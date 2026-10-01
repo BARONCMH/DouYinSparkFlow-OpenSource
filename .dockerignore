@@ -1,0 +1,13 @@
+.git
+.github
+.env
+logs/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+android/
+cookie-tool/
+downloads/
+server-panel/
