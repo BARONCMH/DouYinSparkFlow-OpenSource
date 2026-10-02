@@ -1,7 +1,5 @@
 # DouYin Spark Flow
 
-![cover](docs/images/cover.png)
-
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)
 ![Playwright](https://img.shields.io/badge/Playwright-%E2%9C%94-green?logo=playwright)
 ![chrome-headless-shell](https://img.shields.io/badge/chrome--headless--shell-%E2%9C%94-brightgreen?logo=googlechrome)
