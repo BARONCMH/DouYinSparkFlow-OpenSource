@@ -24,6 +24,8 @@
 
 ## 📌 项目介绍
 
+本仓库也提供一个不依赖 Docker 的 [Windows 单用户版本](https://github.com/BARONCMH/DouYinSparkFlow-SingleUser)，数据保存在本机，支持一个使用者管理多个抖音号。
+
 **抖音火花自动续火脚本**，一款轻量实用的抖音互动脚本，可自动为你和抖音好友续火花，无需手动操作。
 
 ✅ 支持 Docker 部署至自有服务器，容器内 cron 定时执行（推荐）
