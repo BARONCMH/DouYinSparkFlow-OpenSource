@@ -18,6 +18,10 @@ For the upstream single-user project, start with the [deployment guide](docs/gui
 
 For the multi-user panel overlay, read [`server-panel/README.md`](server-panel/README.md) before deployment. It requires an HTTPS reverse proxy, a strong administrator password, persistent private config/log directories, and the compatible upstream container image.
 
+## Online site
+
+The hosted control panel is available at [续火花控制台](https://124.220.96.161/). This public service is operated separately from the source repository; review its terms and privacy practices before creating an account or entering credentials.
+
 ## Security and privacy
 
 Never commit `.env` files, Cookies, account/user databases, logs, screenshots, private keys, keystores, signing passwords, or server configuration. These are excluded by `.gitignore`; review `git status` before every commit. Report suspected security issues privately using the process in [`SECURITY.md`](SECURITY.md).
