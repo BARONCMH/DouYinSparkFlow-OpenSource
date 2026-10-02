@@ -6474,6 +6474,18 @@ section.panel.on{display:block}
   font-size:13.5px;padding:7px 10px;border-radius:7px;cursor:pointer}
 .authtab:hover:not(.on){background:#e8ecf6}
 .authtab.on{background:var(--card);color:var(--brand-dark);font-weight:600;box-shadow:0 1px 3px rgba(15,23,42,.12)}
+.authtab{display:flex;align-items:center;justify-content:center;gap:4px;white-space:nowrap}
+.auth-rec-badge{display:inline-flex;align-items:center;white-space:nowrap;padding:1px 5px;border-radius:999px;background:#c9233b;color:#fff;font-size:9px;line-height:1.5;font-weight:800;letter-spacing:.2px}
+.auth-recommend{display:flex;align-items:flex-start;gap:11px;margin:10px 0 13px;padding:13px 14px;border:1px solid var(--brand-line);border-left:5px solid #c9233b;border-radius:12px;background:var(--brand-soft);color:var(--ink)}
+.auth-recommend .ar-icon{display:grid;place-items:center;flex:none;width:30px;height:30px;border-radius:9px;background:#c9233b;color:#fff;font-size:17px;font-weight:800}
+.auth-recommend strong{display:block;font-size:14px;line-height:1.4}
+.auth-recommend p{margin:3px 0 0;color:var(--ink2);font-size:13px;line-height:1.6}
+.manual-screen-tip{display:flex;align-items:flex-start;gap:10px;margin:10px 0;padding:12px 14px;border:2px solid #c9233b;border-radius:12px;background:var(--brand-soft);color:var(--ink)}
+.manual-screen-tip .tapmark{display:grid;place-items:center;flex:none;width:32px;height:32px;border-radius:10px;background:#c9233b;color:#fff;font-size:18px}
+.manual-screen-tip p{margin:0}
+.manual-screen-tip strong{display:block;font-size:14px;line-height:1.35}
+.manual-screen-tip p>span{display:block;margin-top:3px;color:var(--ink2);font-size:13px;line-height:1.55}
+@media(max-width:560px){.auth-rec-badge{font-size:8.5px;padding:1px 4px}.auth-recommend,.manual-screen-tip{padding:11px 12px;gap:8px}}
 .auth-download{display:inline-flex;align-items:center;justify-content:center;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink2);font-size:13px;text-decoration:none}
 .auth-download:hover{border-color:var(--brand-line);background:var(--brand-soft);color:var(--brand)}
 @media(max-width:900px){
@@ -6837,11 +6849,15 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 
 <section id="authbox"><h2><span class="step">2</span>授权登录</h2>
 <div class="authtabs" role="tablist" aria-label="选择登录方式">
-<button class="authtab on" id="tabmanual" type="button" role="tab" aria-selected="true">手动授权</button>
+<button class="authtab on" id="tabmanual" type="button" role="tab" aria-selected="true" aria-label="手动授权，推荐方式">手动授权 <span class="auth-rec-badge">推荐</span></button>
 <button class="authtab" id="tabphone" type="button" role="tab" aria-selected="false">手机号授权</button>
 <button class="authtab" id="tabcookie" type="button" role="tab" aria-selected="false">手动输入 Cookie</button>
 </div>
 <div id="browserauthpane">
+<div id="manualauthnotice" class="auth-recommend" role="note">
+<span class="ar-icon" aria-hidden="true">✓</span>
+<div><strong>推荐使用手动授权</strong><p>点「开始授权」后，下方会显示抖音实时画面；直接点击画面里的输入框和按钮，就能操作登录与验证。</p></div>
+</div>
 <div class="row">
 <button id="bstart" type="button">开始授权</button>
 <button id="bstop" class="danger" type="button">停止</button>
@@ -6871,6 +6887,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <img id="verifyqrimg" alt="抖音二级验证二维码：用已登录的抖音 App 扫一扫" width="220" height="220" style="background:#fff;border:1px solid #e5e7eb;border-radius:10px">
 </div>
 <div id="shotwrap" hidden>
+<div id="manualscreentip" class="manual-screen-tip" role="note"><span class="tapmark" aria-hidden="true">👆</span><p><strong>下方画面可以直接点击</strong><span>点画面里的输入框、登录或验证按钮，就能直接操作抖音页面。</span></p></div>
 <div class="row"><div id="shotframe"><img id="shot" alt="点击这里操作抖音页面" hidden><span class="livetag" id="livetag" hidden></span></div></div>
 <p class="muted" id="shotempty" hidden>当前没有正在运行的浏览器画面：点「开始授权」或「检测登录状态」后，这里会实时显示。</p>
 <div id="anybox">
@@ -7945,6 +7962,8 @@ function setAuthMethod(method){
   if($('browserauthpane')){ $('browserauthpane').hidden = method === 'cookie'; }
   if($('cookieauthpane')){ $('cookieauthpane').hidden = method !== 'cookie'; }
   if($('phonebox')){ $('phonebox').hidden = method !== 'phone'; }
+  if($('manualauthnotice')){ $('manualauthnotice').hidden = !wantManual; }
+  if($('manualscreentip')){ $('manualscreentip').hidden = !wantManual; }
   if(wantManual){
     shotManual = false;
     setShot(true);
