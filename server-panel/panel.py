@@ -6293,6 +6293,14 @@ h1 .logo{width:22px;height:22px;border-radius:7px;flex:none;background:url("data
 .header-right{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .header-right .lnk{color:#cbd5e1;text-decoration:none;font-size:13px;padding:6px 8px;border-radius:6px}
 .header-right .lnk:hover{color:#fff;background:rgba(255,255,255,.09)}
+.opensource-promo{display:flex;align-items:center;gap:12px;background:var(--brand-soft);border:1px solid var(--brand-line)}
+.opensource-promo .promo-mark{display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:11px;background:linear-gradient(135deg,#f04452,#a91d2d);color:#fff;font-size:12px;font-weight:800;letter-spacing:-.4px}
+.opensource-promo .promo-copy{flex:1;min-width:0}
+.opensource-promo h2{margin:0 0 2px;font-size:14px}
+.opensource-promo p{margin:0;color:var(--muted);font-size:12.5px}
+.opensource-promo a{display:inline-flex;align-items:center;gap:5px;min-height:38px;padding:7px 12px;border:1px solid var(--brand-line);border-radius:9px;background:var(--card);color:var(--brand);font-size:13px;font-weight:700;text-decoration:none;white-space:nowrap}
+.opensource-promo a:hover{background:var(--brand-soft);text-decoration:underline}
+@media(max-width:560px){.opensource-promo{align-items:flex-start;flex-wrap:wrap;gap:9px}.opensource-promo .promo-copy{flex:1 1 calc(100% - 52px)}.opensource-promo a{margin-left:47px}}
 main{max-width:1420px;margin:16px auto;padding:0 16px}
 section{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;margin-bottom:16px}
 h2{font-size:15px;margin:0 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -6772,6 +6780,11 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
   <span class="today-mark" aria-hidden="true">✦</span>
   <div class="today-copy"><b id="todaySendState">正在读取今天的发送状态</b><span id="todaySendMeta">发送结果会自动更新</span></div>
   <button class="ghost sm" type="button" onclick="showPanel('records')">查看记录</button>
+</section>
+<section class="opensource-promo" aria-label="开源项目">
+  <span class="promo-mark" aria-hidden="true">GH</span>
+  <div class="promo-copy"><h2>项目已开源</h2><p>查看源代码，下载 Android App 和 Windows Cookie 工具。</p></div>
+  <a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">查看项目 <span aria-hidden="true">↗</span></a>
 </section>
 <section id="webpush-card" aria-label="发送结果通知">
   <h2>🔔 发送结果通知</h2>
@@ -11748,7 +11761,7 @@ ADMIN_LOGIN_HTML = """<!doctype html>
 <button type="button" class="eye" id="ad-eye" aria-label="显示密码" aria-pressed="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
 <button id="ad-go">进入管理控制台</button></form>
 __ERROR__
-<p class="foot">不是管理员？<a href="/login">返回普通登录</a></p>
+<p class="foot">不是管理员？<a href="/login">返回普通登录</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
 </div>
 <script>
 (function(){
@@ -11788,7 +11801,7 @@ LOGIN_HTML = """<!doctype html>
 <label class="keep" for="lg-keep"><input type="checkbox" id="lg-keep"> 记住账号（下次自动填好）</label>
 <button id="lg-go">登录</button></form>
 __ERROR__
-<p class="foot">__REGOFFER__<br><a href="/download">下载手机 App</a><br><span style="color:#a3aab8">忘了密码？找管理员重置 · </span><a href="/login?next=/admin" style="font-weight:400;color:#a3aab8">管理员入口</a></p>
+<p class="foot">__REGOFFER__<br><a href="/download">下载手机 App</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a><br><span style="color:#a3aab8">忘了密码？找管理员重置 · </span><a href="/login?next=/admin" style="font-weight:400;color:#a3aab8">管理员入口</a></p>
 </div>
 <script>
 (function(){
@@ -11841,7 +11854,7 @@ REGISTER_HTML = """<!doctype html>
 <p class="hint bad" id="rg-hint" role="alert" hidden></p>
 <button id="rg-go">注册并登录</button></form>
 __ERROR__
-<p class="foot">已经有账号了？<a href="/login">去登录</a> · <a href="/download">下载手机 App</a></p>
+<p class="foot">已经有账号了？<a href="/login">去登录</a> · <a href="/download">下载手机 App</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
 </div>
 <script>
 (function(){
