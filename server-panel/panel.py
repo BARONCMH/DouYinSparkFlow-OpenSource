@@ -6996,6 +6996,102 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 .overview-shortcut:first-of-type{border-top:0}.overview-shortcut span{color:var(--muted);font-size:13px}
 @media(max-width:720px){.overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-layout{grid-template-columns:1fr}}
 
+/* DouYinSparkFlow visual refresh: a calm operations desk with the spark red reserved for action. */
+html[data-theme="dark"]{
+  color-scheme:dark;--brand:#e84d5b;--brand-dark:#cc3546;--brand-soft:#2d191e;--brand-line:#65313a;
+  --ink:#f5edef;--ink2:#d8c8cc;--muted:#a58f95;--line:#3b2b30;--line2:#261b1f;
+  --bg:#100d0f;--card:#191416;--side:#130f11;--side2:#29191e;--sideink:#cdbdc1;
+  --ok:#68d8a1;--ok-bg:#14251e;--ok-line:#2d5c45;--warn:#f1c469;--warn-bg:#2b2114;--warn-line:#6c5428;
+  --bad:#ff8790;--bad-bg:#30191e;--bad-line:#6b343c;--neu:#c5c8ce;--neu-bg:#222126;--neu-line:#414047;
+}
+html[data-theme="light"]{
+  color-scheme:light;--brand:#bd263c;--brand-dark:#981b31;--brand-soft:#fbe9ec;--brand-line:#ecc2c8;
+  --ink:#2b1a1e;--ink2:#5d454b;--muted:#806a70;--line:#e8d8db;--line2:#f8edef;
+  --bg:#fff8f8;--card:#fff;--side:#fffdfd;--side2:#f9ecee;--sideink:#60484e;
+  --ok:#08794e;--ok-bg:#e8f6ef;--ok-line:#b5dfc8;--warn:#845900;--warn-bg:#fff5dc;--warn-line:#ead9a9;
+  --bad:#a82034;--bad-bg:#fdebed;--bad-line:#efbdc4;--neu:#4c515c;--neu-bg:#f1f2f5;--neu-line:#dce0e7;
+}
+html[data-theme] body{font-family:Inter,"Aptos","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;font-size:14px;font-variant-numeric:tabular-nums;background:var(--bg);color:var(--ink)}
+html[data-theme] .app{grid-template-columns:224px minmax(0,1fr);min-height:100vh}
+html[data-theme] .side{gap:20px;padding:22px 15px;background:var(--side);border-right:1px solid var(--line);box-shadow:none}
+html[data-theme] .brand{gap:11px;padding:4px 8px 17px;border-bottom:1px solid var(--line)}
+html[data-theme] .brand .logo{width:34px;height:34px;border-radius:11px;box-shadow:none;background-size:58%,100%}
+html[data-theme] .brand b{font-size:14px;letter-spacing:.1px}
+html[data-theme="dark"] .brand b{color:#fff}
+html[data-theme] .brand i{margin-top:2px;color:var(--muted);font-size:11px;letter-spacing:.1px}
+html[data-theme] nav{gap:5px}
+html[data-theme] .nav{min-height:42px;padding:9px 11px;border:1px solid transparent;border-radius:9px;color:var(--sideink);font-size:13px;transition:background .16s,color .16s,border-color .16s}
+html[data-theme] .nav:hover{background:var(--side2);color:var(--brand)}
+html[data-theme] .nav.on{background:var(--brand-soft);border-color:var(--brand-line);color:var(--brand);box-shadow:none;font-weight:700}
+html[data-theme] .nav.on .ni{background:var(--brand)}
+html[data-theme] .side-foot{gap:8px;padding:14px 8px 0;border-top-color:var(--line)}
+html[data-theme] .side-foot .who{color:var(--ink);overflow-wrap:anywhere}
+html[data-theme] .side-foot a{color:var(--muted);text-decoration:none}
+html[data-theme] .side-foot a:hover{color:var(--brand)}
+html[data-theme] main.main{width:100%;max-width:1600px;margin:0 auto;padding:24px clamp(18px,3vw,42px) 56px}
+html[data-theme] .top{position:sticky;top:0;z-index:120;min-height:58px;margin:-24px calc(-1 * clamp(18px,3vw,42px)) 22px;padding:10px clamp(18px,3vw,42px);background:var(--bg);border:0;border-bottom:1px solid var(--line)}
+html[data-theme] .top h1{font-size:20px;letter-spacing:-.35px}
+html[data-theme] .head-mid{color:var(--muted)}
+html[data-theme] .head-mid b{color:var(--ink);font-size:13px}
+html[data-theme] .panel{margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{margin:0 0 14px;padding:19px 20px;border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:none}
+html[data-theme] .panel>section h2,html[data-theme] .panel .col>section h2,html[data-theme] .overview-layout>section h2{font-size:15px;letter-spacing:-.1px}
+html[data-theme] .overview-heading{margin:0 0 16px}
+html[data-theme] .overview-heading h2{font-size:23px;letter-spacing:-.55px}
+html[data-theme] .overview-heading p{font-size:13px;color:var(--muted)}
+html[data-theme] .today-status{min-height:82px;margin-bottom:13px;padding:18px 20px;border:1px solid var(--brand-line);border-left:4px solid var(--brand);border-radius:12px;background:var(--brand-soft);box-shadow:none}
+html[data-theme] .today-mark{width:30px;height:30px;display:grid;place-items:center;border-radius:9px;background:var(--brand);color:#fff;font-size:17px}
+html[data-theme] .today-copy b{font-size:16px;letter-spacing:-.2px;color:var(--ink)}
+html[data-theme] .today-copy b.success{color:var(--ok)}
+html[data-theme] .today-copy b.partial,html[data-theme] .today-copy b.pending{color:var(--warn)}
+html[data-theme] .today-copy b.failed{color:var(--bad)}
+html[data-theme] .today-copy span{font-size:12.5px;color:var(--muted)}
+html[data-theme] .overview-stats{grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin:0 0 17px;padding:12px 0;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+html[data-theme] .overview-stat{padding:5px 18px;border:0;border-right:1px solid var(--line);border-radius:0;background:transparent}
+html[data-theme] .overview-stat:last-child{border-right:0}
+html[data-theme] .overview-stat span{font-size:12px;color:var(--muted)}
+html[data-theme] .overview-stat b{margin-top:5px;font-size:25px;letter-spacing:-.5px;color:var(--ink)}
+html[data-theme] #todaySuccessCount{color:var(--ok)}
+html[data-theme] .overview-layout{grid-template-columns:minmax(0,1.55fr) minmax(260px,.8fr);gap:14px}
+html[data-theme] .overview-layout>section{margin:0;padding:18px 20px}
+html[data-theme] .overview-layout>section:last-child{background:var(--line2)}
+html[data-theme] .overview-run{padding:12px 2px;border-top-color:var(--line)}
+html[data-theme] .overview-run-main b{color:var(--ink);font-size:13.5px}
+html[data-theme] .overview-run-main span{color:var(--muted)}
+html[data-theme] .overview-shortcut{padding:13px 0;border-top-color:var(--line)}
+html[data-theme] .overview-shortcut b{font-size:13px}
+html[data-theme] .overview-shortcut span{font-size:12px;color:var(--muted)}
+html[data-theme] .opensource-promo{margin-bottom:14px;padding:11px 14px;border-color:var(--line);border-radius:11px;background:var(--card)}
+html[data-theme] .opensource-promo .promo-mark{width:34px;height:34px;border-radius:9px;background:var(--brand);font-size:11px}
+html[data-theme] .opensource-promo h2{margin:0 0 1px;font-size:13px}
+html[data-theme] .opensource-promo p{font-size:12px;color:var(--muted)}
+html[data-theme] .opensource-promo a{min-height:34px;border-color:var(--brand-line);border-radius:8px;background:var(--brand-soft);color:var(--brand);font-size:12px}
+html[data-theme] button{min-height:38px;border-radius:8px;background:var(--brand);color:#fff;font-weight:600;box-shadow:none;transition:background .16s,border-color .16s,color .16s}
+html[data-theme] button:hover:not(:disabled){background:var(--brand-dark)}
+html[data-theme] button.sm{min-height:32px}
+html[data-theme] button.ghost,html[data-theme] button.sec{border:1px solid var(--line);background:var(--card);color:var(--ink2)}
+html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){border-color:var(--brand-line);background:var(--brand-soft);color:var(--brand)}
+html[data-theme] button.danger-ghost{border-color:var(--bad-line);background:transparent;color:var(--bad)}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{border-color:var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline:3px solid rgba(232,77,91,.22);outline-offset:1px;border-color:var(--brand)}
+html[data-theme] label{color:var(--ink2)}
+html[data-theme] .badge{border-radius:7px;font-size:12px}
+html[data-theme] .authtabs{border-color:var(--line);background:var(--line2)}
+html[data-theme] button.authtab{border:1px solid transparent;background:transparent;color:var(--ink2);font-weight:500}
+html[data-theme] button.authtab:hover:not(.on){background:var(--line2);color:var(--ink)}
+html[data-theme] button.authtab.on{border-color:var(--brand);background:var(--brand);color:#fff;font-weight:700}
+html[data-theme] .auth-recommend,html[data-theme] .manual-screen-tip{border-color:var(--brand-line);border-radius:10px;background:var(--brand-soft)}
+html[data-theme] .progress{background:var(--line2)}
+html[data-theme] pre{border:1px solid var(--line);border-radius:10px;background:#120f11;color:#eadfe2}
+html[data-theme] a{color:var(--brand)}
+html[data-theme] .side-foot a{color:var(--muted)}
+html[data-theme] .account-panel a:not(.account-exit){color:var(--ink2)}
+html[data-theme] .account-panel a.account-exit{color:var(--bad)}
+html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
+@media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;height:auto;min-height:62px;width:100%;padding:4px 8px calc(5px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid var(--line);box-shadow:none}html[data-theme] nav{height:54px;gap:4px}html[data-theme] .nav{min-height:50px;border-radius:8px}html[data-theme] main.main{padding:12px 18px calc(92px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 17px;padding:9px 18px}}
+@media(max-width:720px){html[data-theme] .overview-layout{grid-template-columns:1fr}}
+@media(max-width:560px){html[data-theme] main.main{padding-right:12px;padding-left:12px}html[data-theme] .top{margin-right:-12px;margin-left:-12px;padding-right:12px;padding-left:12px;gap:7px}html[data-theme] .overview-heading h2{font-size:21px}html[data-theme] .overview-stats{padding:7px 0}html[data-theme] .overview-stat{padding:7px 12px}html[data-theme] .overview-stat:nth-child(2){border-right:0}html[data-theme] .overview-stat:nth-child(n+3){border-top:1px solid var(--line)}html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{padding:15px 14px}html[data-theme] .today-status{align-items:flex-start;padding:14px}html[data-theme] .opensource-promo{align-items:flex-start}html[data-theme] .opensource-promo a{margin-left:44px}}
+
 </style></head><body>
 <div class="app">
 <aside class="side">
@@ -10127,6 +10223,76 @@ html[data-theme] #themebtn:hover{border-color:var(--softline);color:var(--brand)
 @media(max-width:900px){html[data-theme] .side{box-shadow:0 -8px 26px rgba(30,8,12,.18)}html[data-theme] .top{background:var(--bg);border-bottom-color:var(--line);z-index:180}}
 @media(max-width:560px){.account-panel{width:min(270px,calc(100vw - 22px))}}
 
+/* Admin visual refresh: the same spark red system, tuned for dense operational work. */
+html[data-theme="dark"]{
+  color-scheme:dark;--brand:#e84d5b;--brand2:#cc3546;--soft:#2d191e;--softline:#65313a;
+  --ink:#f5edef;--ink2:#d8c8cc;--muted:#a58f95;--line:#3b2b30;--bg:#100d0f;--card:#191416;
+  --ok:#68d8a1;--okbg:#14251e;--okline:#2d5c45;--warn:#f1c469;--warnbg:#2b2114;--warnline:#6c5428;
+  --bad:#ff8790;--badbg:#30191e;--badline:#6b343c;--side:#130f11;--side2:#29191e;--sideink:#cdbdc1;
+}
+html[data-theme="light"]{
+  color-scheme:light;--brand:#bd263c;--brand2:#981b31;--soft:#fbe9ec;--softline:#ecc2c8;
+  --ink:#2b1a1e;--ink2:#5d454b;--muted:#806a70;--line:#e8d8db;--bg:#fff8f8;--card:#fff;
+  --ok:#08794e;--okbg:#e8f6ef;--okline:#b5dfc8;--warn:#845900;--warnbg:#fff5dc;--warnline:#ead9a9;
+  --bad:#a82034;--badbg:#fdebed;--badline:#efbdc4;--side:#fffdfd;--side2:#f9ecee;--sideink:#60484e;
+}
+html[data-theme] body{font-family:Inter,"Aptos","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;font-size:13.5px;font-variant-numeric:tabular-nums;background:var(--bg);color:var(--ink)}
+html[data-theme] .app{grid-template-columns:224px minmax(0,1fr)}
+html[data-theme] .side{gap:20px;padding:22px 15px;background:var(--side);border-right:1px solid var(--line);box-shadow:none}
+html[data-theme] .brand{gap:11px;padding:4px 8px 17px;border-bottom:1px solid var(--line)}
+html[data-theme] .brand .logo{width:34px;height:34px;border-radius:11px;box-shadow:none;background-size:58%,100%}
+html[data-theme] .brand b{font-size:14px;color:var(--ink);letter-spacing:.1px}
+html[data-theme] .brand i{margin-top:2px;color:var(--muted);font-size:11px;letter-spacing:.1px}
+html[data-theme] nav{gap:5px}
+html[data-theme] .nav{min-height:42px;padding:9px 11px;border:1px solid transparent;border-radius:9px;color:var(--sideink);font-size:13px;transition:background .16s,color .16s,border-color .16s}
+html[data-theme] .nav:hover{background:var(--side2);color:var(--brand)}
+html[data-theme] .nav.on{background:var(--soft);border-color:var(--softline);color:var(--brand);box-shadow:none;font-weight:700}
+html[data-theme] .nav.on .pill{background:var(--brand);color:#fff}
+html[data-theme] .nav.on .ni{background:var(--brand)}
+html[data-theme] .side-foot{gap:8px;padding:14px 8px 0;border-top-color:var(--line)}
+html[data-theme] .side-foot .who{color:var(--ink)}
+html[data-theme] .side-foot a{color:var(--muted)}
+html[data-theme] .side-foot a:hover{color:var(--brand)}
+html[data-theme] .main{max-width:1600px;margin:0 auto;padding:24px clamp(18px,3vw,42px) 56px}
+html[data-theme] .top{position:sticky;top:0;z-index:120;min-height:58px;margin:-24px calc(-1 * clamp(18px,3vw,42px)) 22px;padding:10px clamp(18px,3vw,42px);background:var(--bg);border:0;border-bottom:1px solid var(--line)}
+html[data-theme] .top h1{font-size:20px;letter-spacing:-.35px}
+html[data-theme] .card{border:1px solid var(--line);border-radius:13px;background:var(--card);box-shadow:none;padding:19px 20px}
+html[data-theme] .card>h2{font-size:15px;letter-spacing:-.1px}
+html[data-theme] .card>p.sub{font-size:12.5px;color:var(--muted)}
+html[data-theme] .kpis{gap:0;margin-bottom:16px;border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
+html[data-theme] .kpi{min-width:0;padding:14px 16px;border:0;border-right:1px solid var(--line);border-radius:0;background:transparent}
+html[data-theme] .kpi:last-child{border-right:0}
+html[data-theme] .kpi b{font-size:25px;letter-spacing:-.35px}
+html[data-theme] .kpi span{font-size:12px;color:var(--muted)}
+html[data-theme] .kpi.b b{color:var(--brand)}
+html[data-theme] .kpi.g b{color:var(--ok)}
+html[data-theme] .kpi.y b{color:var(--warn)}
+html[data-theme] .kpi.r b{color:var(--bad)}
+html[data-theme] .grid2{gap:14px}
+html[data-theme] button{min-height:38px;border-radius:8px;background:var(--brand);font-weight:600;box-shadow:none;transition:background .16s,border-color .16s,color .16s}
+html[data-theme] button:hover:not(:disabled){background:var(--brand2)}
+html[data-theme] button.sm{min-height:32px}
+html[data-theme] button.ghost,html[data-theme] button.sec{border:1px solid var(--line);background:var(--card);color:var(--ink2)}
+html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){border-color:var(--softline);background:var(--soft);color:var(--brand)}
+html[data-theme] button.dghost{border-color:var(--badline);background:transparent;color:var(--bad)}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{min-height:40px;border-color:var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline:3px solid rgba(232,77,91,.22);outline-offset:1px;border-color:var(--brand)}
+html[data-theme] label{color:var(--ink2)}
+html[data-theme] table{font-size:12.5px}
+html[data-theme] th{z-index:2;border-bottom-color:var(--line);background:var(--card);color:var(--muted);font-size:11.5px}
+html[data-theme] td{border-bottom-color:var(--line);color:var(--ink2)}
+html[data-theme] tbody tr:hover{background:var(--soft)}
+html[data-theme] .badge{border-radius:7px}
+html[data-theme] .chip{border-color:var(--line);border-radius:8px;background:var(--card);color:var(--ink2)}
+html[data-theme] .account-menu>summary{border-radius:8px;background:var(--card);color:var(--ink2)}
+html[data-theme] .account-menu>summary:hover,html[data-theme] .account-menu[open]>summary{border-color:var(--softline);background:var(--soft);color:var(--brand)}
+html[data-theme] .account-panel{border-color:var(--line);border-radius:12px;background:var(--card);box-shadow:0 16px 36px rgba(0,0,0,.2)}
+html[data-theme] #toast .t{border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
+html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
+@media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;height:auto;width:100%;padding:4px 8px calc(5px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid var(--line);box-shadow:none}html[data-theme] nav{height:54px;gap:4px}html[data-theme] .nav{min-height:50px;border-radius:8px}html[data-theme] .main{padding:12px 18px calc(92px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 17px;padding:9px 18px}}
+@media(max-width:700px){html[data-theme] .kpis{grid-template-columns:repeat(3,minmax(0,1fr))}html[data-theme] .kpi:nth-child(3){border-right:0}html[data-theme] .kpi:nth-child(n+4){border-top:1px solid var(--line)}}
+@media(max-width:560px){html[data-theme] .main{padding-right:12px;padding-left:12px}html[data-theme] .top{margin-right:-12px;margin-left:-12px;padding-right:12px;padding-left:12px}html[data-theme] .card{padding:15px 14px}html[data-theme] .kpi{padding:11px 10px}html[data-theme] .kpi b{font-size:22px}}
+
 </style></head><body>
 <div id="toast" aria-live="polite"></div>
 <div class="app">
@@ -12005,6 +12171,32 @@ html[data-theme="light"] form>button:not(.eye){background:#ca2638;box-shadow:0 8
 html[data-theme="light"] form>button:not(.eye):hover{background:#a91d2d}
 html[data-theme="light"] .foot a{color:#a91d2d}
 @media(max-width:480px){.auth-theme{top:calc(10px + env(safe-area-inset-top));right:10px}.box{width:calc(100% - 28px);margin:58px auto 20px}}
+
+/* Auth pages share the same quiet red/black language as the console. */
+html[data-theme="dark"]{color-scheme:dark;--auth-bg:#100d0f;--auth-card:#191416;--auth-ink:#f5edef;--auth-muted:#a58f95;--auth-line:#3b2b30;--auth-red:#e84d5b;--auth-soft:#2d191e}
+html[data-theme="light"]{color-scheme:light;--auth-bg:#fff8f8;--auth-card:#fff;--auth-ink:#2b1a1e;--auth-muted:#806a70;--auth-line:#e8d8db;--auth-red:#bd263c;--auth-soft:#fbe9ec}
+html[data-theme] body{font-family:Inter,"Aptos","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;color:var(--auth-ink);background:var(--auth-bg)}
+html[data-theme] .box{position:relative;overflow:hidden;width:min(430px,calc(100% - 32px));padding:32px 30px 24px;border:1px solid var(--auth-line);border-radius:15px;background:var(--auth-card);box-shadow:0 22px 56px rgba(25,8,12,.18)}
+html[data-theme] .box::before{content:"";position:absolute;inset:0 0 auto;height:4px;background:var(--auth-red)}
+html[data-theme] .brand{gap:12px;margin-bottom:24px}
+html[data-theme] .brand .logo{width:42px;height:42px;border-radius:12px;box-shadow:none}
+html[data-theme] .brand b{font-size:15px;letter-spacing:.1px;color:var(--auth-ink)}
+html[data-theme] .brand i{margin-top:3px;color:var(--auth-muted);font-size:11px;letter-spacing:.1px}
+html[data-theme] h2{margin:0 0 7px;color:var(--auth-ink);font-size:24px;letter-spacing:-.6px}
+html[data-theme] p.tip{margin:0 0 20px;color:var(--auth-muted);font-size:13px;line-height:1.65}
+html[data-theme] label{margin-top:14px;color:var(--auth-ink);font-size:12.5px}
+html[data-theme] input{min-height:44px;margin-top:7px;padding:10px 12px;border:1px solid var(--auth-line);border-radius:8px;background:var(--auth-card);color:var(--auth-ink)}
+html[data-theme] input:focus{outline:3px solid rgba(232,77,91,.2);border-color:var(--auth-red);box-shadow:none}
+html[data-theme] form>button:not(.eye){min-height:46px;margin-top:20px;border-radius:8px;background:var(--auth-red);box-shadow:none;font-weight:700}
+html[data-theme] form>button:not(.eye):hover{background:#9f2034;filter:none}
+html[data-theme] .error{border-color:var(--auth-line);border-radius:8px}
+html[data-theme] .foot{margin-top:20px;padding-top:15px;border-top:1px solid var(--auth-line);color:var(--auth-muted)}
+html[data-theme] .foot a{color:var(--auth-red)}
+html[data-theme] .auth-theme{min-height:38px;padding:7px 12px;border:1px solid var(--auth-line);border-radius:8px;background:var(--auth-card);color:var(--auth-ink);box-shadow:none}
+html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(--auth-soft);color:var(--auth-red)}
+html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
+@media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
+@media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
 """
 
 ADMIN_LOGIN_CSS = """
@@ -12087,6 +12279,33 @@ html[data-theme="light"] .foot{border-top-color:#eadcdf}
 html[data-theme="light"] .foot a{color:#a91d2d}
 html[data-theme="light"] .auth-theme{background:#fff;color:#a91d2d;border-color:#efb5bc}
 @media(max-width:480px){.auth-theme{top:calc(10px + env(safe-area-inset-top));right:10px}.box{width:calc(100% - 28px);margin:58px auto 20px}}
+
+/* Admin sign-in uses the same red/black identity as the rest of the console. */
+html[data-theme="dark"]{color-scheme:dark;--auth-bg:#100d0f;--auth-card:#191416;--auth-ink:#f5edef;--auth-muted:#a58f95;--auth-line:#3b2b30;--auth-red:#e84d5b;--auth-soft:#2d191e}
+html[data-theme="light"]{color-scheme:light;--auth-bg:#fff8f8;--auth-card:#fff;--auth-ink:#2b1a1e;--auth-muted:#806a70;--auth-line:#e8d8db;--auth-red:#bd263c;--auth-soft:#fbe9ec}
+html[data-theme] body{font-family:Inter,"Aptos","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;color:var(--auth-ink);background:var(--auth-bg)}
+html[data-theme] .box{position:relative;overflow:hidden;width:min(430px,calc(100% - 32px));padding:32px 30px 24px;border:1px solid var(--auth-line);border-radius:15px;background:var(--auth-card);box-shadow:0 22px 56px rgba(25,8,12,.18)}
+html[data-theme] .box::before{content:"";position:absolute;inset:0 0 auto;height:4px;background:var(--auth-red)}
+html[data-theme] .brand{gap:12px;margin-bottom:21px}
+html[data-theme] .brand .logo{width:42px;height:42px;border-radius:12px;box-shadow:none}
+html[data-theme] .brand b{font-size:15px;color:var(--auth-ink)}
+html[data-theme] .brand i{margin-top:3px;color:var(--auth-muted);font-size:11px;letter-spacing:.2px}
+html[data-theme] .badge{margin-bottom:12px;border-color:var(--auth-line);border-radius:7px;background:var(--auth-soft);color:var(--auth-red)}
+html[data-theme] h2{margin:0 0 7px;color:var(--auth-ink);font-size:24px;letter-spacing:-.6px}
+html[data-theme] p.tip{margin:0 0 20px;color:var(--auth-muted);font-size:13px;line-height:1.65}
+html[data-theme] label{margin-top:14px;color:var(--auth-ink);font-size:12.5px}
+html[data-theme] input{min-height:44px;margin-top:7px;padding:10px 12px;border:1px solid var(--auth-line);border-radius:8px;background:var(--auth-card);color:var(--auth-ink)}
+html[data-theme] input:focus{outline:3px solid rgba(232,77,91,.2);border-color:var(--auth-red);box-shadow:none}
+html[data-theme] form>button:not(.eye){min-height:46px;margin-top:20px;border-radius:8px;background:var(--auth-red);box-shadow:none;font-weight:700}
+html[data-theme] form>button:not(.eye):hover{background:#9f2034;filter:none}
+html[data-theme] .error{border-color:var(--auth-line);border-radius:8px}
+html[data-theme] .foot{margin-top:20px;padding-top:15px;border-top:1px solid var(--auth-line);color:var(--auth-muted)}
+html[data-theme] .foot a{color:var(--auth-red)}
+html[data-theme] .auth-theme{min-height:38px;padding:7px 12px;border:1px solid var(--auth-line);border-radius:8px;background:var(--auth-card);color:var(--auth-ink);box-shadow:none}
+html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(--auth-soft);color:var(--auth-red)}
+html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
+@media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
+@media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
 """
 
 ADMIN_LOGIN_HTML = """<!doctype html>
