@@ -32,7 +32,7 @@
 
 ✅ 支持 GitHub Actions 运行（`schedule.yml` 仅限手动触发，Fork 后不会自动跑）
 
-✅ 配套多用户 Web 控制台，支持注册 / 兑换 / 发送记录 / Web Push 通知
+✅ 配套多用户 Web 控制台，支持注册 / 兑换 / 发送记录 / Web Push 与邮件通知
 
 ✅ 提供 Android 客户端与 Windows Cookie 导出工具，装完即用
 

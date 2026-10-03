@@ -21,11 +21,15 @@ import queue
 import re
 import secrets
 import signal
+import smtplib
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from email.message import EmailMessage
+from email.utils import formataddr
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 try:
@@ -112,6 +116,8 @@ WEBPUSH_SUBSCRIPTIONS_PATH = Path("/app/config/panel-webpush-subscriptions.json"
 WEBPUSH_VAPID_PATH = Path("/app/config/panel-webpush-vapid.json")
 WEBPUSH_STATE_PATH = LOG_DIR / "webpush-state.json"
 WEBPUSH_LIB_DIR = Path("/app/config/webpush-lib")
+EMAIL_SETTINGS_PATH = Path("/app/config/panel-email-settings.json")
+EMAIL_NOTIFY_STATE_PATH = LOG_DIR / "email-notify-state.json"
 MAX_BODY_BYTES = 1000000  # 单次请求体上限，超过直接回 413
 BODY_READ_TIMEOUT = 15  # 秒：读请求体的总时限，客户端只报长度不发内容时不能一直等
 
@@ -343,6 +349,12 @@ WEBPUSH_SUBSCRIPTIONS_STORE = JsonStore(
 )
 WEBPUSH_STATE_STORE = JsonStore(
     WEBPUSH_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
+)
+EMAIL_SETTINGS_STORE = JsonStore(
+    EMAIL_SETTINGS_PATH, default=lambda: {"users": {}}
+)
+EMAIL_NOTIFY_STATE_STORE = JsonStore(
+    EMAIL_NOTIFY_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
 )
 
 _WEBPUSH_KEY_LOCK = threading.Lock()
@@ -730,6 +742,281 @@ def _webpush_notify_loop(stop_event: threading.Event) -> None:
             })
         except Exception as error:
             log_force("Web Push 后台检查失败", type(error).__name__)
+
+
+EMAIL_ADDRESS_RE = re.compile(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]{2,}")
+EMAIL_TEST_COOLDOWN = 60
+EMAIL_ADDRESS_TEST_COOLDOWN = 300
+
+
+def _valid_email_address(value: str) -> str:
+    address = str(value or "").strip()
+    if not address:
+        return ""
+    if len(address) > 254 or not EMAIL_ADDRESS_RE.fullmatch(address):
+        raise ValueError("邮箱地址格式不正确")
+    return address
+
+
+def email_preferences(username: str) -> dict:
+    data = EMAIL_SETTINGS_STORE.read()
+    users = data.get("users") if isinstance(data, dict) else {}
+    item = users.get(str(username or "")) if isinstance(users, dict) else None
+    if not isinstance(item, dict):
+        item = {}
+    try:
+        address = _valid_email_address(item.get("address") or "")
+    except ValueError:
+        address = ""
+    return {"address": address, "enabled": bool(item.get("enabled")) and bool(address)}
+
+
+def save_email_preferences(username: str, address: str, enabled: bool) -> dict:
+    name = str(username or "").strip()
+    if not name:
+        return {"ok": False, "error": "当前登录账号无效"}
+    try:
+        address = _valid_email_address(address)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+    enabled = bool(enabled)
+    if enabled and not address:
+        return {"ok": False, "error": "请先填写收件邮箱"}
+
+    def _apply(data):
+        users = data.get("users") if isinstance(data, dict) else {}
+        users = dict(users) if isinstance(users, dict) else {}
+        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
+        test_limits = dict(test_limits) if isinstance(test_limits, dict) else {}
+        previous = users.get(name) if isinstance(users.get(name), dict) else {}
+        record = dict(previous)
+        if str(previous.get("address") or "") != address:
+            record["last_test_at"] = 0
+        record.update({"address": address, "enabled": enabled and bool(address)})
+        users[name] = record
+        return {"users": users, "test_limits": test_limits}
+
+    EMAIL_SETTINGS_STORE.update(_apply)
+    return {
+        "ok": True,
+        "message": "邮件通知设置已保存",
+        "settings": email_preferences(name),
+    }
+
+
+def _smtp_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        return bool(default)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _smtp_config() -> dict:
+    host = str(os.getenv("SMTP_HOST") or "").strip()
+    username = str(os.getenv("SMTP_USERNAME") or "").strip()
+    password = str(os.getenv("SMTP_PASSWORD") or "")
+    sender = str(os.getenv("SMTP_FROM") or username).strip()
+    if not host or not sender:
+        raise ValueError("邮件服务尚未配置")
+    try:
+        sender = _valid_email_address(sender)
+        port = int(os.getenv("SMTP_PORT") or "587")
+    except (TypeError, ValueError) as error:
+        raise ValueError("SMTP 参数配置无效") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("SMTP 端口配置无效")
+    use_ssl = _smtp_flag("SMTP_USE_SSL", False)
+    starttls = _smtp_flag("SMTP_STARTTLS", not use_ssl)
+    if use_ssl and starttls:
+        raise ValueError("SMTP_SSL 与 SMTP_STARTTLS 不能同时启用")
+    if not use_ssl and not starttls:
+        raise ValueError("SMTP 必须启用 SSL 或 STARTTLS")
+    if bool(username) != bool(password):
+        raise ValueError("SMTP 用户名和授权码需要同时设置")
+    return {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "sender": sender,
+        "sender_name": str(os.getenv("SMTP_FROM_NAME") or "DouYinSparkFlow").strip(),
+        "use_ssl": use_ssl,
+        "starttls": starttls,
+    }
+
+
+def smtp_is_configured() -> bool:
+    try:
+        _smtp_config()
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def send_smtp_email(recipient: str, subject: str, body: str) -> dict:
+    try:
+        config = _smtp_config()
+        recipient = _valid_email_address(recipient)
+        if not recipient:
+            raise ValueError("收件邮箱为空")
+        message = EmailMessage()
+        message["From"] = formataddr((config["sender_name"], config["sender"]), charset="utf-8")
+        message["To"] = recipient
+        message["Subject"] = str(subject)
+        message.set_content(str(body))
+        context = ssl.create_default_context()
+        if config["use_ssl"]:
+            connection = smtplib.SMTP_SSL(
+                config["host"], config["port"], timeout=15, context=context
+            )
+        else:
+            connection = smtplib.SMTP(config["host"], config["port"], timeout=15)
+        with connection as server:
+            server.ehlo()
+            if config["starttls"]:
+                server.starttls(context=context)
+                server.ehlo()
+            if config["username"]:
+                server.login(config["username"], config["password"])
+            refused = server.send_message(message)
+            if refused:
+                raise RuntimeError("SMTP 拒收邮件")
+        return {"ok": True}
+    except Exception as error:
+        log_force("邮件发送失败", type(error).__name__)
+        return {"ok": False, "error": "邮件发送失败，请管理员检查 SMTP 配置和服务器出站端口"}
+
+
+def reserve_email_test(username: str, address: str) -> int:
+    """Reserve per-user and per-address test-mail slots; return seconds remaining."""
+    now = int(time.time())
+    outcome = {"remaining": 0}
+    address_key = hashlib.sha256(str(address or "").strip().lower().encode("utf-8")).hexdigest()
+
+    def _apply(data):
+        users = data.get("users") if isinstance(data, dict) else {}
+        users = dict(users) if isinstance(users, dict) else {}
+        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
+        test_limits = (
+            {str(key): _epoch(value) for key, value in test_limits.items()
+             if now - _epoch(value) < EMAIL_ADDRESS_TEST_COOLDOWN * 2}
+            if isinstance(test_limits, dict) else {}
+        )
+        name = str(username or "")
+        record = dict(users.get(name) or {})
+        user_remaining = EMAIL_TEST_COOLDOWN - (now - _epoch(record.get("last_test_at")))
+        address_remaining = EMAIL_ADDRESS_TEST_COOLDOWN - (now - _epoch(test_limits.get(address_key)))
+        remaining = max(user_remaining, address_remaining, 0)
+        if remaining:
+            outcome["remaining"] = remaining
+        else:
+            record["last_test_at"] = now
+            users[name] = record
+            test_limits[address_key] = now
+        return {"users": users, "test_limits": test_limits}
+
+    EMAIL_SETTINGS_STORE.update(_apply)
+    return max(0, int(outcome["remaining"]))
+
+
+def _email_run_message(run: dict) -> tuple:
+    status = str(run.get("status") or "")
+    labels = {
+        "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
+        "error": "发送出错", "no_login": "账号需要重新登录", "no_friend": "未找到目标好友",
+        "queue_timeout": "任务排队超时", "skipped": "任务已跳过",
+    }
+    label = labels.get(status, "发送任务已结束")
+    account = str(run.get("account") or run.get("unique_id") or "你的账号")[:80]
+    sent_at = str(run.get("at") or "")[:40]
+    return "抖音火花发送通知：" + label, (
+        "你的发送任务已结束。\n\n"
+        "账号：%s\n结果：%s\n时间：%s\n\n"
+        "请登录面板查看发送详情。\n" % (account, label, sent_at)
+    )
+
+
+def _email_notify_loop(stop_event: threading.Event) -> None:
+    """Send one account-scoped email for each completed run to opted-in users."""
+    try:
+        state = EMAIL_NOTIFY_STATE_STORE.read()
+        if not isinstance(state, dict) or not state.get("initialized"):
+            baseline = [_push_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
+            EMAIL_NOTIFY_STATE_STORE.write({
+                "initialized": True, "seen": baseline[-500:], "retry_after": {}, "delivered": {},
+            })
+    except Exception as error:
+        log_force("邮件通知初始化失败", type(error).__name__)
+    while not stop_event.wait(_WEBPUSH_POLL_SECONDS):
+        try:
+            state = EMAIL_NOTIFY_STATE_STORE.read()
+            seen_order = [str(item) for item in (state.get("seen") or [])]
+            seen = set(seen_order)
+            retry_after = state.get("retry_after") if isinstance(state.get("retry_after"), dict) else {}
+            delivered = state.get("delivered") if isinstance(state.get("delivered"), dict) else {}
+            runs = [item for item in load_sends(SEND_STORE_MAX) if isinstance(item, dict)]
+            events = []
+            for run in reversed(runs):
+                status = str(run.get("status") or "")
+                event_id = _push_event_id(run)
+                if (status in ("running", "queued") or event_id in seen
+                        or int(retry_after.get(event_id) or 0) > int(time.time())):
+                    continue
+                events.append((run, event_id))
+            if not events:
+                continue
+            preferences = EMAIL_SETTINGS_STORE.read()
+            recipients = preferences.get("users") if isinstance(preferences, dict) else {}
+            recipients = recipients if isinstance(recipients, dict) else {}
+            users = load_users()
+            accounts_by_name = {
+                str(task.get("unique_id") or ""): str(task.get("username") or "")
+                for task in load_tasks()
+            }
+            for run, event_id in events:
+                subject, body = _email_run_message(run)
+                failed = False
+                delivered_for_event = set(str(x) for x in (delivered.get(event_id) or []))
+                for username, preference in recipients.items():
+                    if not isinstance(preference, dict) or not preference.get("enabled"):
+                        continue
+                    try:
+                        address = _valid_email_address(preference.get("address") or "")
+                    except ValueError:
+                        continue
+                    if not address or not _push_run_visible(run, str(username), users, accounts_by_name):
+                        continue
+                    if str(username) in delivered_for_event:
+                        continue
+                    result = send_smtp_email(address, subject, body)
+                    if result.get("ok"):
+                        delivered_for_event.add(str(username))
+                    else:
+                        failed = True
+                if failed:
+                    delivered[event_id] = sorted(delivered_for_event)
+                    retry_after[event_id] = int(time.time()) + 30
+                else:
+                    seen.add(event_id)
+                    seen_order.append(event_id)
+                    retry_after.pop(event_id, None)
+                    delivered.pop(event_id, None)
+            pending_ids = {
+                _push_event_id(run) for run in runs
+                if str(run.get("status") or "") not in ("running", "queued")
+                and _push_event_id(run) not in seen
+            }
+            retry_after = {
+                key: value for key, value in retry_after.items()
+                if key in pending_ids and int(value or 0) > int(time.time()) - 86400
+            }
+            delivered = {key: value for key, value in delivered.items() if key in pending_ids}
+            EMAIL_NOTIFY_STATE_STORE.write({
+                "initialized": True, "seen": seen_order[-500:],
+                "retry_after": retry_after, "delivered": delivered,
+            })
+        except Exception as error:
+            log_force("邮件通知后台检查失败", type(error).__name__)
 
 
 # 退出登录「黑名单」：令牌一旦进来，签名再对也不认。
@@ -3017,6 +3304,16 @@ def delete_user(name: str) -> dict:
         return {"users": subscriptions}
 
     WEBPUSH_SUBSCRIPTIONS_STORE.update(_remove_push_devices)
+
+    def _remove_email_settings(data):
+        users = data.get("users") if isinstance(data, dict) else {}
+        users = dict(users) if isinstance(users, dict) else {}
+        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
+        test_limits = dict(test_limits) if isinstance(test_limits, dict) else {}
+        users.pop(name, None)
+        return {"users": users, "test_limits": test_limits}
+
+    EMAIL_SETTINGS_STORE.update(_remove_email_settings)
     log_force("删除用户", name)
     return {"ok": True, "message": "已删除用户 %s（它的抖音号配置还在账号区，可以再删掉）" % name}
 
@@ -6918,6 +7215,22 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <a href="/download">下载手机 App 与安装说明 →</a>
 </section>
 
+<section id="email-notification-settings">
+<h2>邮件通知</h2>
+<p class="muted">SMTP 由站点管理员配置。填写自己的收件邮箱后，可先发送测试邮件；开启后，只会收到自己名下账号的发送结果。</p>
+<label for="email_address">收件邮箱</label>
+<input id="email_address" type="email" maxlength="254" autocomplete="email" inputmode="email" placeholder="name@example.com">
+<div class="row" style="margin-top:10px">
+<label class="row" for="email_enabled" style="margin:0"><input id="email_enabled" type="checkbox" style="width:auto">接收发送结果邮件</label>
+</div>
+<div class="row" style="margin-top:10px">
+<button id="email_save" type="button">保存邮件设置</button>
+<button id="email_test" class="ghost" type="button">发送测试邮件</button>
+<span class="muted" id="email_state" role="status" aria-live="polite">读取邮件通知设置…</span>
+</div>
+<p class="muted">邮件服务器未配置时，地址仍可保存，但不会发送通知。测试邮件发送成功只代表 SMTP 已接收，请同时检查垃圾邮件文件夹。</p>
+</section>
+
 <section id="accountswitch">
 <h2>切换面板账号</h2>
 <p class="muted">退出后会回到登录页，你可以登录其他账号或注册新账号。</p>
@@ -7033,6 +7346,7 @@ function fmtWait(sec){
   return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
 }
 var FLASH_SEQ = 0, FLASH_MAX = 3;
+var EMAIL_SAVED_ADDRESS = '';
 function closeFlash(id){
   var el = $(id);
   if(el && el.parentNode && el.parentNode.removeChild){ el.parentNode.removeChild(el); }
@@ -7314,6 +7628,20 @@ function applyRole(s){
     mbd.textContent = s.has_cookie ? '已授权（Cookie 可用）' : '未授权';
     mbd.style.color = s.has_cookie ? 'var(--ok)' : 'var(--muted)';
   }
+  var mail = s.email_notifications || {};
+  EMAIL_SAVED_ADDRESS = String(mail.address || '');
+  if($('email_address') && document.activeElement !== $('email_address')){
+    $('email_address').value = EMAIL_SAVED_ADDRESS;
+  }
+  if($('email_enabled') && document.activeElement !== $('email_enabled')){
+    $('email_enabled').checked = !!mail.enabled;
+  }
+  if($('email_state')){
+    $('email_state').textContent = !mail.smtp_configured
+      ? '邮件服务尚未配置，请联系站点管理员'
+      : (mail.enabled ? '已开启：发送结果将发到 ' + (mail.address || '')
+        : (mail.address ? '邮件通知已关闭' : '请填写并保存邮箱地址'));
+  }
   var mine = (s.my_ids || []).length;
   // 普通用户只能有 1 个抖音号：已经有一个了就别再让他点「新增账号」
   var addBtn = $('baddacct');
@@ -7541,6 +7869,40 @@ $('mp_save').onclick = function(){
     if(r.ok){ $('mp_old').value = ''; $('mp_new').value = ''; $('mp_new2').value = ''; }
   });
 };
+if($('email_save')){
+  $('email_save').onclick = function(){
+    var address = ($('email_address').value || '').trim();
+    var enabled = !!$('email_enabled').checked;
+    $('email_save').disabled = true;
+    post('api/email/settings', {address: address, enabled: enabled}).then(function(r){
+      $('email_state').textContent = r.message || r.error || '';
+      $('email_state').style.color = r.ok ? 'var(--ok)' : 'var(--bad)';
+      flash(r.message || r.error || '', !!r.ok);
+      if(r.ok){
+        EMAIL_SAVED_ADDRESS = String((r.settings || {}).address || '');
+        $('email_address').value = EMAIL_SAVED_ADDRESS;
+        $('email_enabled').checked = !!((r.settings || {}).enabled);
+        refresh();
+      }
+    }).finally(function(){ $('email_save').disabled = false; });
+  };
+}
+if($('email_test')){
+  $('email_test').onclick = function(){
+    if(($('email_address').value || '').trim() !== EMAIL_SAVED_ADDRESS){
+      $('email_state').textContent = '请先保存当前邮箱，再发送测试邮件';
+      $('email_state').style.color = 'var(--warn)';
+      return;
+    }
+    $('email_test').disabled = true;
+    $('email_state').textContent = '正在发送测试邮件…';
+    post('api/email/test', {}).then(function(r){
+      $('email_state').textContent = r.message || r.error || '';
+      $('email_state').style.color = r.ok ? 'var(--ok)' : 'var(--bad)';
+      flash(r.message || r.error || '', !!r.ok);
+    }).finally(function(){ $('email_test').disabled = false; });
+  };
+}
 var SCHEDULE_CONFLICTS = [], scheduleCheckTimer = null, scheduleCheckAt = 0, scheduleCheckSignature = '', SCHEDULE_AUTOFILL = false;
 function scheduleCheckNow(force){
   var f = $('cfg');
@@ -12813,7 +13175,49 @@ class Handler(BaseHTTPRequestHandler):
         self._json(payload)
 
     def _dispatch(self, path: str) -> None:
-        if path == "/api/webpush/status":
+        if path == "/api/email/settings":
+            if not self._same_origin_request():
+                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
+                return
+            payload = self._body()
+            result = save_email_preferences(
+                self._user(), str(payload.get("address") or ""), payload.get("enabled")
+            )
+            self._json(result, 200 if result.get("ok") else 400)
+        elif path == "/api/email/test":
+            if not self._same_origin_request():
+                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
+                return
+            if not smtp_is_configured():
+                self._json({
+                    "ok": False,
+                    "error": "站点邮件服务尚未配置或配置无效，请联系管理员",
+                }, 503)
+                return
+            address = email_preferences(self._user()).get("address") or ""
+            if not address:
+                self._json({"ok": False, "error": "请先填写并保存收件邮箱"}, 400)
+                return
+            remaining = reserve_email_test(self._user(), address)
+            if remaining:
+                self._json({
+                    "ok": False,
+                    "error": "测试邮件发送太频繁，请 %d 秒后重试" % remaining,
+                }, 429)
+                return
+            result = send_smtp_email(
+                address,
+                "DouYinSparkFlow 邮件通知测试",
+                "这是一封测试邮件。SMTP 已接受发送请求；请检查收件箱和垃圾邮件文件夹。",
+            )
+            if result.get("ok"):
+                self._json({
+                    "ok": True,
+                    "message": "测试邮件已交给 SMTP 服务器，请检查收件箱和垃圾邮件文件夹",
+                })
+            else:
+                self._json(result, 502)
+        elif path == "/api/webpush/status":
             if not self._same_origin_request():
                 self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
                 return
@@ -13376,6 +13780,9 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "me": me,
             "is_admin": is_admin,
+            "email_notifications": dict(
+                email_preferences(me), smtp_configured=smtp_is_configured()
+            ),
             "subscription": access,
             "today_send": today_send,
             # 管理员自己的「最近从哪登录」；普通用户不需要，别白给
@@ -13880,6 +14287,12 @@ def main() -> int:
         ).start()
     else:
         print("[panel] Web Push 暂不可用：未安装 cryptography 依赖", flush=True)
+    if smtp_is_configured():
+        threading.Thread(
+            target=_email_notify_loop, args=(heartbeat_stop,), name="email-notify", daemon=True
+        ).start()
+    else:
+        print("[panel] 邮件通知未启用：请在 panel.env 配置 SMTP", flush=True)
     SERVER = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), Handler)
     print("[panel] listening on %s:%d" % (PANEL_HOST, PANEL_PORT), flush=True)
     try:

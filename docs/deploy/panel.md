@@ -83,6 +83,35 @@ PANEL_TRUST_PROXY=1
 - `WEBPUSH_SUBJECT` 填站点的公开 HTTPS origin，并以 `/` 结尾；不要填 IP、HTTP 地址或带页面路径的地址。
 - 只有按下文配置了可信的本机反向代理，并让它覆盖转发头时，才把 `PANEL_TRUST_PROXY` 设为 `1`。不要让公网客户端直接控制这些转发头。
 
+### 可选：配置发送结果邮件
+
+邮件由站点管理员配置 SMTP；每位用户再在网页的「我的账号 → 邮件通知」里填写自己的收件地址、发送测试邮件并选择是否开启。未配置 SMTP 时不会发邮件，Web Push 仍可单独使用。
+
+将以下变量追加到服务器私有的 `panel.env`。以 QQ 邮箱为例，须先在邮箱设置里开启 SMTP 并生成授权码；163、企业邮箱等请换成服务商提供的 SMTP 地址、端口和授权码：
+
+```dotenv
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=587
+SMTP_USERNAME=你的完整邮箱地址
+SMTP_PASSWORD=邮箱 SMTP 授权码
+SMTP_FROM=你的完整邮箱地址
+SMTP_FROM_NAME=DouYinSparkFlow
+SMTP_USE_SSL=0
+SMTP_STARTTLS=1
+```
+
+端口 `587` 通常使用 STARTTLS。若邮箱服务商要求 `465` SSL，将 `SMTP_PORT` 改为 `465`、`SMTP_USE_SSL=1`、`SMTP_STARTTLS=0`。`SMTP_FROM` 通常应与认证邮箱一致；用户名和授权码要么都填写，要么都留空（仅适用于服务商允许匿名中继的环境）。不要把邮箱登录密码或配置好的 `panel.env` 提交到 GitHub。
+
+如果授权码包含 `$` 等会被 Compose 展开的字符，在 `panel.env` 中按 Compose 环境文件语法用单引号括起该值，例如 `SMTP_PASSWORD='这里填写完整授权码'`。
+
+保存 SMTP 配置后，在确认没有发送任务运行时重建面板容器，让新环境变量生效：
+
+```bash
+sudo docker compose --env-file panel.env -f compose.yml up -d --force-recreate
+```
+
+再用用户账号打开「我的账号」，填入个人收件地址，点「保存邮件设置」，点「发送测试邮件」确认收件箱能收到邮件，最后勾选「接收发送结果邮件」并再次保存。测试按钮对每个面板账号有 60 秒冷却，同一收件地址有 5 分钟冷却；测试成功表示 SMTP 接收了邮件，不保证邮件一定进入收件箱。面板只在邮件中提供任务结果摘要，不附 Cookie 或完整日志。用户邮箱地址保存在私有的 `config/panel-email-settings.json` 中。
+
 限制配置文件权限：
 
 ```bash
@@ -228,6 +257,7 @@ sudo docker compose --env-file panel.env -f compose.yml up -d
 | 容器不断重启，日志提示 `PANEL_PASSWORD 未设置` | 检查 `panel.env` 中密码是否为空；确认命令使用了 `--env-file panel.env`。 |
 | 浏览器无法访问域名 | 检查 DNS、云安全组 TCP `80/443`、Caddy 状态和 `127.0.0.1:18080`；不要开放面板容器端口解决。 |
 | 浏览器提示不安全或通知不可用 | 确认通过域名 HTTPS 访问且证书有效；`WEBPUSH_SUBJECT` 必须与实际 HTTPS origin 一致。 |
+| 测试邮件失败或没有收到 | 检查 `panel.env` 的 SMTP 主机、端口、发件地址和授权码；核对 SSL/STARTTLS 组合以及服务器出站端口是否被服务商或云厂商拦截，并查看垃圾邮件。 |
 | 登录 IP 限速没有按真实访客生效 | 确认代理与面板在同一台主机、覆盖设置了转发头，并且 `PANEL_TRUST_PROXY=1`；不要信任可由公网访客自行填写的转发头。 |
 | 抖音号授权失败或登录态失效 | 看面板账号页提示和容器日志，重新扫码授权；升级前不要更改 `PANEL_SECRET` 或删除 `config/panel-secret`。 |
 | 磁盘或内存不足 | 用 `df -h`、`free -h` 检查主机资源；确认日志增长和同时打开的授权会话数量。不要删除 `config/` 来清理空间。 |

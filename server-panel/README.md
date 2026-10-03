@@ -14,6 +14,8 @@ Follow the [detailed multi-user panel deployment guide](../docs/deploy/panel.md)
 
 The panel's users and Douyin accounts are configured in its web interface. `config/.env` is for global settings such as the time zone and message template. Do not copy the root `.env.example` with its legacy sample `TASKS` and `COOKIES_*` values into a new panel deployment; the first startup can migrate those legacy values as an account.
 
+Optional email notifications use SMTP settings in the private `panel.env`. Each panel user can set their own recipient address and enable or disable send-result emails from “My Account”; the account owner can send a throttled test email before enabling notifications. See the deployment guide for provider examples and TLS settings.
+
 Keep `panel.env`, `config/`, and `logs/` private. They contain credentials, encrypted account state, and logs. `PANEL_SECRET` must remain stable after account credentials are saved; if it is left empty, the panel persists a generated value in `config/panel-secret`.
 
 To let the panel serve the public downloads, copy the files into `logs/app-downloads/` from this directory:
