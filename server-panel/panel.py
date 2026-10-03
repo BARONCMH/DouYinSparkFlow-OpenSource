@@ -68,6 +68,8 @@ ABORT_PATH = LOG_DIR / "abort-run.json"
 RESTART_FLAG = LOG_DIR / "restart-requested.json"
 AUTO_AUTH_SECONDS = 20 * 60  # 一次授权的绝对上限（兜底），正常情况下面那个"没动静"就会先把它关掉
 AUTH_IDLE_STOP = 3 * 60  # 秒：授权浏览器超过 3 分钟没人扫码/没操作，就自动关掉，别占着浏览器
+AUTH_AUTO_CHECK_WAIT_SECONDS = 300  # 授权成功后，最多排队 5 分钟等待资源进行登录检测
+_AUTH_AUTO_CHECK_LOCK = threading.RLock()
 # 发送记录：worker（tasks.py 里的 KEEP_RUNS_MAX）只保留最近 100 次，面板这边照这个上限给管理员看
 SEND_STORE_MAX = 100
 SEND_MAX_USER = 2  # 普通用户最多看自己名下最近 2 次
@@ -2214,7 +2216,7 @@ def real_check(checks: dict, uid: str):
     item = (checks or {}).get(str(uid))
     if not isinstance(item, dict):
         return None
-    if str(item.get("source") or "") == "qr":
+    if str(item.get("source") or "") in ("qr", "authorization"):
         return None
     return item
 
@@ -3762,6 +3764,8 @@ class BrowserSession:
         # 这台授权浏览器是谁的（哪个抖音号）；和 unique_id 分开记，
         # 免得别的流程（比如登录检测）推画面时把归属改掉，让别人看到你的画面。
         self.owner = ""
+        self.auto_check_uid = ""
+        self.auto_check_saved_at = ""
         self.forced = False
         self.last_frame_at = 0.0
         # ---- 扫码登录流程的状态 ----
@@ -3918,6 +3922,8 @@ class BrowserSession:
                     return False, "授权浏览器已经在运行了"
                 self.unique_id = str(unique_id or "").strip()
                 self.owner = self.unique_id
+                self.auto_check_uid = ""
+                self.auto_check_saved_at = ""
                 self.username = str(username or "").strip() or "账号1"
                 self.error = ""
                 self.saved = ""
@@ -3977,6 +3983,8 @@ class BrowserSession:
 
     def _run(self) -> None:
         playwright = browser = context = page = None
+        auto_check_uid = ""
+        auto_check_saved_at = ""
         try:
             from playwright.sync_api import sync_playwright
 
@@ -4107,6 +4115,9 @@ class BrowserSession:
                 except Exception:
                     pass
             with self.lock:
+                if self.state == "authorized":
+                    auto_check_uid = self.auto_check_uid
+                    auto_check_saved_at = self.auto_check_saved_at
                 # 检测结束后把画面交还出去：不然实时画面窗一直挂着别人的最后一张图
                 self.png = None
                 self.last_frame_at = 0.0
@@ -4132,6 +4143,13 @@ class BrowserSession:
                 self.owner = ""
                 self.unique_id = ""
                 self.thread = None
+            if auto_check_uid and auto_check_saved_at:
+                threading.Thread(
+                    target=_check_after_authorization_safely,
+                    args=(auto_check_uid, auto_check_saved_at),
+                    name="auth-auto-check",
+                    daemon=True,
+                ).start()
 
     @staticmethod
     def _capture(cdp) -> bytes:
@@ -4153,7 +4171,7 @@ class BrowserSession:
         if not (self.owner or self.unique_id):
             self._set(
                 state="need_id",
-                message="已检测到登录成功，但还没填「抖音号」。请在上方填写并保存配置，再点「导出 Cookies」",
+                message="已检测到抖音登录，但还没有可绑定的抖音号。请先在上方填写并保存抖音号，再重新开始授权。",
             )
             return False
         return self._store(context.storage_state())
@@ -4184,18 +4202,26 @@ class BrowserSession:
         except Exception:
             pass
         now = now_text()
-        # 只记「这个号什么时候授权的」，**不要**往 checks 里写。
-        # checks 是「登录检测」的结果，授权成功 != 检测通过：授权只说明 Cookie 存下来了，
-        # 这个号还能不能发消息得等检测跑一遍。以前在这里写一条 ok=True，
-        # 界面上刚授权的号立刻变成绿色的「登录正常」，看着全绿，真去发才发现早掉线了。
-        # 想让新授权的号显示正常？点「检测所有账号」跑一遍。
-        save_state({"saved_at": {uid: now}})
+        # 授权成功只代表登录状态已保存，不等于检测通过。用独立来源标记清掉旧检测结果，
+        # 然后自动排队检测；这个标记不会被 real_check 当成检测成功。
+        with _AUTH_AUTO_CHECK_LOCK:
+            save_state({
+                "saved_at": {uid: now},
+                "checks": {uid: {"source": "authorization", "at": now}},
+                "auth_auto_check": {uid: {
+                    "state": "pending",
+                    "saved_at": now,
+                    "message": "登录状态已保存，正在准备自动检测（不会发送消息）",
+                }},
+            })
+        with self.lock:
+            self.auto_check_uid = uid
+            self.auto_check_saved_at = now
         self._set(
             state="authorized",
             saved=key,
             phase="done",
-            message="登录成功，已加密保存 %d 个 Cookie 和 %d 个站点的本地存储到 %s"
-            % (len(cleaned), len(cleaned_state["origins"]), key),
+            message="登录成功，登录状态已加密保存；正在准备自动检测（不会发送消息）",
         )
         return True
 
@@ -5086,6 +5112,8 @@ class LoginChecker:
         self.forced = False
         self.started_at = 0.0
         self.ok = None
+        self.auto_check = False
+        self.auto_check_saved_at = ""
         # ---- 批量检测（管理页「检测所有账号」）----
         # 一台机器同时只能跑一个检测：检测要开 Chromium，内存只够一个（_ENGINE_LOCK 也是这个意思）。
         # 所以「批量」不是并发，而是排一个队、拿一个后台线程挨个跑完。
@@ -5179,23 +5207,25 @@ class LoginChecker:
             return "内存不够了（只剩 %d MB，检测要 %d MB），等%s结束再检测" % (left, need, who)
         return ""
 
-    def _begin(self, unique_id: str, message: str = ""):
+    def _begin(self, unique_id: str, message: str = "", auto_check: bool = False, auth_saved_at: str = ""):
         """真正开一轮检测：落状态 + 起线程，返回那个线程（批量检测要靠它 join）。"""
         with self.lock:
             self.unique_id = unique_id
             self.state = "running"
-            self.message = message or "正在用已保存的 Cookie 打开抖音聊天页…"
+            self.message = message or "正在检查已保存的登录状态…"
             self.png = None
             self.last_frame_at = 0.0
             self.forced = False
             self.ok = None
             self.started_at = time.time()
+            self.auto_check = bool(auto_check)
+            self.auto_check_saved_at = str(auth_saved_at or "")
         thread = threading.Thread(target=self._run, args=(unique_id,), daemon=True)
         self.thread = thread
         thread.start()
         return thread
 
-    def start(self, unique_id: str):
+    def start(self, unique_id: str, auto_check: bool = False):
         unique_id = str(unique_id or "").strip()
         # 和授权浏览器共用一把引擎锁：同时点只会有一个真的跑起来
         with _ENGINE_LOCK:
@@ -5208,8 +5238,18 @@ class LoginChecker:
             blocked = self._blocked_reason()
             if blocked:
                 return False, blocked
-            self._begin(unique_id)
-            return True, "开始检测，请稍候（大约 20-60 秒）"
+            auth_saved_at = ""
+            if auto_check:
+                with _AUTH_AUTO_CHECK_LOCK:
+                    marker = (load_state().get("auth_auto_check") or {}).get(unique_id) or {}
+                    auth_saved_at = str(marker.get("saved_at") or "") if isinstance(marker, dict) else ""
+                if not auth_saved_at:
+                    return False, "授权状态已更新，自动检测任务已取消"
+            else:
+                with _AUTH_AUTO_CHECK_LOCK:
+                    save_state({"auth_auto_check": {unique_id: None}})
+            self._begin(unique_id, auto_check=auto_check, auth_saved_at=auth_saved_at)
+            return True, "登录检测已开始，不会发送消息" if auto_check else "开始检测，请稍候（大约 20-60 秒）"
 
     # ------------------------------------------------------------------
     # 一键检测所有账号
@@ -5385,10 +5425,22 @@ class LoginChecker:
             record.update(extra)
         if not keep_old:
             save_state({"checks": {unique_id: record}})
+        auto_saved_at = ""
         with self.lock:
+            if self.auto_check:
+                auto_saved_at = self.auto_check_saved_at
+            self.auto_check = False
+            self.auto_check_saved_at = ""
             self.state = "done"
             self.ok = bool(ok)
             self.message = message
+        if auto_saved_at:
+            _auth_auto_check_update(
+                unique_id,
+                auto_saved_at,
+                "done" if ok else "failed",
+                message,
+            )
 
     def _targets_of(self, unique_id: str) -> list:
         for task in load_tasks():
@@ -5405,7 +5457,7 @@ class LoginChecker:
             storage_state = load_storage_state(unique_id)
             cookies = storage_state.get("cookies", [])
             if not cookies:
-                self._finish(unique_id, False, "还没有保存 Cookie，请先授权登录", {"reason": "no_cookie"})
+                self._finish(unique_id, False, "还没有保存登录状态，请先授权登录", {"reason": "no_cookie"})
                 return
             has_session = any(
                 c.get("name") in ("sessionid", "sessionid_ss") and c.get("value") for c in cookies
@@ -5481,7 +5533,7 @@ class LoginChecker:
                 if conversations:
                     break
                 with self.lock:
-                    self.message = "正在等待聊天页加载（如果弹了登录框，说明 Cookie 已失效）…"
+                    self.message = "正在打开抖音聊天页核对登录状态…"
 
             if conversations:
                 # 往下翻几屏，尽量把好友列表看全
@@ -5502,12 +5554,12 @@ class LoginChecker:
                 return
 
             if not conversations:
-                reason = "页面被登录弹窗挡住了" if info.get("loginDialog") else "页面里没有出现好友列表"
-                hint = "，Cookie 可能已过期，请重新授权登录" if has_session else "，请点「开始授权」并用抖音 App 扫码"
+                reason = "页面要求重新登录" if info.get("loginDialog") else "聊天列表没有加载出来"
+                hint = "登录状态可能已过期，请重新授权" if has_session else "请先完成抖音授权"
                 self._finish(
                     unique_id,
                     False,
-                    "未登录：" + reason + hint,
+                    "登录检测未通过：" + reason + "；" + hint + "后再试。",
                     {"conversations": 0, "has_session": has_session, "titles": titles[:40]},
                 )
                 return
@@ -6149,6 +6201,118 @@ browser = BrowserPool(MAX_AUTH_SESSIONS)
 runner = TaskRunner()
 checker = LoginChecker()
 
+
+def _auth_auto_check_update(unique_id: str, saved_at: str, status: str, message: str) -> bool:
+    """只更新与这次授权相符的自动检测状态，避免旧线程覆盖新授权。"""
+    with _AUTH_AUTO_CHECK_LOCK:
+        state = load_state()
+        entries = state.get("auth_auto_check")
+        entries = entries if isinstance(entries, dict) else {}
+        current = entries.get(unique_id)
+        if not isinstance(current, dict) or str(current.get("saved_at") or "") != str(saved_at):
+            return False
+        current_status = str(current.get("state") or "pending")
+        rank = {"pending": 0, "running": 1, "needs_manual": 2, "done": 2, "failed": 2}
+        if current_status in ("needs_manual", "done", "failed") and status != current_status:
+            return False
+        if rank.get(current_status, 0) > rank.get(status, 0):
+            return False
+        updated = dict(current)
+        updated.update({"state": status, "message": str(message or ""), "updated_at": now_text()})
+        save_state({"auth_auto_check": {unique_id: updated}})
+        return True
+
+
+def _check_after_authorization(unique_id: str, saved_at: str) -> None:
+    """等授权浏览器释放资源后检测新会话；只读检查，不发送消息。"""
+    deadline = time.monotonic() + AUTH_AUTO_CHECK_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        state = load_state()
+        entries = state.get("auth_auto_check")
+        entries = entries if isinstance(entries, dict) else {}
+        marker = entries.get(unique_id)
+        if not isinstance(marker, dict) or str(marker.get("saved_at") or "") != str(saved_at):
+            return
+        if str((state.get("saved_at") or {}).get(unique_id) or "") != str(saved_at):
+            return
+        if unique_id not in load_accounts():
+            return
+
+        previous = real_check(state.get("checks") or {}, unique_id)
+        if isinstance(previous, dict) and str(previous.get("at") or "") >= str(saved_at):
+            _auth_auto_check_update(
+                unique_id,
+                saved_at,
+                "done" if previous.get("ok") else "failed",
+                str(previous.get("message") or "登录检测已完成"),
+            )
+            return
+
+        check_state = checker.snapshot()
+        if check_state.get("running"):
+            if str(check_state.get("unique_id") or "") == unique_id:
+                _auth_auto_check_update(
+                    unique_id, saved_at, "running", "正在检查登录状态（不会发送消息）"
+                )
+            else:
+                _auth_auto_check_update(
+                    unique_id, saved_at, "pending", "另一项登录检测正在运行，完成后会自动检查此账号"
+                )
+            time.sleep(2)
+            continue
+
+        if browser.running():
+            _auth_auto_check_update(
+                unique_id, saved_at, "pending", "授权已保存，等其他授权窗口结束后自动检查"
+            )
+            time.sleep(2)
+            continue
+
+        ok, message = checker.start(unique_id, auto_check=True)
+        if ok:
+            _auth_auto_check_update(
+                unique_id, saved_at, "running", "正在检查登录状态（不会发送消息）"
+            )
+            return
+        if checker.running():
+            time.sleep(2)
+            continue
+        if "内存不够" in message or "正在检测" in message or "授权浏览器" in message:
+            _auth_auto_check_update(
+                unique_id, saved_at, "pending", "自动检测排队中：" + str(message)
+            )
+            time.sleep(2)
+            continue
+        _auth_auto_check_update(
+            unique_id,
+            saved_at,
+            "needs_manual",
+            "登录状态已保存，但自动检测未能启动：%s。可点「检测登录状态」重试；不会发送消息。"
+            % str(message),
+        )
+        return
+
+    _auth_auto_check_update(
+        unique_id,
+        saved_at,
+        "needs_manual",
+        "自动检测排队超过 5 分钟。登录状态已保存，请点「检测登录状态」重试；不会发送消息。",
+    )
+
+
+def _check_after_authorization_safely(unique_id: str, saved_at: str) -> None:
+    try:
+        _check_after_authorization(unique_id, saved_at)
+    except Exception as error:
+        log_force("授权后自动检测", "账号 %s：%s" % (unique_id, error))
+        _auth_auto_check_update(
+            unique_id,
+            saved_at,
+            "needs_manual",
+            "自动检测遇到问题：%s。登录状态已保存，请手动点「检测登录状态」重试；不会发送消息。"
+            % str(error),
+        )
+
 # 面板的 HTTP 服务器对象（优雅重启时要用它来 shutdown）
 SERVER = None
 
@@ -6501,6 +6665,8 @@ section.panel.on{display:block}
 @media(max-width:560px){.auth-rec-badge{font-size:8.5px;padding:1px 4px}.auth-recommend,.manual-screen-tip{padding:11px 12px;gap:8px}}
 .auth-download{display:inline-flex;align-items:center;justify-content:center;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink2);font-size:13px;text-decoration:none}
 .auth-download:hover{border-color:var(--brand-line);background:var(--brand-soft);color:var(--brand)}
+.auth-advanced{margin-top:10px;border-top:1px solid var(--line);padding-top:9px}
+.auth-advanced summary{color:var(--muted);font-size:13px;cursor:pointer}
 @media(max-width:900px){
   .app{grid-template-columns:1fr}
   .side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px}
@@ -6854,8 +7020,8 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <span class="sp"></span><button id="gtoggle" class="ghost sm" type="button" aria-label="收起或展开新手引导">收起</button></div>
 <ol id="glist">
 <li id="g1" data-goto="acctbox"><span class="gdot">1</span><span class="gtxt"><b>建一个账号</b><span>只填一个「抖音号」当名字（例如 myspark），别的都能先空着</span></span><button class="sm gact" id="gact1" type="button">去填写</button></li>
-<li id="g2" data-goto="authbox"><span class="gdot">2</span><span class="gtxt"><b>授权登录</b><span>选择一种方式完成登录</span></span><button class="sm gact" id="gact2" type="button">去授权</button></li>
-<li id="g3" data-goto="statusbox"><span class="gdot">3</span><span class="gtxt"><b>确认登录成功</b><span>点「检测登录状态」，确认 Cookie 还能看到好友列表</span></span><button class="sm gact" id="gact3" type="button">去检测</button></li>
+<li id="g2" data-goto="authbox"><span class="gdot">2</span><span class="gtxt"><b>授权登录</b><span>扫码或直接操作抖音登录页，成功后自动保存</span></span><button class="sm gact" id="gact2" type="button">去授权</button></li>
+<li id="g3" data-goto="statusbox"><span class="gdot">3</span><span class="gtxt"><b>确认登录状态</b><span>授权后自动检测；检测只查看状态，不会发送消息</span></span><button class="sm gact" id="gact3" type="button">查看状态</button></li>
 <li id="g4" data-goto="cfgbox"><span class="gdot">4</span><span class="gtxt"><b>填目标好友</b><span>每行一个好友昵称；每行填写一个好友，运行时发送</span></span><button class="sm gact" id="gact4" type="button">去填写</button></li>
 <li id="g5" data-goto="runbox"><span class="gdot">5</span><span class="gtxt"><b>跑一次看看</b><span>点击运行开始发送，并查看本次结果</span></span><button class="sm gact" id="gact5" type="button">去运行</button></li>
 </ol>
@@ -6881,13 +7047,13 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <section id="authbox"><h2><span class="step">2</span>授权登录</h2>
 <div class="authtabs" role="tablist" aria-label="选择登录方式">
 <button class="authtab on" id="tabmanual" type="button" role="tab" aria-selected="true" aria-label="手动授权，推荐方式">手动授权 <span class="auth-rec-badge">推荐</span></button>
-<button class="authtab" id="tabqr" type="button" role="tab" aria-selected="false">抖音扫码授权</button>
-<button class="authtab" id="tabcookie" type="button" role="tab" aria-selected="false">手动输入 Cookie</button>
+<button class="authtab" id="tabqr" type="button" role="tab" aria-selected="false">二维码授权</button>
+<button class="authtab" id="tabcookie" type="button" role="tab" aria-selected="false">备用导入</button>
 </div>
 <div id="browserauthpane">
 <div id="manualauthnotice" class="auth-recommend" role="note">
 <span class="ar-icon" aria-hidden="true">✓</span>
-<div><strong>推荐使用手动授权</strong><p>点「开始授权」后，下方会显示抖音实时画面；直接点击画面里的输入框和按钮，就能操作登录与验证。</p></div>
+<div><strong>推荐使用手动授权</strong><p>点「开始授权」后，可先用抖音 App 扫描二维码；也可以在下方画面里直接点选手机号登录并完成验证。登录成功后会自动加密保存并检查状态，无需复制 Cookie。</p></div>
 </div>
 <div class="row">
 <button id="bstart" type="button">开始授权</button>
@@ -6901,7 +7067,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <p class="muted" id="qrdiag" role="status"></p>
 <div id="qrloginbox" class="auth-recommend" role="note" hidden>
 <span class="ar-icon" aria-hidden="true">✓</span>
-<div><strong>使用抖音 App 扫码登录</strong><p>点「开始授权」后，等待下方二维码出现，再用抖音 App 扫一扫并在手机上确认。若网页和抖音 App 在同一部手机，可先保存二维码到相册，再从扫一扫里选择图片。</p></div>
+<div><strong>使用抖音 App 扫码登录</strong><p>点「开始授权」后，等待二维码出现，再用抖音 App 扫描并确认。若网页和抖音 App 在同一部手机，可先保存二维码到相册，再从扫一扫里选择图片。</p></div>
 </div>
 <div id="qrarea" hidden style="margin-top:14px">
 <div class="row" style="align-items:flex-start">
@@ -6935,14 +7101,14 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 </div>
 </div>
 <div id="cookieauthpane" hidden>
-<label for="f_ck">Cookie JSON</label>
-<textarea id="f_ck" name="cookie_json" form="cfg" placeholder="粘贴 Cookie JSON 数组" autocomplete="off" spellcheck="false"></textarea>
+<label for="f_ck">从 Cookie 工具导入（备用方式）</label>
+<textarea id="f_ck" name="cookie_json" form="cfg" placeholder="仅在自动授权失败时，粘贴工具导出的 Cookie JSON" autocomplete="off" spellcheck="false"></textarea>
 <div class="row">
 <button type="submit" form="cfg" id="bcookieimport">保存并导入 Cookie</button>
 <a class="auth-download" href="/downloads/Get-Douyin-Cookies.exe" download>下载 Cookie 获取工具（EXE）</a>
 <a class="auth-download" href="/downloads/Get-Douyin-Cookies.exe.sha256" download>查看 SHA-256</a>
 </div>
-<p class="muted">Cookie 等同登录凭证，请只导入自己的账号。</p>
+<p class="muted">Cookie 等同登录凭证，请只导入自己的账号。通常无需使用此备用方式。</p>
 </div>
 </section>
 
@@ -6952,10 +7118,10 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <div><div class="muted">账号</div><div class="kv" id="st_account">—</div></div>
 <div><div class="muted">抖音号</div><div class="kv" id="st_uid">—</div></div>
 <div><div class="muted">目标好友</div><div class="kv" id="st_targets">—</div></div>
-<div><div class="muted">Cookie</div><div class="kv" id="st_cookie">—</div></div>
+<div><div class="muted">登录状态</div><div class="kv" id="st_cookie">—</div></div>
 <div><div class="muted">登录成功时间</div><div class="kv" id="st_saved">—</div></div>
 </div>
-<div class="row"><button class="sm" id="bcopycookie" type="button">复制该抖音号 Cookie</button><span class="muted" id="copystate" role="status"></span></div>
+<details class="auth-advanced"><summary>高级选项：复制登录 Cookie</summary><p class="muted">仅在排查问题时使用。Cookie 等同登录凭证，请勿分享或发送给他人。</p><div class="row"><button class="sm" id="bcopycookie" type="button">复制该抖音号 Cookie</button><span class="muted" id="copystate" role="status"></span></div></details>
 <div class="row"><button id="bcheck" type="button">检测登录状态</button><span class="muted" id="checkstate" role="status"></span></div>
 <div class="progress" id="checkbar" hidden><i id="checkfill"></i></div>
 <p class="muted" id="checktime" role="status" hidden></p>
@@ -7356,8 +7522,8 @@ function fillForm(a){
   // 「顺便设为新账号默认值」每次切号都复位，免得手一抖把默认值也改了
   if(f.save_global){ f.save_global.checked = false; }
   $('cfgstate').textContent = a.has_cookie
-    ? ('已保存 ' + a.cookie_count + ' 个 Cookie 项' + (a.saved_at ? '（' + a.saved_at + '）' : ''))
-    : '这个账号还没有 Cookie，用下面的「开始授权」登录后会自动写入';
+    ? ('登录状态已保存' + (a.saved_at ? '（' + a.saved_at + '）' : ''))
+    : '这个账号还没有登录状态，点「开始授权」完成登录后会自动保存';
   updateCounts();
   scheduleCheckLater();
 }
@@ -8216,6 +8382,8 @@ function renderStatus(s){
     cur = CUR_ACCT || s;
   }
   var chk = realCheck(cur.check), ck = s.checker || {}, au = s.auth || {};
+  var autoCheck = (cur.auth_check && typeof cur.auth_check === 'object') ? cur.auth_check : {};
+  var autoCheckState = String(autoCheck.state || '');
   // 二级验证：抖音要求用已登录的设备扫码时，把抓到的二维码直接摆出来
   var vq = !!au.verify_qr, vqh = String(au.qr_hash || "");
   var vqBox = $("verifyqr");
@@ -8237,25 +8405,27 @@ function renderStatus(s){
   $('st_account').textContent = cur.username || '—';
   $('st_uid').textContent = cur.unique_id || '—';
   $('st_targets').textContent = (cur.targets && cur.targets.length) ? cur.targets.join('、') : '未填写';
-  $('st_cookie').textContent = cur.has_cookie
-    ? ('已保存 ' + cur.cookie_count + ' 项' + (cur.saved_at ? '（' + cur.saved_at + '）' : ''))
-    : '未保存';
+  $('st_cookie').textContent = cur.has_cookie ? '已保存' : '尚未授权';
   if($('st_saved')){ $('st_saved').textContent = cur.saved_at || '—'; }
   if($('savedat')){
     $('savedat').textContent = cur.saved_at ? ('登录成功时间：' + cur.saved_at) : '';
   }
 
 
-  if(cur._new){ badge('新账号：填个「抖音号」，点下面「开始授权」后用抖音 App 扫码', 'n'); }
+  if(cur._new){ badge('新账号：先填「抖音号」，再点「开始授权」扫码或手机号登录', 'n'); }
   else if(runningThis){ badge('正在检测登录状态…', 'y'); }
+  else if(autoCheckState === 'pending'){ badge('登录已保存，正在排队检测…', 'y'); }
+  else if(autoCheckState === 'needs_manual'){ badge('登录已保存，需要手动检测', 'y'); }
   else if(chk && chk.ok && !ready){ badge('已登录（还没填「目标好友」，填完点「保存配置」后可以手动运行）', 'y'); }
   else if(chk && chk.ok){ badge('已登录 - ' + chk.at, 'g'); }
-  else if(chk && !chk.ok){ badge('未登录 / Cookie 失效 - ' + chk.at, 'r'); }
-  else if(cur.has_cookie){ badge('已保存 Cookie，建议点下面「检测登录状态」确认一下', 'n'); }
+  else if(chk && !chk.ok){ badge('登录检测未通过 - ' + chk.at, 'r'); }
+  else if(cur.has_cookie){ badge('登录状态已保存，等待检测', 'n'); }
   else { badge('尚未授权（还没有登录过）', 'n'); }
   // 顶部常驻的一句话状态：不滚屏也能看到当前账号登录没登录
   var hs = '未授权', hc = 'n';
   if(runningThis){ hs = '检测中'; hc = 'y'; }
+  else if(autoCheckState === 'pending'){ hs = '检测排队中'; hc = 'y'; }
+  else if(autoCheckState === 'needs_manual'){ hs = '待检测'; hc = 'y'; }
   else if(chk && chk.ok){ hs = ready ? '已登录' : '已登录 · 待填好友'; hc = ready ? 'g' : 'y'; }
   else if(chk && !chk.ok){ hs = '未登录'; hc = 'r'; }
   else if(cur.has_cookie){ hs = '待检测'; }
@@ -8267,6 +8437,10 @@ function renderStatus(s){
   else if(!runningThis && checkWasRunning){ checkWasRunning = false; finishCheck(); }
   if(runningThis && ck.stuck){
     $('checkstate').textContent = (ck.message || '') + '　超过 ' + Math.round((ck.frame_age||0)) + ' 秒没有新画面，可能卡住了，可以点下面「强制停止」';
+  } else if(autoCheckState === 'pending'){
+    $('checkstate').textContent = autoCheck.message || '授权已保存，正在等待自动检测…';
+  } else if(autoCheckState === 'needs_manual'){
+    $('checkstate').textContent = autoCheck.message || '自动检测没有启动，请手动重试。';
   } else {
     $('checkstate').textContent = runningThis ? ck.message : '';
   }
@@ -8275,7 +8449,8 @@ function renderStatus(s){
   if(au.running){ ckWhy = '授权浏览器开着，先点「停止」再检测'; }
   else if(ck.running && !runningThis){ ckWhy = '另一个账号正在检测，等它跑完'; }
   setBtn('bcheck', !!ckWhy, ckWhy ? ('暂时点不了：' + ckWhy) : '');
-  $('bcheck').textContent = runningThis ? '停止检测' : '检测登录状态';
+  $('bcheck').textContent = runningThis ? '停止检测'
+    : (autoCheckState === 'pending' ? '立即检测' : '检测登录状态');
   var noAccount = !s.is_admin && !(s.my_ids && s.my_ids.length);
   var runWhy = '';
   if(s.runner.running){ runWhy = '正在执行发送任务，等它跑完'; }
@@ -8296,11 +8471,15 @@ function renderStatus(s){
     if(chk.missing && chk.missing.length){
       html += '<div style="color:#b91c1c">没在前几屏看到的目标好友：' + chk.missing.map(esc).join('、') + '（可能需要手动往上/下翻一下）</div>';
     }
+  } else if(cur.has_cookie && autoCheckState === 'pending'){
+    html += '<div class="muted">' + esc(autoCheck.message || '登录状态已保存，正在等待自动检测。')
+         + ' 检测只会打开聊天页确认登录状态，不会发送消息。</div>';
+  } else if(cur.has_cookie && autoCheckState === 'needs_manual'){
+    html += '<div class="bad">' + esc(autoCheck.message || '自动检测未启动，请点上面的「检测登录状态」重试。') + '</div>';
   } else if(cur.has_cookie){
     // 有 Cookie、但从没真检测过：这是常态（扫码授权不等于是验过），
     // 说清楚 + 指个按钮，别让人以为号坏了
-    html += '<div class="muted">这个号还没检测过。点上面的「检测登录状态」跑一遍，'
-         + '确认保存的 Cookie 现在还能不能发消息（大约 20-60 秒）。</div>';
+    html += '<div class="muted">这个账号还没检测过。点上面的「检测登录状态」检查能否正常打开聊天页（约 20-60 秒，不会发送消息）。</div>';
   }
   $('checkresult').innerHTML = html;
   renderGuide(s, cur);
@@ -8487,6 +8666,12 @@ function renderGuide(s, cur){
     var act = $('gact' + (k + 1));
     if(act){ act.hidden = (k !== current); }
   }
+  var g3act = $('gact3');
+  if(g3act && current === 2){
+    var autoState = String((cur.auth_check && cur.auth_check.state) || '');
+    g3act.textContent = (autoState === 'pending' || autoState === 'running')
+      ? '查看状态' : (cur.has_cookie && !checked ? '手动检测' : '查看状态');
+  }
 }
 function guideAction(step){
   if(step === 1 || step === 4){
@@ -8496,7 +8681,12 @@ function guideAction(step){
     return;
   }
   if(step === 2){ guideScrollTo('authbox'); if($('bstart') && !$('bstart').disabled){ $('bstart').click(); } return; }
-  if(step === 3){ guideScrollTo('statusbox'); if($('bcheck') && !$('bcheck').disabled){ $('bcheck').click(); } return; }
+  if(step === 3){
+    guideScrollTo('statusbox');
+    var autoState = String((CUR_ACCT && CUR_ACCT.auth_check && CUR_ACCT.auth_check.state) || '');
+    if(autoState !== 'pending' && autoState !== 'running' && $('bcheck') && !$('bcheck').disabled){ $('bcheck').click(); }
+    return;
+  }
   if(step === 5){ guideScrollTo('runbox'); if($('brun') && !$('brun').disabled){ $('brun').click(); } return; }
 }
 (function(){
@@ -13370,6 +13560,10 @@ class Handler(BaseHTTPRequestHandler):
                     "has_cookie": bool(item),
                     "cookie_count": len(item),
                     "saved_at": saved_at.get(uid, ""),
+                    "auth_check": (
+                        (state.get("auth_auto_check") or {}).get(uid)
+                        if isinstance(state.get("auth_auto_check"), dict) else None
+                    ),
                     "check": real_check(checks, uid),
                     "login_user": login_of.get(uid, ""),
                     "mine": True if scopes is None else (uid in scopes),
