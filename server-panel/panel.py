@@ -6783,7 +6783,6 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户</button>
 <button class="nav" type="button" data-go="records"><i class="ni ni-records"></i>发送记录</button>
 <button class="nav" type="button" data-go="me"><i class="ni ni-me"></i>我的账号</button>
-<button class="nav" type="button" data-go="admin" id="navadmin" hidden><i class="ni ni-admin"></i>管理</button>
 </nav>
 <div class="side-foot">
 <span class="who" id="whoami">—</span>
@@ -7092,7 +7091,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 </section><!-- /p-me -->
 
 <!-- ===== 管理（仅管理员可见）===== -->
-<section class="panel" id="p-admin">
+<section class="panel" id="p-admin" hidden>
 <section id="adminbox" hidden>
 <h2>用户管理</h2>
 <p class="muted">所有注册用户、绑定的抖音号、登录状态和剩余时长；可以改密码、分配抖音号、删用户。</p>
@@ -7409,9 +7408,8 @@ function applyRole(s){
     if(el){ el.disabled = !admin; el.title = admin ? '' : '所有账号共用的设置，只有管理员能改'; }
   });
   if($('gglobalwrap')){ $('gglobalwrap').hidden = !admin; }
-  // 管理员才看得到进「管理控制台」的入口
+  // 独立管理员控制台保留在 /admin；主控制台不再提供内嵌管理页签
   if($('adminlink')){ $('adminlink').hidden = !admin; }
-  if($('navadmin')){ $('navadmin').hidden = !admin; }
   if(!admin && typeof showPanel === 'function' && $('p-admin') && $('p-admin').className.indexOf('on') >= 0){
     // 换了个人登录 / 权限被收回：别把人晾在一个自己看不见的「管理」页上
     showPanel('accounts');
@@ -8420,8 +8418,8 @@ function guideSetOpen(open){
   try { window.localStorage.setItem(GUIDE_OPEN_KEY, open ? '1' : '0'); } catch(e){}
 }
 // ---- 左侧导航：切换内容面板 ----
-var PANELS = {overview:'概览', accounts:'抖音账户', records:'发送记录', me:'我的账号', admin:'管理'};
-var PANEL_ORDER = ['overview', 'accounts', 'records', 'me', 'admin'];
+var PANELS = {overview:'概览', accounts:'抖音账户', records:'发送记录', me:'我的账号'};
+var PANEL_ORDER = ['overview', 'accounts', 'records', 'me'];
 function showPanel(go){
   if(PANELS[go] === undefined){ go = 'overview'; }
   PANEL_ORDER.forEach(function(k){
@@ -8434,11 +8432,6 @@ function showPanel(go){
   var t = $('pageTitle');
   if(t){ t.textContent = PANELS[go]; }
   try { window.localStorage.setItem('panel:go', go); } catch(e){}
-  // 切到「管理」页时立刻拉一次用户列表（原先是展开折叠块触发的）
-  if(go === 'admin' && LAST_STATUS){
-    USERS_FORCE = true;
-    if(typeof renderUsers === 'function'){ renderUsers(LAST_STATUS); }
-  }
 }
 function initNav(){
   Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b){
@@ -8446,8 +8439,8 @@ function initNav(){
   });
   var saved = '';
   try { saved = window.localStorage.getItem('panel:go') || ''; } catch(e){}
-  // 「管理」对普通用户是隐藏的：上次退出时停在那一页的话，回落到抖音账户
-  if(saved === 'admin' && $('navadmin') && $('navadmin').hidden){ saved = ''; }
+  // 兼容旧版保存过的「管理」页状态：主控制台已移除该页，回到概览
+  if(saved === 'admin'){ saved = ''; }
   showPanel(saved || 'overview');
 }
 function guideScrollTo(id){
