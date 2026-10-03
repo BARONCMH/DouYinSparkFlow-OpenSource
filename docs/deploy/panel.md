@@ -60,7 +60,7 @@ EOF
 
 需要调整消息模板、日志级别等全局选项时，可在面板的设置页管理可用选项，或按根目录 [`.env.example`](../../.env.example) 的说明添加对应变量。不要把 `TASKS`、`COOKIES_*` 示例值放进新面板的 `config/.env`。
 
-## 3. 设置管理员和 Web Push 配置
+## 3. 设置管理员面板配置
 
 ```bash
 cp panel.env.example panel.env
@@ -68,24 +68,22 @@ openssl rand -hex 24
 nano panel.env
 ```
 
-把 `openssl` 输出的一串随机字符复制到 `PANEL_PASSWORD`，并将 `WEBPUSH_SUBJECT` 改成你之后实际使用的 HTTPS 网站根地址。例如：
+把 `openssl` 输出的一串随机字符复制到 `PANEL_PASSWORD`。例如：
 
 ```dotenv
 PANEL_USERNAME=admin
 PANEL_PASSWORD=这里替换为刚生成的随机密码
 PANEL_SECRET=
-WEBPUSH_SUBJECT=https://panel.example.com/
 PANEL_TRUST_PROXY=1
 ```
 
 - `PANEL_PASSWORD` 必须设置，否则面板会拒绝启动。请使用唯一的强密码；登录后也可以在面板中修改管理员密码。
 - `PANEL_SECRET` 留空时，程序会生成密钥并保存到 `config/panel-secret`。备份时要保留该文件。若自行填写 `PANEL_SECRET`，之后必须一直保留同一个值；更换密钥会使已保存的抖音登录凭据无法解密，并让现有登录会话失效。
-- `WEBPUSH_SUBJECT` 填站点的公开 HTTPS origin，并以 `/` 结尾；不要填 IP、HTTP 地址或带页面路径的地址。
 - 只有按下文配置了可信的本机反向代理，并让它覆盖转发头时，才把 `PANEL_TRUST_PROXY` 设为 `1`。不要让公网客户端直接控制这些转发头。
 
 ### 可选：配置发送结果邮件
 
-邮件由站点管理员配置 SMTP；每位用户再在网页的「我的账号 → 邮件通知」里填写自己的收件地址、发送测试邮件并选择是否开启。未配置 SMTP 时不会发邮件，Web Push 仍可单独使用。
+发送结果只通过邮件通知。邮件由站点管理员配置 SMTP；每位用户再在网页的「我的账号 → 邮件通知」里填写自己的收件地址、发送测试邮件并选择是否开启。未配置 SMTP 时不会发邮件。
 
 将以下变量追加到服务器私有的 `panel.env`。以 QQ 邮箱为例，须先在邮箱设置里开启 SMTP 并生成授权码；163、企业邮箱等请换成服务商提供的 SMTP 地址、端口和授权码：
 
@@ -169,7 +167,7 @@ sudo systemctl status caddy --no-pager
 
 Caddy 会为可公开访问的域名申请并续期 HTTPS 证书。若已有 Nginx 或其他反向代理，也可以继续使用；需将站点代理到 `http://127.0.0.1:18080`，启用有效 HTTPS，并覆盖传给面板的 `Host`、`X-Real-IP`、`X-Forwarded-For` 和 `X-Forwarded-Proto` 请求头。只有代理可信且覆盖这些头时才启用 `PANEL_TRUST_PROXY=1`。
 
-现在可访问 `https://panel.example.com/`。浏览器应显示有效证书，登录 Cookie 会使用 `Secure` 属性，Web Push 也需要 HTTPS。
+现在可访问 `https://panel.example.com/`。浏览器应显示有效证书，登录 Cookie 会使用 `Secure` 属性。
 
 ## 6. 首次登录和添加账号
 
@@ -177,8 +175,8 @@ Caddy 会为可公开访问的域名申请并续期 HTTPS 证书。若已有 Ngi
 2. 如果需要开放普通用户注册，在管理员面板中保持注册开启；要限制使用者时，可在管理页关闭公开注册并自行管理账号。
 3. 普通用户通过网站注册并登录后，在账号页添加自己的抖音号。
 4. 按页面提示发起授权，并使用抖音 App 扫描网页二维码，在手机上确认。若抖音要求额外短信验证，在页面中填写收到的验证码。
-5. 为账号设置目标好友、发送时间和消息配置，再查看面板显示的任务状态与记录。
-6. 如果要使用通知，在支持 Web Push 的浏览器中允许通知权限。通知是否及时还受浏览器、系统省电策略和网络状态影响。
+5. 为账号设置目标好友、发送时间和消息配置，再查看面板显示的任务状态与记录。单次发送运行最多 10 分钟；超时后系统会结束本次任务并记录超时结果。
+6. 如需发送结果提醒，在「我的账号 → 邮件通知」填写收件邮箱并开启邮件通知。
 
 每个面板账号只能查看和操作自己名下的抖音号。管理员密码、账号凭据和二维码都不要转发给他人。
 
@@ -198,7 +196,7 @@ cp ../downloads/Get-Douyin-Cookies.exe ../downloads/Get-Douyin-Cookies.exe.sha25
 
 ### 备份
 
-至少定期备份 `config/`、`logs/`、`panel.env` 和当前 Git 提交版本。它们包含管理员设置、用户数据库、加密后的抖音登录状态、兑换码状态、通知订阅与发送记录。备份文件也属于敏感数据，应限制读取权限并存放在受控位置；不要提交到 GitHub。
+至少定期备份 `config/`、`logs/`、`panel.env` 和当前 Git 提交版本。它们包含管理员设置、用户数据库、加密后的抖音登录状态、兑换码状态、邮件通知设置与发送记录。备份文件也属于敏感数据，应限制读取权限并存放在受控位置；不要提交到 GitHub。
 
 建议在没有发送任务运行时进行一致性备份。若通过停止容器备份，先确认没有任务正在执行，因为停止容器会中断面板及其中的任务：
 
@@ -256,7 +254,7 @@ sudo docker compose --env-file panel.env -f compose.yml up -d
 | --- | --- |
 | 容器不断重启，日志提示 `PANEL_PASSWORD 未设置` | 检查 `panel.env` 中密码是否为空；确认命令使用了 `--env-file panel.env`。 |
 | 浏览器无法访问域名 | 检查 DNS、云安全组 TCP `80/443`、Caddy 状态和 `127.0.0.1:18080`；不要开放面板容器端口解决。 |
-| 浏览器提示不安全或通知不可用 | 确认通过域名 HTTPS 访问且证书有效；`WEBPUSH_SUBJECT` 必须与实际 HTTPS origin 一致。 |
+| 浏览器提示不安全 | 确认通过域名 HTTPS 访问且证书有效，并检查反向代理的证书配置。 |
 | 测试邮件失败或没有收到 | 检查 `panel.env` 的 SMTP 主机、端口、发件地址和授权码；核对 SSL/STARTTLS 组合以及服务器出站端口是否被服务商或云厂商拦截，并查看垃圾邮件。 |
 | 登录 IP 限速没有按真实访客生效 | 确认代理与面板在同一台主机、覆盖设置了转发头，并且 `PANEL_TRUST_PROXY=1`；不要信任可由公网访客自行填写的转发头。 |
 | 抖音号授权失败或登录态失效 | 看面板账号页提示和容器日志，重新扫码授权；升级前不要更改 `PANEL_SECRET` 或删除 `config/panel-secret`。 |

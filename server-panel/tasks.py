@@ -4,6 +4,7 @@ import os
 import random
 import re
 import traceback
+from uuid import uuid4
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.douyin_im import norm
@@ -210,7 +211,7 @@ def wait_with_abort(seconds):
         time.sleep(min(1.0, remaining))
 
 
-def record_run(entry):
+def record_run(entry, cleanup_shots=True):
     """把一次发送的结果写进 send-status.json，控制台据此显示发送记录。"""
     try:
         os.makedirs(os.path.dirname(SEND_LOG), exist_ok=True)
@@ -223,7 +224,18 @@ def record_run(entry):
                     data = loaded
             except Exception:
                 pass
-        data["runs"].insert(0, entry)
+        run_id = str(entry.get("run_id") or "")
+        existing_index = next(
+            (
+                index for index, run in enumerate(data["runs"])
+                if run_id and isinstance(run, dict) and str(run.get("run_id") or "") == run_id
+            ),
+            None,
+        )
+        if existing_index is None:
+            data["runs"].insert(0, entry)
+        else:
+            data["runs"][existing_index] = entry
         kept, seen = [], {}
         for run in data["runs"]:
             key = str(run.get("unique_id") or run.get("account") or "")
@@ -231,22 +243,23 @@ def record_run(entry):
             if seen[key] <= KEEP_RUNS_PER_ACCOUNT and len(kept) < KEEP_RUNS_MAX:
                 kept.append(run)
         data["runs"] = kept
-        keep = {
-            item.get("shot")
-            for run in data["runs"]
-            for item in run.get("friends", [])
-            if item.get("shot")
-        }
         tmp = SEND_LOG + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=1)
         os.replace(tmp, SEND_LOG)
-        try:
-            for name in os.listdir(SHOT_DIR):
-                if name not in keep:
-                    os.remove(os.path.join(SHOT_DIR, name))
-        except Exception:
-            pass
+        if cleanup_shots:
+            keep = {
+                item.get("shot")
+                for run in data["runs"]
+                for item in run.get("friends", [])
+                if item.get("shot")
+            }
+            try:
+                for name in os.listdir(SHOT_DIR):
+                    if name not in keep:
+                        os.remove(os.path.join(SHOT_DIR, name))
+            except Exception:
+                pass
     except Exception as error:
         print("写入发送记录失败:", error)
 
@@ -1311,6 +1324,8 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
 
     # [本地增强] 记录本次发送结果，结束后写进 send-status.json 供控制台展示
     entry = {
+        "run_id": "%s:%s" % (os.getenv("PANEL_RUN_ID", "") or uuid4().hex, str(unique_id or "")),
+        "runner_id": str(os.getenv("PANEL_RUN_ID") or ""),
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "account": account,
         "unique_id": str(unique_id or ""),
@@ -1319,6 +1334,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
         "status": "running",
         "detail": "",
     }
+    # 先落一条进行中记录。若面板的 10 分钟硬上限先到，父进程会把它改成超时，
+    # 概览和邮箱通知仍能看到这次未完成的任务。
+    record_run(entry)
     try:
         shot_session = context.new_cdp_session(page)
     except Exception:
@@ -1326,9 +1344,10 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
 
     # [修复·误报] 同时挂一个"发送回执"观察器：只有它才知道抖音服务端到底
     # 收下没有。上一版只信 DOM（还是猜的类名），8 条真发出去的消息全被冤成"未送达"。
-    watcher = ImSendWatcher(page)
+    watcher = None
 
     try:
+        watcher = ImSendWatcher(page)
         # 打开抖音网页聊天页面
         retry_operation(
             "打开抖音网页聊天页面",
@@ -1400,6 +1419,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                         "message": "",
                     }
                 )
+                record_run(entry, cleanup_shots=False)
                 break
             if handled:
                 wait = delay_seconds()
@@ -1417,6 +1437,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                                 "message": "",
                             }
                         )
+                        record_run(entry, cleanup_shots=False)
                         break
             handled += 1
             item = {
@@ -1438,6 +1459,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 item["shot"] = capture_shot(shot_session, account, target)
                 logger.error(f"账号 {account} 给 {target} 发送失败：{item['detail']}")
                 entry["friends"].append(item)
+                record_run(entry, cleanup_shots=False)
                 continue
 
             chat_input = page.locator(CHAT_EDITOR_SELECTOR)
@@ -1460,6 +1482,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 logger.error(f"账号 {account} 给 {target} 发送失败：{item['detail']}")
                 traceback.print_exc()
                 entry["friends"].append(item)
+                record_run(entry, cleanup_shots=False)
                 continue
 
             # 第三步：按回车发送，然后校验"到底发出去了没有"。
@@ -1525,6 +1548,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
             time.sleep(1)
             item["shot"] = capture_shot(shot_session, account, target)
             entry["friends"].append(item)
+            record_run(entry, cleanup_shots=False)
         # [本地增强] 名单上还有没匹配上的好友：列表滚到底也没出现这个名字。
         # 截一张当时的画面存进发送记录，点开就知道是「列表压根没加载出来」，
         # 还是「这个人不在这个号的好友里 / 昵称对不上」。
@@ -1541,6 +1565,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                         "shot": miss_shot,
                         "message": "",
                     })
+                record_run(entry, cleanup_shots=False)
                 logger.warning(
                     f"账号 {account} 没找到的好友：{'、'.join(missing)}（已附现场截图）"
                 )
@@ -1576,7 +1601,8 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 clear_relogin_marker()
         entry["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         record_run(entry)
-        watcher.close()
+        if watcher is not None:
+            watcher.close()
         context.close()
 
 

@@ -32,7 +32,7 @@
 
 ✅ 支持 GitHub Actions 运行（`schedule.yml` 仅限手动触发，Fork 后不会自动跑）
 
-✅ 配套多用户 Web 控制台，支持注册 / 兑换 / 发送记录 / Web Push 与邮件通知
+✅ 配套多用户 Web 控制台，支持注册 / 兑换 / 发送记录 / 邮件通知
 
 ✅ 提供 Android 客户端与 Windows Cookie 导出工具，装完即用
 
@@ -43,7 +43,7 @@
 | 目录 | 说明 |
 |---|---|
 | `server-panel/` | 多用户面板与 worker overlay（`panel.py` + `tasks.py` + `compose.yml`） |
-| `android/` | HTTPS-only WebView 客户端源码，含账号切换与发送结果通知 |
+| `android/` | HTTPS-only WebView 客户端源码，含账号切换 |
 | `cookie-tool/` | Windows Cookie 导出工具源码与打包脚本 |
 | `downloads/` | 成品 APK / EXE 及配套 `.sha256` |
 
@@ -100,7 +100,7 @@ docker compose logs -f
 mkdir -p server-panel/config server-panel/logs
 printf 'TZ=Asia/Shanghai\n' > server-panel/config/.env
 
-# 2) 面板环境，必须设 PANEL_PASSWORD 与 WEBPUSH_SUBJECT
+# 2) 面板环境，必须设置 PANEL_PASSWORD
 cp server-panel/panel.env.example server-panel/panel.env
 
 # 3) 想让面板的下载路由提供成品，就把 downloads/ 里的文件放进去

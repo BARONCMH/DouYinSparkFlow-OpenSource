@@ -30,6 +30,6 @@ To let the panel serve the public downloads, copy the files into `logs/app-downl
 
 ## Private data
 
-The config directory contains user/password databases, hashed redemption codes, session keys, account Cookies, and Web Push keys. The log directory contains send records and diagnostic output. Back up these paths securely; never commit or publish them. Use least-privilege filesystem permissions and keep the reverse proxy, base image, and host patched.
+The config directory contains user/password databases, hashed redemption codes, session keys, account Cookies, and per-user email settings. The log directory contains send records and diagnostic output. Back up these paths securely; never commit or publish them. Use least-privilege filesystem permissions and keep the reverse proxy, base image, and host patched.
 
 This is a deployment overlay, not a standalone server image. Check the upstream image release notes before upgrading `PANEL_IMAGE`; custom overlays can depend on upstream interfaces.

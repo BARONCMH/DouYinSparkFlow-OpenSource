@@ -38,9 +38,8 @@ except ImportError:  # pragma: no cover
     fcntl = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from uuid import uuid4
 
 from dotenv import dotenv_values
 
@@ -97,6 +96,7 @@ SCHEDULE_INTERVAL = 5  # 秒：检查到期账号并启动排队中的定时任�
 CHECK_TIMEOUT = 120  # 秒：登录检测整体上限，超过就自动收尾，绝不允许一直卡着
 STUCK_AFTER = 90  # 秒：授权浏览器超过这么久没有新画面，就认为卡住了
 RUN_STUCK_AFTER = 180  # 秒：发送任务超过这么久没有新日志，就认为卡住了
+RUN_MAX_DURATION = 600  # 秒：单次发送任务的硬上限，超过后关闭任务及其子进程
 
 PANEL_USERNAME = os.getenv("PANEL_USERNAME", "admin")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "")
@@ -112,10 +112,6 @@ SESSION_REVOKE_PATH = Path("/app/config/session-revoked.json")  # 退出登录�
 NOTICE_PATH = Path("/app/config/panel-notice.json")  # 主界面公告条 + 管理员联系方式（给「全体同志」看的那份）
 MESSAGES_PATH = Path("/app/config/panel-messages.json")  # 定向消息（管理员单独发给指定用户），显示在他们控制台最上方
 CODES_PATH = Path("/app/config/panel-redeem-codes.json")  # 一次性兑换码（只保存哈希）
-WEBPUSH_SUBSCRIPTIONS_PATH = Path("/app/config/panel-webpush-subscriptions.json")
-WEBPUSH_VAPID_PATH = Path("/app/config/panel-webpush-vapid.json")
-WEBPUSH_STATE_PATH = LOG_DIR / "webpush-state.json"
-WEBPUSH_LIB_DIR = Path("/app/config/webpush-lib")
 EMAIL_SETTINGS_PATH = Path("/app/config/panel-email-settings.json")
 EMAIL_NOTIFY_STATE_PATH = LOG_DIR / "email-notify-state.json"
 MAX_BODY_BYTES = 1000000  # 单次请求体上限，超过直接回 413
@@ -344,12 +340,6 @@ USERS_STORE = JsonStore(USERS_PATH)
 ACCOUNTS_STORE = JsonStore(ACCOUNTS_PATH)
 CODES_STORE = JsonStore(CODES_PATH, default=lambda: {"codes": []})
 LOGIN_FAILS_STORE = JsonStore(LOGIN_FAILS_PATH)
-WEBPUSH_SUBSCRIPTIONS_STORE = JsonStore(
-    WEBPUSH_SUBSCRIPTIONS_PATH, default=lambda: {"users": {}}
-)
-WEBPUSH_STATE_STORE = JsonStore(
-    WEBPUSH_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
-)
 EMAIL_SETTINGS_STORE = JsonStore(
     EMAIL_SETTINGS_PATH, default=lambda: {"users": {}}
 )
@@ -357,396 +347,10 @@ EMAIL_NOTIFY_STATE_STORE = JsonStore(
     EMAIL_NOTIFY_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
 )
 
-_WEBPUSH_KEY_LOCK = threading.Lock()
-_WEBPUSH_CRYPTO_CACHE = None
-_WEBPUSH_SUBJECT = (os.getenv("WEBPUSH_SUBJECT") or "https://example.com/").strip()
-_WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER = 5
-_WEBPUSH_POLL_SECONDS = 5
-
-
-def _webpush_crypto():
-    """Load the optional cryptography wheel from the persistent config volume."""
-    global _WEBPUSH_CRYPTO_CACHE
-    if _WEBPUSH_CRYPTO_CACHE is False:
-        return None
-    if _WEBPUSH_CRYPTO_CACHE is not None:
-        return _WEBPUSH_CRYPTO_CACHE
-    if WEBPUSH_LIB_DIR.is_dir() and str(WEBPUSH_LIB_DIR) not in sys.path:
-        sys.path.insert(0, str(WEBPUSH_LIB_DIR))
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import ec, utils
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    except Exception:
-        _WEBPUSH_CRYPTO_CACHE = False
-        return None
-    _WEBPUSH_CRYPTO_CACHE = (hashes, serialization, ec, utils, AESGCM)
-    return _WEBPUSH_CRYPTO_CACHE
-
-
-def _b64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(value: str) -> bytes:
-    text = str(value or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
-        raise ValueError("invalid base64url")
-    return base64.urlsafe_b64decode(text + "=" * ((4 - len(text) % 4) % 4))
-
-
-def webpush_vapid_keys() -> dict:
-    """Create one persistent P-256 VAPID key pair, then reuse it for all devices."""
-    crypto = _webpush_crypto()
-    if not crypto:
-        raise RuntimeError("Web Push 的加密组件尚未安装")
-    _hashes, _serialization, ec, _utils, _aesgcm = crypto
-    with _WEBPUSH_KEY_LOCK:
-        if WEBPUSH_VAPID_PATH.exists():
-            data = read_json(WEBPUSH_VAPID_PATH, dict)
-            private_hex = str(data.get("private_hex") or "") if isinstance(data, dict) else ""
-            public_text = str(data.get("public_key") or "") if isinstance(data, dict) else ""
-            if not re.fullmatch(r"[0-9a-f]{64}", private_hex):
-                raise RuntimeError("VAPID 密钥文件格式无效")
-            private_value = int(private_hex, 16)
-            private = ec.derive_private_key(private_value, ec.SECP256R1())
-            public_raw = private.public_key().public_bytes(
-                _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
-            )
-            if not hmac.compare_digest(_b64url_encode(public_raw), public_text):
-                raise RuntimeError("VAPID 密钥对不匹配")
-            return {"private": private, "public_key": public_text, "public_raw": public_raw}
-        private = ec.generate_private_key(ec.SECP256R1())
-        private_value = private.private_numbers().private_value
-        public_raw = private.public_key().public_bytes(
-            _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
-        )
-        data = {
-            "private_hex": "%064x" % private_value,
-            "public_key": _b64url_encode(public_raw),
-            "created_at": now_text(),
-        }
-        atomic_write(WEBPUSH_VAPID_PATH, json.dumps(data, ensure_ascii=False, indent=2), 0o600)
-        return {"private": private, "public_key": data["public_key"], "public_raw": public_raw}
-
-
-def _hkdf_extract(salt: bytes, key_material: bytes) -> bytes:
-    return hmac.new(salt or (b"\x00" * 32), key_material, hashlib.sha256).digest()
-
-
-def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-    output = bytearray()
-    previous = b""
-    counter = 1
-    while len(output) < length:
-        previous = hmac.new(prk, previous + info + bytes([counter]), hashlib.sha256).digest()
-        output.extend(previous)
-        counter += 1
-        if counter > 256:
-            raise ValueError("HKDF output is too long")
-    return bytes(output[:length])
-
-
-def _webpush_endpoint_origin(endpoint: str) -> str:
-    parsed = urlsplit(str(endpoint or ""))
-    host = (parsed.hostname or "").lower().rstrip(".")
-    allowed = (
-        host == "fcm.googleapis.com" or host.endswith(".fcm.googleapis.com")
-        or host == "push.services.mozilla.com" or host.endswith(".push.services.mozilla.com")
-        or host == "push.apple.com" or host.endswith(".push.apple.com")
-    )
-    if (
-        parsed.scheme != "https" or not allowed or not parsed.path.startswith("/")
-        or parsed.username or parsed.password or parsed.port not in (None, 443)
-        or len(endpoint) > 2048
-    ):
-        raise ValueError("推送地址不受支持")
-    return "https://" + parsed.netloc.lower()
-
-
-def _vapid_authorization(endpoint: str, keypair: dict) -> str:
-    crypto = _webpush_crypto()
-    if not crypto:
-        raise RuntimeError("Web Push 的加密组件尚未安装")
-    hashes, _serialization, _ec, utils, _aesgcm = crypto
-    header = _b64url_encode(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
-    claims = {
-        "aud": _webpush_endpoint_origin(endpoint),
-        "exp": int(time.time()) + 12 * 60 * 60,
-        "sub": _WEBPUSH_SUBJECT,
-    }
-    body = _b64url_encode(json.dumps(claims, separators=(",", ":")).encode())
-    signing_input = (header + "." + body).encode("ascii")
-    der = keypair["private"].sign(signing_input, _ec_signature_algorithm())
-    r, s = utils.decode_dss_signature(der)
-    return "vapid t=%s.%s.%s, k=%s" % (
-        header, body, _b64url_encode(r.to_bytes(32, "big") + s.to_bytes(32, "big")),
-        keypair["public_key"],
-    )
-
-
-def _ec_signature_algorithm():
-    crypto = _webpush_crypto()
-    if not crypto:
-        raise RuntimeError("Web Push 的加密组件尚未安装")
-    return crypto[2].ECDSA(crypto[0].SHA256())
-
-
-def _webpush_encrypt(subscription: dict, payload: bytes) -> tuple:
-    crypto = _webpush_crypto()
-    if not crypto:
-        raise RuntimeError("Web Push 的加密组件尚未安装")
-    _hashes, _serialization, ec, _utils, aes_gcm = crypto
-    keys = subscription.get("keys") if isinstance(subscription, dict) else None
-    if not isinstance(keys, dict):
-        raise ValueError("订阅密钥无效")
-    user_public = _b64url_decode(keys.get("p256dh") or "")
-    auth_secret = _b64url_decode(keys.get("auth") or "")
-    if len(user_public) != 65 or user_public[0] != 4 or len(auth_secret) != 16:
-        raise ValueError("订阅密钥长度无效")
-    user_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), user_public)
-    server_private = ec.generate_private_key(ec.SECP256R1())
-    server_public = server_private.public_key().public_bytes(
-        _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
-    )
-    shared_secret = server_private.exchange(ec.ECDH(), user_key)
-    key_info = b"WebPush: info\x00" + user_public + server_public
-    input_key_material = _hkdf_expand(_hkdf_extract(auth_secret, shared_secret), key_info, 32)
-    salt = os.urandom(16)
-    prk = _hkdf_extract(salt, input_key_material)
-    content_key = _hkdf_expand(prk, b"Content-Encoding: aes128gcm\x00", 16)
-    nonce = _hkdf_expand(prk, b"Content-Encoding: nonce\x00", 12)
-    encrypted = aes_gcm(content_key).encrypt(nonce, payload + b"\x02", None)
-    record_size = 4096
-    body = salt + record_size.to_bytes(4, "big") + bytes([len(server_public)]) + server_public + encrypted
-    return body, server_public
-
-
-class _NoWebPushRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def send_webpush(subscription: dict, message: dict) -> str:
-    """Send one encrypted Web Push. Returns sent, expired, or retry."""
-    try:
-        endpoint = str(subscription.get("endpoint") or "")
-        _webpush_endpoint_origin(endpoint)
-        keys = webpush_vapid_keys()
-        body, _server_public = _webpush_encrypt(
-            subscription, json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-        request = Request(
-            endpoint,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": _vapid_authorization(endpoint, keys),
-                "Content-Encoding": "aes128gcm",
-                "Content-Type": "application/octet-stream",
-                "TTL": "86400",
-                "Urgency": "high",
-            },
-        )
-        opener = build_opener(_NoWebPushRedirect())
-        with opener.open(request, timeout=6) as response:
-            return "sent" if 200 <= response.status < 300 else "retry"
-    except HTTPError as error:
-        if error.code in (404, 410):
-            return "expired"
-        log_force("Web Push 服务暂不可用", "HTTP %d" % error.code)
-        return "retry"
-    except (URLError, TimeoutError, OSError) as error:
-        # Never put subscription endpoints or cryptographic material in logs.
-        log_force("Web Push 发送失败", type(error).__name__)
-        return "retry"
-    except (ValueError, TypeError, RuntimeError) as error:
-        log_force("Web Push 订阅无效", type(error).__name__)
-        return "expired"
-
-
-def _clean_push_subscriptions(data) -> dict:
-    users = data.get("users") if isinstance(data, dict) else None
-    cleaned = {}
-    if isinstance(users, dict):
-        for name, records in users.items():
-            if not isinstance(records, list):
-                continue
-            valid = [
-                item for item in records
-                if isinstance(item, dict) and isinstance(item.get("endpoint"), str)
-                and isinstance(item.get("keys"), dict)
-            ]
-            if valid:
-                cleaned[str(name)] = valid[:_WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER]
-    return {"users": cleaned}
-
-
-def save_webpush_subscription(username: str, subscription: dict) -> dict:
-    endpoint = str(subscription.get("endpoint") or "")
-    _webpush_endpoint_origin(endpoint)
-    keys = subscription.get("keys") if isinstance(subscription.get("keys"), dict) else {}
-    p256dh = _b64url_encode(_b64url_decode(str(keys.get("p256dh") or "")))
-    auth = _b64url_encode(_b64url_decode(str(keys.get("auth") or "")))
-    if len(_b64url_decode(p256dh)) != 65 or len(_b64url_decode(auth)) != 16:
-        raise ValueError("订阅密钥长度无效")
-    crypto = _webpush_crypto()
-    if not crypto:
-        raise RuntimeError("Web Push 的加密组件尚未安装")
-    try:
-        crypto[2].EllipticCurvePublicKey.from_encoded_point(
-            crypto[2].SECP256R1(), _b64url_decode(p256dh)
-        )
-    except Exception as error:
-        raise ValueError("订阅公钥无效") from error
-    record = {"endpoint": endpoint, "keys": {"p256dh": p256dh, "auth": auth}, "at": now_text()}
-    result = {"ok": True}
-
-    def apply(data):
-        users = _clean_push_subscriptions(data)["users"]
-        current_records = [item for item in users.get(username, []) if item.get("endpoint") != endpoint]
-        if len(current_records) >= _WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER:
-            result.update({"ok": False, "error": "一个账号最多开启 5 台设备的通知，请先关闭其他设备"})
-            return {"users": users}
-        # A push endpoint belongs to one panel login only, even on a shared device.
-        for name in list(users):
-            users[name] = [item for item in users[name] if item.get("endpoint") != endpoint]
-            if not users[name]:
-                users.pop(name, None)
-        users[username] = current_records + [record]
-        return {"users": users}
-
-    WEBPUSH_SUBSCRIPTIONS_STORE.update(apply)
-    return result
-
-
-def remove_webpush_subscription(username: str, endpoint: str) -> None:
-    if endpoint:
-        _webpush_endpoint_origin(endpoint)
-
-    def apply(data):
-        users = _clean_push_subscriptions(data)["users"]
-        if username in users:
-            users[username] = [item for item in users[username] if item.get("endpoint") != endpoint]
-            if not users[username]:
-                users.pop(username, None)
-        return {"users": users}
-
-    WEBPUSH_SUBSCRIPTIONS_STORE.update(apply)
-
-
-def _push_run_visible(run: dict, username: str, users: dict, accounts_by_name: dict) -> bool:
-    if username == PANEL_USERNAME:
-        return True
-    item = users.get(username) if isinstance(users, dict) else None
-    scopes = set(str(uid) for uid in (item.get("accounts") or [])) if isinstance(item, dict) else set()
-    uid = str(run.get("unique_id") or "")
-    if uid:
-        return uid in scopes
-    owned_names = {
-        str(accounts_by_name.get(uid) or "") for uid in scopes
-    }
-    owned_names.discard("")
-    return str(run.get("account") or "") in owned_names
-
-
-def _push_event_id(run: dict) -> str:
-    stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
-
-
-def _push_message(run: dict, event_id: str) -> dict:
-    status = str(run.get("status") or "")
-    labels = {
-        "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
-        "error": "发送出错", "no_login": "账号需要重新登录", "no_friend": "未找到目标好友",
-    }
-    account = str(run.get("account") or run.get("unique_id") or "你的账号")[:60]
-    label = labels.get(status, "发送任务已结束")
-    return {
-        "title": label,
-        "body": account + " · " + label,
-        "url": "/",
-        "tag": "send-" + event_id,
-    }
-
-
-def _webpush_notify_loop(stop_event: threading.Event) -> None:
-    """Watch completed send records and deliver account-scoped Web Push notifications."""
-    try:
-        state = WEBPUSH_STATE_STORE.read()
-        if not isinstance(state, dict) or not state.get("initialized"):
-            baseline = [_push_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
-            WEBPUSH_STATE_STORE.write({"initialized": True, "seen": baseline[-500:], "retry_after": {}})
-    except Exception as error:
-        log_force("Web Push 初始化失败", type(error).__name__)
-    while not stop_event.wait(_WEBPUSH_POLL_SECONDS):
-        try:
-            state = WEBPUSH_STATE_STORE.read()
-            seen_order = [str(item) for item in (state.get("seen") or [])]
-            seen = set(seen_order)
-            retry_after = state.get("retry_after") if isinstance(state.get("retry_after"), dict) else {}
-            runs = [item for item in load_sends(SEND_STORE_MAX) if isinstance(item, dict)]
-            events = []
-            for run in reversed(runs):
-                status = str(run.get("status") or "")
-                event_id = _push_event_id(run)
-                if (status in ("running", "queued") or event_id in seen
-                        or int(retry_after.get(event_id) or 0) > int(time.time())):
-                    continue
-                events.append((run, event_id))
-            if not events:
-                continue
-            subscriptions = _clean_push_subscriptions(WEBPUSH_SUBSCRIPTIONS_STORE.read())["users"]
-            users = load_users()
-            accounts_by_name = {
-                str(task.get("unique_id") or ""): str(task.get("username") or "")
-                for task in load_tasks()
-            }
-            for run, event_id in events:
-                message = _push_message(run, event_id)
-                retry = False
-                for username, records in subscriptions.items():
-                    if not _push_run_visible(run, username, users, accounts_by_name):
-                        continue
-                    expired = []
-                    for subscription in records:
-                        result = send_webpush(subscription, message)
-                        if result == "expired":
-                            expired.append(str(subscription.get("endpoint") or ""))
-                        elif result == "retry":
-                            retry = True
-                    if expired:
-                        for endpoint in expired:
-                            try:
-                                remove_webpush_subscription(username, endpoint)
-                            except Exception:
-                                pass
-                if retry:
-                    retry_after[event_id] = int(time.time()) + 30
-                else:
-                    seen.add(event_id)
-                    seen_order.append(event_id)
-                    retry_after.pop(event_id, None)
-            pending_ids = {
-                _push_event_id(run) for run in runs
-                if str(run.get("status") or "") not in ("running", "queued")
-                and _push_event_id(run) not in seen
-            }
-            retry_after = {
-                key: value for key, value in retry_after.items()
-                if key in pending_ids and int(value or 0) > int(time.time()) - 86400
-            }
-            WEBPUSH_STATE_STORE.write({
-                "initialized": True, "seen": seen_order[-500:], "retry_after": retry_after,
-            })
-        except Exception as error:
-            log_force("Web Push 后台检查失败", type(error).__name__)
-
-
 EMAIL_ADDRESS_RE = re.compile(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]{2,}")
 EMAIL_TEST_COOLDOWN = 60
 EMAIL_ADDRESS_TEST_COOLDOWN = 300
+EMAIL_NOTIFY_POLL_SECONDS = 5
 
 
 def _valid_email_address(value: str) -> str:
@@ -919,12 +523,30 @@ def reserve_email_test(username: str, address: str) -> int:
     return max(0, int(outcome["remaining"]))
 
 
+def _send_event_id(run: dict) -> str:
+    stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
+
+
+def _send_run_visible(run: dict, username: str, users: dict, accounts_by_name: dict) -> bool:
+    if username == PANEL_USERNAME:
+        return True
+    item = users.get(username) if isinstance(users, dict) else None
+    scopes = set(str(uid) for uid in (item.get("accounts") or [])) if isinstance(item, dict) else set()
+    uid = str(run.get("unique_id") or "")
+    if uid:
+        return uid in scopes
+    owned_names = {str(accounts_by_name.get(key) or "") for key in scopes}
+    owned_names.discard("")
+    return str(run.get("account") or "") in owned_names
+
+
 def _email_run_message(run: dict) -> tuple:
     status = str(run.get("status") or "")
     labels = {
         "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
         "error": "发送出错", "no_login": "账号需要重新登录", "no_friend": "未找到目标好友",
-        "queue_timeout": "任务排队超时", "skipped": "任务已跳过",
+        "queue_timeout": "任务排队超时", "skipped": "任务已跳过", "timed_out": "发送任务超时",
     }
     label = labels.get(status, "发送任务已结束")
     account = str(run.get("account") or run.get("unique_id") or "你的账号")[:80]
@@ -941,13 +563,13 @@ def _email_notify_loop(stop_event: threading.Event) -> None:
     try:
         state = EMAIL_NOTIFY_STATE_STORE.read()
         if not isinstance(state, dict) or not state.get("initialized"):
-            baseline = [_push_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
+            baseline = [_send_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
             EMAIL_NOTIFY_STATE_STORE.write({
                 "initialized": True, "seen": baseline[-500:], "retry_after": {}, "delivered": {},
             })
     except Exception as error:
         log_force("邮件通知初始化失败", type(error).__name__)
-    while not stop_event.wait(_WEBPUSH_POLL_SECONDS):
+    while not stop_event.wait(EMAIL_NOTIFY_POLL_SECONDS):
         try:
             state = EMAIL_NOTIFY_STATE_STORE.read()
             seen_order = [str(item) for item in (state.get("seen") or [])]
@@ -958,7 +580,7 @@ def _email_notify_loop(stop_event: threading.Event) -> None:
             events = []
             for run in reversed(runs):
                 status = str(run.get("status") or "")
-                event_id = _push_event_id(run)
+                event_id = _send_event_id(run)
                 if (status in ("running", "queued") or event_id in seen
                         or int(retry_after.get(event_id) or 0) > int(time.time())):
                     continue
@@ -984,7 +606,7 @@ def _email_notify_loop(stop_event: threading.Event) -> None:
                         address = _valid_email_address(preference.get("address") or "")
                     except ValueError:
                         continue
-                    if not address or not _push_run_visible(run, str(username), users, accounts_by_name):
+                    if not address or not _send_run_visible(run, str(username), users, accounts_by_name):
                         continue
                     if str(username) in delivered_for_event:
                         continue
@@ -1002,9 +624,9 @@ def _email_notify_loop(stop_event: threading.Event) -> None:
                     retry_after.pop(event_id, None)
                     delivered.pop(event_id, None)
             pending_ids = {
-                _push_event_id(run) for run in runs
+                _send_event_id(run) for run in runs
                 if str(run.get("status") or "") not in ("running", "queued")
-                and _push_event_id(run) not in seen
+                and _send_event_id(run) not in seen
             }
             retry_after = {
                 key: value for key, value in retry_after.items()
@@ -3297,13 +2919,6 @@ def delete_user(name: str) -> dict:
         return users
 
     update_users(_apply)
-
-    def _remove_push_devices(data):
-        subscriptions = _clean_push_subscriptions(data)["users"]
-        subscriptions.pop(name, None)
-        return {"users": subscriptions}
-
-    WEBPUSH_SUBSCRIPTIONS_STORE.update(_remove_push_devices)
 
     def _remove_email_settings(data):
         users = data.get("users") if isinstance(data, dict) else {}
@@ -5946,6 +5561,10 @@ class TaskRunner:
         self.started_at = None
         self.handle = None
         self._lock_handle = None
+        self._timeout_timer = None
+        self.timed_out = False
+        self.timed_out_at = ""
+        self.run_id = ""
         self.only = ""   # 这次只跑哪个抖音号（空 = 全部）
 
     def _take_shared_lock(self) -> bool:
@@ -5988,51 +5607,237 @@ class TaskRunner:
         """发送任务退出后释放共享锁，供下一次手动运行使用。"""
         process = self.process
         if process is not None and process.poll() is not None:
+            if self._timeout_timer is not None:
+                self._timeout_timer.cancel()
+                self._timeout_timer = None
             self._release_shared_lock()
+            if self.handle is not None:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+                self.handle = None
+
+    def _terminate_process_tree(self, process) -> None:
+        """Stop the task and browser children spawned by main.py."""
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                pass
+
+    def _record_timeout_results(self, run_id: str, started_at: float) -> None:
+        """Finalize the active account and record selected accounts the killed batch never reached."""
+        try:
+            data = json.loads(SEND_LOG.read_text(encoding="utf-8")) if SEND_LOG.exists() else {"runs": []}
+            if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+                data = {"runs": []}
+            runs = data["runs"]
+            started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
+            finished_text = now_text()
+            detail_active = "本次发送运行超过 10 分钟，系统已关闭任务及其子进程；本账号未完成。"
+            detail_pending = "发送批次超过 10 分钟，系统已关闭任务及其子进程；本账号未能开始发送。"
+            recorded = set()
+            changed = False
+
+            for run in runs:
+                if not isinstance(run, dict) or str(run.get("runner_id") or "") != run_id:
+                    continue
+                uid = str(run.get("unique_id") or "")
+                if uid:
+                    recorded.add(uid)
+                if str(run.get("status") or "") == "running":
+                    run.update({
+                        "status": "timed_out",
+                        "reason": "timeout",
+                        "detail": detail_active,
+                        "finished_at": finished_text,
+                        "timed_out": True,
+                    })
+                    changed = True
+
+            all_tasks = load_tasks()
+            requested_ids = {part.strip() for part in str(self.only or "").split(",") if part.strip()}
+            if not requested_ids:
+                requested_ids = {
+                    str(task.get("unique_id") or "")
+                    for task in all_tasks
+                    if isinstance(task, dict)
+                }
+            by_id = {
+                str(task.get("unique_id") or ""): task
+                for task in all_tasks
+                if isinstance(task, dict) and str(task.get("unique_id") or "") in requested_ids
+            }
+            for uid, task in by_id.items():
+                if not uid or uid in recorded:
+                    continue
+                if not [target for target in (task.get("targets") or []) if str(target).strip()]:
+                    continue
+                try:
+                    if not load_cookies(uid):
+                        continue
+                except Exception:
+                    continue
+                runs.insert(0, {
+                    "run_id": "%s:%s" % (run_id, uid),
+                    "runner_id": run_id,
+                    "at": started_text,
+                    "finished_at": finished_text,
+                    "account": str(task.get("username") or uid),
+                    "unique_id": uid,
+                    "targets": [str(target) for target in (task.get("targets") or [])],
+                    "friends": [],
+                    "status": "timed_out",
+                    "reason": "timeout",
+                    "detail": detail_pending,
+                    "timed_out": True,
+                })
+                changed = True
+
+            if changed:
+                runs[:] = runs[:SEND_STORE_MAX]
+                atomic_write(SEND_LOG, json.dumps(data, ensure_ascii=False, indent=1))
+        except Exception as error:
+            log_force("记录发送超时结果失败", type(error).__name__)
+
+    def _record_aborted_results(self, run_id: str) -> None:
+        """Keep a manually force-stopped run from remaining marked as running forever."""
+        if not run_id:
+            return
+        try:
+            if not SEND_LOG.exists():
+                return
+            data = json.loads(SEND_LOG.read_text(encoding="utf-8"))
+            runs = data.get("runs") if isinstance(data, dict) else None
+            if not isinstance(runs, list):
+                return
+            changed = False
+            for run in runs:
+                if (not isinstance(run, dict)
+                        or str(run.get("runner_id") or "") != run_id
+                        or str(run.get("status") or "") != "running"):
+                    continue
+                run.update({
+                    "status": "failed",
+                    "reason": "aborted",
+                    "detail": "发送任务被强制停止，本账号本次运行未完成。",
+                    "finished_at": now_text(),
+                })
+                changed = True
+            if changed:
+                atomic_write(SEND_LOG, json.dumps(data, ensure_ascii=False, indent=1))
+        except Exception as error:
+            log_force("记录发送停止结果失败", type(error).__name__)
+
+    def _stop_if_expired(self, process, started_at: float) -> None:
+        with self.lock:
+            if self.process is not process or self.started_at != started_at or process.poll() is not None:
+                return
+            if self.handle is not None:
+                try:
+                    self.handle.write("\n===== %s任务运行超过 10 分钟，已自动停止=====\n" % now_text())
+                    self.handle.flush()
+                except Exception:
+                    pass
+            self._terminate_process_tree(process)
+            self._record_timeout_results(self.run_id, started_at)
+            self.timed_out = True
+            self.timed_out_at = now_text()
+            self._release_shared_lock()
+            if self.handle is not None:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+                self.handle = None
+            self._timeout_timer = None
 
     def start(self, only: str = "", source: str = "手动"):
         """only 传抖音号时，只跑这一个账号（账号级登录的用户只能跑自己的）。"""
         # 同样共用引擎锁：不会出现"检测刚起来，发送任务也起来了"
         with _ENGINE_LOCK:
-            if browser.running():
-                return False, "授权浏览器还开着，请先点「停止」再运行，避免内存不够"
-            if checker.running():
-                return False, "正在检测登录状态，请稍候"
-            if self.process is not None and self.process.poll() is None:
-                return False, "已经有一个任务在运行了"
-            if not self._take_shared_lock():
-                return False, "已有发送任务正在运行，等它结束后再试，避免同一个账号重复发送"
-            environment = os.environ.copy()
-            environment.update({k: v for k, v in parse_env().items() if v is not None})
-            # 账号数据现在存在 accounts.json，这里还原成 main.py 认识的老格式变量
-            environment.update(accounts_env())
-            if only:
-                environment["RUN_ONLY_ACCOUNTS"] = str(only)
-            else:
-                environment.pop("RUN_ONLY_ACCOUNTS", None)
-            self.only = str(only or "")
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            self.handle = os.fdopen(
-                os.open(RUN_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8"
-            )
-            self.handle.write(
-                "\n===== %s %s运行（%s）=====\n" % (now_text(), source, only or "全部账号")
-            )
-            self.handle.flush()
-            try:
-                self.process = subprocess.Popen(
-                    [sys.executable, "main.py"],
-                    cwd=str(BASE_DIR),
-                    env=environment,
-                    stdout=self.handle,
-                    stderr=subprocess.STDOUT,
-                    text=True,
+            with self.lock:
+                self._reap()
+                if browser.running():
+                    return False, "授权浏览器还开着，请先点「停止」再运行，避免内存不够"
+                if checker.running():
+                    return False, "正在检测登录状态，请稍候"
+                if self.process is not None and self.process.poll() is None:
+                    return False, "已经有一个任务在运行了"
+                if not self._take_shared_lock():
+                    return False, "已有发送任务正在运行，等它结束后再试，避免同一个账号重复发送"
+                environment = os.environ.copy()
+                environment.update({k: v for k, v in parse_env().items() if v is not None})
+                environment.update(accounts_env())
+                self.run_id = uuid4().hex
+                environment["PANEL_RUN_ID"] = self.run_id
+                self.timed_out = False
+                self.timed_out_at = ""
+                if only:
+                    environment["RUN_ONLY_ACCOUNTS"] = str(only)
+                else:
+                    environment.pop("RUN_ONLY_ACCOUNTS", None)
+                self.only = str(only or "")
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                self.handle = os.fdopen(
+                    os.open(RUN_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8"
                 )
-            except Exception:
-                self._release_shared_lock()
-                raise
-            self.started_at = time.time()
-            return True, "任务已启动"
+                self.handle.write(
+                    "\n===== %s %s运行（%s）=====\n" % (now_text(), source, only or "全部账号")
+                )
+                self.handle.flush()
+                process_options = {}
+                if os.name == "nt":
+                    process_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                else:
+                    process_options["start_new_session"] = True
+                try:
+                    self.process = subprocess.Popen(
+                        [sys.executable, "main.py"],
+                        cwd=str(BASE_DIR),
+                        env=environment,
+                        stdout=self.handle,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        **process_options,
+                    )
+                except Exception:
+                    self._release_shared_lock()
+                    if self.handle is not None:
+                        self.handle.close()
+                        self.handle = None
+                    raise
+                self.started_at = time.time()
+                self.timed_out = False
+                self._timeout_timer = threading.Timer(
+                    RUN_MAX_DURATION, self._stop_if_expired, args=(self.process, self.started_at)
+                )
+                self._timeout_timer.daemon = True
+                self._timeout_timer.start()
+                return True, "任务已启动，单次最多运行 10 分钟"
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -6050,20 +5855,30 @@ class TaskRunner:
                 "started_at": self.started_at,
                 "stale": stale,
                 "stuck": bool(running and stale is not None and stale > RUN_STUCK_AFTER),
+                "timed_out": bool(self.timed_out),
+                "timed_out_at": self.timed_out_at,
                 "only": self.only,
             }
 
     def kill(self) -> bool:
         """强杀面板里正在跑的发送任务（连同它的浏览器进程）。"""
         with self.lock:
-            self._release_shared_lock()
             process = self.process
             if process is None or process.poll() is not None:
+                self._reap()
                 return False
-            try:
-                process.kill()
-            except Exception:
-                pass
+            if self._timeout_timer is not None:
+                self._timeout_timer.cancel()
+                self._timeout_timer = None
+            self._terminate_process_tree(process)
+            self._record_aborted_results(self.run_id)
+            self._release_shared_lock()
+            if self.handle is not None:
+                try:
+                    self.handle.close()
+                except Exception:
+                    pass
+                self.handle = None
             self.started_at = None
             return True
 
@@ -6948,17 +6763,26 @@ html[data-theme] #themebtn{gap:5px;border-color:var(--line);color:var(--ink2);ba
 html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--brand)}
 @media(max-width:900px){html[data-theme] .side{box-shadow:0 -8px 26px rgba(30,8,12,.18)}html[data-theme] .top{background:var(--bg);border-bottom-color:var(--line);z-index:180}}
 @media(max-width:560px){.account-panel{width:min(270px,calc(100vw - 22px))}}
+.overview-heading{margin:4px 0 14px}.overview-heading h2{margin:0 0 4px}.overview-heading p{margin:0;color:var(--muted);font-size:13px}
+.overview-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0 0 15px}
+.overview-stat{min-width:0;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card)}
+.overview-stat span{display:block;color:var(--muted);font-size:12px}.overview-stat b{display:block;margin-top:4px;font-size:24px;line-height:1.2}
+.overview-layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(240px,.8fr);gap:14px}
+.overview-run{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+.overview-run:first-child{border-top:0}.overview-run-main{min-width:0}.overview-run-main b,.overview-run-main span{display:block;overflow-wrap:anywhere}.overview-run-main span{color:var(--muted);font-size:12px;margin-top:2px}
+.overview-shortcut{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 0;border-top:1px solid var(--line)}
+.overview-shortcut:first-of-type{border-top:0}.overview-shortcut span{color:var(--muted);font-size:13px}
+@media(max-width:720px){.overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-layout{grid-template-columns:1fr}}
 
 </style></head><body>
 <div class="app">
 <aside class="side">
 <div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>续火花控制台</i></div></div>
 <nav id="nav" aria-label="主菜单">
-<button class="nav on" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户</button>
-<button class="nav" type="button" data-go="logs"><i class="ni ni-logs"></i>日志</button>
+<button class="nav on" type="button" data-go="overview"><i class="ni ni-overview"></i>概览</button>
+<button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户</button>
 <button class="nav" type="button" data-go="records"><i class="ni ni-records"></i>发送记录</button>
 <button class="nav" type="button" data-go="me"><i class="ni ni-me"></i>我的账号</button>
-<button class="nav" type="button" data-go="subscription"><i class="ni ni-clock"></i>时长服务</button>
 <button class="nav" type="button" data-go="admin" id="navadmin" hidden><i class="ni ni-admin"></i>管理</button>
 </nav>
 <div class="side-foot">
@@ -6970,7 +6794,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 </aside>
 <main class="main">
 <div class="top">
-<h1 id="pageTitle">抖音账户</h1>
+<h1 id="pageTitle">概览</h1>
 <span class="sp"></span>
 <span class="head-mid"><b id="headacct">—</b><span id="headbadge" class="badge n">读取中</span></span>
 <button id="hbstart" class="sm" type="button" aria-label="开始授权登录">开始授权</button>
@@ -6986,24 +6810,10 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 </details>
 </div>
 <div id="flash" role="status" aria-live="polite"></div>
-<section class="today-status" aria-live="polite" aria-label="今天的发送状态">
-  <span class="today-mark" aria-hidden="true">✦</span>
-  <div class="today-copy"><b id="todaySendState">正在读取今天的发送状态</b><span id="todaySendMeta">发送结果会自动更新</span></div>
-  <button class="ghost sm" type="button" onclick="showPanel('records')">查看记录</button>
-</section>
 <section class="opensource-promo" aria-label="开源项目">
   <span class="promo-mark" aria-hidden="true">GH</span>
   <div class="promo-copy"><h2>项目已开源</h2><p>查看源代码，下载 Android App 和 Windows Cookie 工具。</p></div>
   <a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">查看项目 <span aria-hidden="true">↗</span></a>
-</section>
-<section id="webpush-card" aria-label="发送结果通知">
-  <h2>🔔 发送结果通知</h2>
-  <p class="muted" id="webpush-help" style="margin:0 0 8px">开启后，发送成功或失败时会向这台设备推送提醒。</p>
-  <div class="row" style="margin-top:0">
-    <button id="webpush-enable" class="sm" type="button">开启发送通知</button>
-    <button id="webpush-disable" class="ghost sm" type="button" hidden>关闭通知</button>
-    <span class="muted" id="webpush-state" role="status" aria-live="polite">正在检查通知支持情况…</span>
-  </div>
 </section>
 <div id="notice" hidden>
 <div class="n-head"><b>公告</b><span class="sp"></span><button id="notice_x" class="ghost sm" type="button" aria-label="关闭公告">知道了</button></div>
@@ -7014,8 +6824,32 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <div id="msgs" hidden></div>
 <div id="relogin"></div>
 
+<!-- ===== 个人概览 ===== -->
+<section class="panel on" id="p-overview">
+<div class="overview-heading"><h2>今日概览</h2><p>查看今天的发送结果、账号数量和剩余服务时长。</p></div>
+<section class="today-status" aria-live="polite" aria-label="今天的发送状态">
+  <span class="today-mark" aria-hidden="true">✦</span>
+  <div class="today-copy"><b id="todaySendState">正在读取今天的发送状态</b><span id="todaySendMeta">发送结果会自动更新</span></div>
+  <button class="ghost sm" type="button" onclick="showPanel('records')">查看记录</button>
+</section>
+<div class="overview-stats" aria-label="今日任务统计">
+  <div class="overview-stat"><span>今日任务</span><b id="todayTaskCount">—</b></div>
+  <div class="overview-stat"><span>发送成功</span><b id="todaySuccessCount">—</b></div>
+  <div class="overview-stat"><span>部分成功</span><b id="todayPartialCount">—</b></div>
+  <div class="overview-stat"><span>未成功 / 进行中</span><b id="todayOtherCount">—</b></div>
+</div>
+<div class="overview-layout">
+  <section><h2>今日发送结果</h2><div id="todayRunList" class="muted">读取中…</div></section>
+  <section><h2>账户概况</h2>
+    <div class="overview-shortcut"><div><b>抖音账号</b><br><span id="overviewAccountsMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('accounts')">账号设置</button></div>
+    <div class="overview-shortcut"><div><b>服务时长</b><br><span id="overviewSubscriptionMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('me')">管理时长</button></div>
+    <div class="overview-shortcut"><div><b>邮件通知</b><br><span id="overviewEmailMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('me')">通知设置</button></div>
+  </section>
+</div>
+</section><!-- /p-overview -->
+
 <!-- ===== 抖音账户 ===== -->
-<section class="panel on" id="p-accounts">
+<section class="panel" id="p-accounts">
 <section id="guide" aria-label="新手引导">
 <div class="g-head"><b>新手引导</b>
 <span class="sp"></span><button id="gtoggle" class="ghost sm" type="button" aria-label="收起或展开新手引导">收起</button></div>
@@ -7189,13 +7023,6 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 </section>
 </section><!-- /p-records -->
 
-<!-- ===== 日志 ===== -->
-<section class="panel" id="p-logs">
-<section id="logbox"><h2>运行日志</h2>
-<pre id="logs">加载中…</pre>
-</section>
-</section><!-- /p-logs -->
-
 <!-- ===== 我的账号 ===== -->
 <section class="panel" id="p-me">
 <section id="meinfo">
@@ -7207,6 +7034,21 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <div><div class="muted">登录状态</div><div class="kv" id="me_badge">—</div></div>
 </div>
 <p class="muted">绑定新抖音号：去「抖音账户」页点「＋ 新增账号」，填一个自己起的标识（例如 myspark），再用抖音 App 扫码授权。</p>
+</section>
+
+<section id="subscriptionbox">
+<h2>时长服务</h2>
+<p class="muted">新注册账号含 3 天试用期。兑换成功后，账户时长会延长；你可以随时手动运行发送任务。</p>
+<div class="facts" style="margin-top:12px">
+<div><div class="muted">当前状态</div><div class="kv" id="sub_status">读取中…</div></div>
+<div><div class="muted">剩余时长</div><div class="kv" id="sub_remaining">—</div></div>
+<div><div class="muted">到期时间</div><div class="kv" id="sub_expires">—</div></div>
+</div>
+<div class="row" style="margin-top:14px">
+<input id="sub_code" maxlength="19" autocomplete="off" placeholder="输入 DSF-XXXX-XXXX-XXXX 兑换码" aria-label="兑换码">
+<button id="sub_redeem" type="button">兑换时长</button>
+</div>
+<p class="muted" id="sub_result" role="status"></p>
 </section>
 
 <section id="mobileapp">
@@ -7248,24 +7090,6 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <div class="row"><button id="mp_save" type="button">修改我的登录密码</button><span class="muted" id="mp_state" role="status"></span></div>
 </section>
 </section><!-- /p-me -->
-
-<!-- ===== 时长服务 ===== -->
-<section class="panel" id="p-subscription">
-<section id="subscriptionbox">
-<h2>时长服务</h2>
-<p class="muted">新注册账号含 3 天试用期。兑换成功后，账户时长会延长；你可以随时手动运行发送任务。</p>
-<div class="facts" style="margin-top:12px">
-<div><div class="muted">当前状态</div><div class="kv" id="sub_status">读取中…</div></div>
-<div><div class="muted">剩余时长</div><div class="kv" id="sub_remaining">—</div></div>
-<div><div class="muted">到期时间</div><div class="kv" id="sub_expires">—</div></div>
-</div>
-<div class="row" style="margin-top:14px">
-<input id="sub_code" maxlength="19" autocomplete="off" placeholder="输入 DSF-XXXX-XXXX-XXXX 兑换码" aria-label="兑换码">
-<button id="sub_redeem" type="button">兑换时长</button>
-</div>
-<p class="muted" id="sub_result" role="status"></p>
-</section>
-</section><!-- /p-subscription -->
 
 <!-- ===== 管理（仅管理员可见）===== -->
 <section class="panel" id="p-admin">
@@ -8495,30 +8319,80 @@ function renderSubscription(s){
 function renderTodaySend(s){
   var state = $('todaySendState'), meta = $('todaySendMeta');
   if(!state || !meta){ return; }
-  if(s && s.is_admin){
-    state.textContent = '今天的全站发送状态';
-    meta.textContent = '请在管理控制台的发送记录中查看';
-    return;
-  }
   var summary = s && s.today_send || {}, run = summary.record || null;
+  var runs = summary.runs || (run ? [run] : []);
   var date = String(summary.date || '今天');
-  state.className = 'today-state';
-  if(!run){
-    state.textContent = '今天还没有发送记录';
-    meta.textContent = date + ' · 手动运行发送任务后会更新';
-    return;
+  var success = runs.filter(function(item){ return item.status === 'ok'; }).length;
+  var partial = runs.filter(function(item){ return item.status === 'partial'; }).length;
+  var other = Math.max(0, runs.length - success - partial);
+  if($('todayTaskCount')){ $('todayTaskCount').textContent = String(runs.length); }
+  if($('todaySuccessCount')){ $('todaySuccessCount').textContent = String(success); }
+  if($('todayPartialCount')){ $('todayPartialCount').textContent = String(partial); }
+  if($('todayOtherCount')){ $('todayOtherCount').textContent = String(other); }
+  var accounts = (s && s.accounts) || [];
+  if($('overviewAccountsMeta')){
+    $('overviewAccountsMeta').textContent = s && s.is_admin
+      ? ('管理员可见全站 ' + accounts.length + ' 个账号')
+      : ('你名下 ' + accounts.length + ' 个账号');
   }
-  var labels = {
-    ok:['今天发送成功','success'], partial:['今天部分发送成功','partial'],
-    failed:['今天发送失败','failed'], no_login:['今天未发送：登录已失效','failed'],
-    error:['今天任务出错','failed'], queued:['发送任务排队中','pending'],
-    queue_timeout:['发送排队超时','failed'], skipped:['今天的发送已跳过','pending'],
-    running:['发送任务进行中','pending'], no_friend:['未找到目标好友','failed']
-  };
-  var result = labels[run.status] || ['今天任务状态：' + (run.status || '未知'),'pending'];
-  state.textContent = result[0];
-  state.classList.add(result[1]);
-  meta.textContent = [run.account, run.at, run.detail].filter(Boolean).join(' · ');
+  var sub = (s && s.subscription) || {};
+  if($('overviewSubscriptionMeta')){
+    $('overviewSubscriptionMeta').textContent = sub.unlimited ? '永久有效'
+      : (sub.remaining_text || (sub.status === 'trial' ? '试用期' : '暂无有效时长'));
+  }
+  var mail = (s && s.email_notifications) || {};
+  if($('overviewEmailMeta')){
+    $('overviewEmailMeta').textContent = !mail.smtp_configured ? '邮件服务尚未配置'
+      : (mail.enabled ? ('已开启 · ' + (mail.address || '未填写邮箱')) : '尚未开启');
+  }
+  var runner = (s && s.runner) || {};
+  var timedOutToday = runner.timed_out && String(runner.timed_out_at || '').slice(0, 10) === date;
+  state.className = 'today-state';
+  if(timedOutToday){
+    state.textContent = '任务运行超过 10 分钟，已自动停止';
+    state.classList.add('failed');
+    meta.textContent = '为避免任务长时间挂起，系统已关闭本次发送进程';
+  } else if(runner.running){
+    state.textContent = '发送任务进行中';
+    state.classList.add('pending');
+    meta.textContent = '单次任务最多运行 10 分钟，超时后会自动停止';
+  } else if(!run){
+    state.textContent = s && s.is_admin ? '今天还没有全站发送记录' : '今天还没有发送记录';
+    meta.textContent = date + ' · 手动运行发送任务后会更新';
+  } else {
+    var labels = {
+      ok:['今天发送成功','success'], partial:['今天部分发送成功','partial'],
+      failed:['今天发送失败','failed'], no_login:['今天未发送：登录已失效','failed'],
+      error:['今天任务出错','failed'], queued:['发送任务排队中','pending'],
+      queue_timeout:['发送排队超时','failed'], skipped:['今天的发送已跳过','pending'],
+      running:['发送任务进行中','pending'], no_friend:['未找到目标好友','failed'],
+      timed_out:['任务超时，已自动停止','failed']
+    };
+    var result = labels[run.status] || ['今天任务状态：' + (run.status || '未知'),'pending'];
+    state.textContent = result[0];
+    state.classList.add(result[1]);
+    meta.textContent = [run.account, run.at, run.detail].filter(Boolean).join(' · ');
+  }
+  var list = $('todayRunList');
+  if(list){
+    if(!runs.length){
+      list.innerHTML = runner.running ? '<div class="muted">本次任务正在执行，完成后会显示结果。</div>'
+        : '<div class="muted">' + esc(s && s.is_admin ? '今天还没有全站发送记录' : '今天还没有发送记录') + '</div>';
+    } else {
+      var labels = {
+        ok:['发送成功','g'], partial:['部分成功','y'], failed:['发送失败','r'],
+        no_login:['登录失效','r'], error:['任务出错','r'], no_friend:['未找到好友','r'],
+        queued:['排队中','y'], queue_timeout:['排队超时','r'], skipped:['已跳过','n'], running:['进行中','y'],
+        timed_out:['超时并自动停止','r']
+      };
+      list.innerHTML = runs.slice(0, 8).map(function(item){
+        var info = labels[item.status] || [item.status || '未知','n'];
+        return '<div class="overview-run"><div class="overview-run-main"><b>' + esc(item.account || '抖音账号')
+          + '</b><span>' + esc([item.at, item.detail].filter(Boolean).join(' · '))
+          + '</span></div>' + tagHtml(info[0], info[1]) + '</div>';
+      }).join('');
+    }
+  }
 }
 if($('sub_redeem')){
   $('sub_redeem').onclick = function(){
@@ -8546,10 +8420,10 @@ function guideSetOpen(open){
   try { window.localStorage.setItem(GUIDE_OPEN_KEY, open ? '1' : '0'); } catch(e){}
 }
 // ---- 左侧导航：切换内容面板 ----
-var PANELS = {accounts:'抖音账户', logs:'日志', records:'发送记录', me:'我的账号', subscription:'时长服务', admin:'管理'};
-var PANEL_ORDER = ['accounts', 'logs', 'records', 'me', 'subscription', 'admin'];
+var PANELS = {overview:'概览', accounts:'抖音账户', records:'发送记录', me:'我的账号', admin:'管理'};
+var PANEL_ORDER = ['overview', 'accounts', 'records', 'me', 'admin'];
 function showPanel(go){
-  if(PANELS[go] === undefined){ go = 'accounts'; }
+  if(PANELS[go] === undefined){ go = 'overview'; }
   PANEL_ORDER.forEach(function(k){
     var p = $('p-' + k);
     if(p){ if(k === go){ p.classList.add('on'); } else { p.classList.remove('on'); } }
@@ -8560,8 +8434,6 @@ function showPanel(go){
   var t = $('pageTitle');
   if(t){ t.textContent = PANELS[go]; }
   try { window.localStorage.setItem('panel:go', go); } catch(e){}
-  // 切到「日志」页时直接翻到最下面（默认就要看到最新几行）
-  if(go === 'logs' && typeof refreshLogs === 'function'){ refreshLogs(true); }
   // 切到「管理」页时立刻拉一次用户列表（原先是展开折叠块触发的）
   if(go === 'admin' && LAST_STATUS){
     USERS_FORCE = true;
@@ -8576,7 +8448,7 @@ function initNav(){
   try { saved = window.localStorage.getItem('panel:go') || ''; } catch(e){}
   // 「管理」对普通用户是隐藏的：上次退出时停在那一页的话，回落到抖音账户
   if(saved === 'admin' && $('navadmin') && $('navadmin').hidden){ saved = ''; }
-  showPanel(saved || 'accounts');
+  showPanel(saved || 'overview');
 }
 function guideScrollTo(id){
   var el = $(id);
@@ -9296,8 +9168,9 @@ function refresh(){
     }
     var rs = $('runstate');
     rs.textContent = s.runner.running
-      ? ('运行中…' + (s.runner.stuck ? '　超过 3 分钟没有新日志，可能卡住了，可以点下面的「强制停止」' : ''))
-      : (s.runner.returncode === null ? '尚未运行' : ('上次退出码 ' + s.runner.returncode));
+      ? ('运行中…单次上限 10 分钟' + (s.runner.stuck ? '；超过 3 分钟没有新日志，可能卡住了，可点「强制停止」' : ''))
+      : (s.runner.timed_out ? '任务超过 10 分钟，已自动停止'
+        : (s.runner.returncode === null ? '尚未运行' : ('上次退出码 ' + s.runner.returncode)));
   setBtn('bstart', au.running || !!ck2.running);
   if($('hbstart')){ $('hbstart').disabled = $('bstart').disabled; $('hbstart').title = $('bstart').title; }
   var ha = $('headacct');
@@ -9371,6 +9244,7 @@ var SEND_BADGE = {
   no_login:['登录已失效','r'],
   error:['运行出错','r'],
   running:['本次记录未正常结束','y'],
+  timed_out:['运行超过 10 分钟，已自动停止','r'],
   skipped:['上一轮还没跑完，本轮跳过','y'],
   queued:['排队中：等上一轮跑完接着发','y'],
   queue_timeout:['排队超时，本轮没发成','r']
@@ -9466,31 +9340,15 @@ function refreshSends(){
     try { renderSends(JSON.parse(t).runs); } catch(e){}
   }).catch(function(){});
 }
-function refreshLogs(force){
-  var el = $('logs');
-  if(!el){ return; }
-  fetch('api/logs').then(function(r){ return r.text(); }).then(function(t){
-    // 只有用户本来就在底部时才自动跟着滚：人家翻上去看旧日志时别把他拽下来
-    // nearBottom 改成取回内容之后再算：判断的是"此刻"的滚动位置，不会被别的请求插队冲掉
-    var nearBottom = true;
-    if(el.scrollHeight && el.clientHeight !== undefined){
-      nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
-    }
-    el.textContent = t || '暂无日志';
-    // force=true 表示「日志面板刚打开」：不管以前滚到哪儿，默认翻到最下面
-    if((force || nearBottom) && el.scrollHeight){ el.scrollTop = el.scrollHeight; }
-  }).catch(function(){});
-}
 // ---- 轮询：页面切到后台就停，回到前台立刻补一次再继续（手机锁屏时不再空转） ----
 var POLL = { timers: [], on: false };
-function pollOnce(){ refresh(); refreshSends(); refreshLogs(); }
+function pollOnce(){ refresh(); refreshSends(); }
 function startPolling(){
   if(POLL.on){ return; }
   POLL.on = true;
   POLL.timers = [
     setInterval(refresh, 2000),
-    setInterval(refreshSends, 4000),
-    setInterval(refreshLogs, 4000)
+    setInterval(refreshSends, 4000)
   ];
 }
 function stopPolling(){
@@ -9538,116 +9396,21 @@ function bindAnyBox(){
   }
 }
 
-function initWebPush(){
-  var enable = $('webpush-enable'), disable = $('webpush-disable'), state = $('webpush-state');
-  if(!enable || !disable || !state){ return; }
-  var ua = navigator.userAgent || '';
-  var ios = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  var standalone = !!(navigator.standalone || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
-  var supported = !!(window.Notification && navigator.serviceWorker && ('PushManager' in window));
-  function say(text){ state.textContent = text; }
-  function setSubscribed(active){
-    enable.hidden = !!active;
-    disable.hidden = !active;
-    if(active){ say('此设备已开启发送结果推送通知。'); }
-  }
-  if(navigator.serviceWorker){
-    navigator.serviceWorker.register('/service-worker.js', {scope:'/'}).catch(function(){
-      if(supported){ say('通知组件暂时无法加载，请刷新页面后重试。'); }
-    });
-  }
-  if(ios && !standalone){
-    enable.disabled = true;
-    enable.textContent = '先添加到主屏幕';
-    say('iPhone / iPad 的系统通知需要 iOS 16.4+：先用 Safari“添加到主屏幕”，再从主屏幕图标打开此页面。');
-    return;
-  }
-  if(!supported){
-    enable.disabled = true;
-    say('当前浏览器不支持网页推送。iPhone / iPad 请更新到 iOS 16.4+ 并从主屏幕图标打开。');
-    return;
-  }
-  if(window.Notification.permission === 'denied'){
-    enable.disabled = true;
-    say('系统已禁止通知，请在设备设置中允许“续火花”发送通知。');
-    return;
-  }
-  navigator.serviceWorker.ready.then(function(registration){
-    return registration.pushManager.getSubscription();
-  }).then(function(subscription){
-    if(!subscription){ setSubscribed(false); say('尚未开启通知；点“开启发送通知”完成设置。'); return null; }
-    return fetch('/api/webpush/status', {
-      method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({endpoint:subscription.endpoint})
-    }).then(function(response){
-      return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error('无法读取这台设备的通知状态。'); } return data; });
-    });
-  }).then(function(data){
-    if(!data){ return; }
-    if(data.active){ setSubscribed(true); }
-    else { setSubscribed(false); say('此设备尚未绑定到当前账号；点“开启发送通知”即可绑定。'); }
-  }).catch(function(){ say('还没有开启通知；点“开启发送通知”完成设置。'); });
-
-  function toApplicationServerKey(value){
-    var base64 = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
-    while(base64.length % 4){ base64 += '='; }
-    var raw = window.atob(base64), result = new Uint8Array(raw.length);
-    for(var i = 0; i < raw.length; i++){ result[i] = raw.charCodeAt(i); }
-    return result;
-  }
-  enable.onclick = function(){
-    if(enable.disabled){ return; }
-    enable.disabled = true;
-    say('正在请求系统通知权限…');
-    var permission;
-    try { permission = window.Notification.requestPermission(); }
-    catch(e){ enable.disabled = false; say('系统没有接受通知授权请求，请重试。'); return; }
-    Promise.resolve(permission).then(function(granted){
-      if(granted !== 'granted'){ throw new Error(granted === 'denied' ? '系统已拒绝通知权限，请到设备设置中开启。' : '你还没有允许通知。'); }
-      say('正在登记这台设备…');
-      return navigator.serviceWorker.ready.then(function(registration){
-        return fetch('/api/webpush/vapid-key', {credentials:'same-origin'}).then(function(response){
-          return response.json().then(function(data){
-            if(!response.ok || !data.ok){ throw new Error(data.error || '服务器暂时无法开启推送。'); }
-            return registration.pushManager.getSubscription().then(function(existing){
-              return existing || registration.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:toApplicationServerKey(data.public_key)});
-            });
-          });
-        });
-      });
-    }).then(function(subscription){
-      return fetch('/api/webpush/subscription', {
-        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(subscription.toJSON())
-      }).then(function(response){
-        return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error(data.error || '设备登记失败。'); } });
-      }).then(function(){ setSubscribed(true); });
-    }).catch(function(error){
-      enable.disabled = false;
-      say(error && error.message ? error.message : '开启通知失败，请检查网络后重试。');
-    });
-  };
-  disable.onclick = function(){
-    disable.disabled = true;
-    navigator.serviceWorker.ready.then(function(registration){ return registration.pushManager.getSubscription(); }).then(function(subscription){
-      if(!subscription){ return null; }
-      return fetch('/api/webpush/unsubscribe', {
-        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({endpoint:subscription.endpoint})
-      }).then(function(response){
-        return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error(data.error || '关闭通知失败。'); } return subscription; });
-      });
-    }).then(function(subscription){ return subscription ? subscription.unsubscribe() : true; }).then(function(){
-      disable.disabled = false;
-      setSubscribed(false);
-      say('此设备已关闭发送结果通知。');
-    }).catch(function(error){
-      disable.disabled = false;
-      say(error && error.message ? error.message : '关闭通知失败，请检查网络后重试。');
-    });
-  };
+function retireLegacyPush(){
+  if(!navigator.serviceWorker || !navigator.serviceWorker.getRegistrations){ return; }
+  navigator.serviceWorker.getRegistrations().then(function(registrations){
+    return Promise.all(registrations.map(function(registration){
+      var active = registration.active || registration.waiting || registration.installing;
+      var scriptUrl = active && active.scriptURL ? active.scriptURL : '';
+      if(!scriptUrl || new URL(scriptUrl, location.href).pathname !== '/service-worker.js'){ return Promise.resolve(); }
+      var manager = registration.pushManager;
+      var removeSubscription = manager && manager.getSubscription
+        ? manager.getSubscription().then(function(subscription){ return subscription ? subscription.unsubscribe() : undefined; })
+        : Promise.resolve();
+      return removeSubscription.catch(function(){}).then(function(){ return registration.unregister(); });
+    }));
+  }).catch(function(){});
 }
-
 // 顶部提示条要贴在顶栏下面：手机上顶栏会折成两行、高度变高，这里跟着量一次
 function syncHeadHeight(){
   // 顶栏换成了侧边栏布局里的 .main .top：量它的高度，顶部提示条才会正好落在标题栏下面
@@ -9665,7 +9428,7 @@ if(window.addEventListener){ window.addEventListener('resize', syncHeadHeight); 
 function bootChrome(){
   bindAuthWizard();
   bindAnyBox();
-  initWebPush();
+  retireLegacyPush();
   initNav();
 }
 if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', bootChrome); }
@@ -10533,7 +10296,7 @@ window.addEventListener('hashchange', function(){ showPanel((location.hash || ''
 
 // ---- 状态 ----
 var STATUS = null, USERS = null, RUNS = [];
-var SEND_TONE = {ok:'g', partial:'y', failed:'r', no_friend:'n', no_login:'r', error:'r', running:'y', skipped:'y', queued:'y', queue_timeout:'r'};
+var SEND_TONE = {ok:'g', partial:'y', failed:'r', no_friend:'n', no_login:'r', error:'r', running:'y', timed_out:'r', skipped:'y', queued:'y', queue_timeout:'r'};
 var REC_SEL = 0, REC_MAX = 100, REC_STORED = 0, REC_CAP = 2;
 // ---- 公告与管理员联系方式（/admin「系统」页里改）----
 // 用户端每次 /api/status 都会拿到这份内容，所以保存完直接 loadStatus 回读，
@@ -12219,35 +11982,21 @@ DOWNLOAD_MANIFEST = json.dumps(
     separators=(",", ":"),
 )
 
-WEBPUSH_SERVICE_WORKER_JS = r"""'use strict';
-self.addEventListener('push', function (event) {
-  var data = {};
-  try { data = event.data ? event.data.json() : {}; } catch (e) {}
-  var title = String(data.title || '发送任务已完成').slice(0, 80);
-  var options = {
-    body: String(data.body || '打开续火花控制台查看发送结果').slice(0, 180),
-    icon: '/app-icon-512.png',
-    badge: '/apple-touch-icon.png',
-    tag: String(data.tag || 'sparkflow-send').slice(0, 80),
-    renotify: false,
-    data: { url: '/' }
-  };
-  event.waitUntil(self.registration.showNotification(title, options));
+LEGACY_PUSH_CLEANUP_SW_JS = r"""'use strict';
+self.addEventListener('install', function(event){ event.waitUntil(self.skipWaiting()); });
+self.addEventListener('activate', function(event){
+  event.waitUntil((function(){
+    var manager = self.registration.pushManager;
+    var removeSubscription = manager && manager.getSubscription
+      ? manager.getSubscription().then(function(subscription){ return subscription ? subscription.unsubscribe() : undefined; })
+      : Promise.resolve();
+    return removeSubscription.catch(function(){}).then(function(){ return self.registration.unregister(); });
+  })());
 });
-self.addEventListener('notificationclick', function (event) {
-  event.notification.close();
-  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clients) {
-    for (var i = 0; i < clients.length; i++) {
-      var client = clients[i];
-      if (client.url.indexOf(self.location.origin + '/') === 0 && 'focus' in client) {
-        return client.focus();
-      }
-    }
-    return self.clients.openWindow('/');
-  }));
+self.addEventListener('push', function(event){
+  event.waitUntil(self.registration.getNotifications().then(function(rows){ rows.forEach(function(row){ row.close(); }); }));
 });
 """
-
 DOWNLOAD_PAGE_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#087f8c"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="续火花"><meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -12258,12 +12007,12 @@ main{width:min(740px,100% - 32px);margin:42px auto;padding-bottom:40px}.brand{di
 .card{background:#fff;border:1px solid #dce9e9;border-radius:20px;padding:24px;margin:14px 0;box-shadow:0 8px 28px #1a484a0d}.card h1{font-size:24px;line-height:1.25;margin:0 0 8px}.card h2{font-size:17px;margin:0 0 8px}.muted{color:#6a8187;font-size:14px}.download{display:flex;justify-content:center;align-items:center;min-height:54px;border-radius:12px;background:#087f8c;color:white;text-decoration:none;font-weight:700;margin:18px 0 8px}.download:hover{background:#076b76}.download.disabled{background:#82989a;pointer-events:none}.hash{font:12px/1.6 ui-monospace,Consolas,monospace;overflow-wrap:anywhere;background:#f0f6f5;border-radius:10px;padding:10px;color:#405759}.steps{padding-left:22px}.steps li{padding:3px 0}.badge{display:inline-block;background:#e6f6f4;color:#076b76;border-radius:99px;padding:3px 9px;font-size:12px;font-weight:700}a{color:#087f8c}details{padding:13px 0;border-top:1px solid #dce9e9}summary{cursor:pointer;font-weight:700}.foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:14px}
 @media(max-width:600px){main{margin:20px auto;width:calc(100% - 22px)}.card{padding:18px;border-radius:17px}.card h1{font-size:22px}}
 </style></head><body><main><div class="brand"><div class="logo">✦</div><div><b>DouYinSparkFlow</b><span>手机应用与安装说明</span></div></div>
-<section class="card"><span class="badge">Android 安装包</span><h1>把续火花管理放进口袋</h1><p>登录或注册原有网站账号，查看今天的发送状态，管理自己的账号配置。开启系统提醒后，发送成功、部分成功或失败都会显示通知；应用打开时检查更及时，后台通知可能受 Android 省电影响而延迟。</p>
+<section class="card"><span class="badge">Android 安装包</span><h1>把续火花管理放进口袋</h1><p>登录或注册原有网站账号，查看今天的发送状态，管理自己的账号配置。发送结果通知通过你在网站「我的账号」填写的邮箱发送。</p>
 __APK_BUTTON__<div class="muted">安装包大小：__APK_SIZE__ · SHA-256</div><div class="hash">__APK_SHA__</div>
-<p class="muted">首次安装时 Android 可能要求允许浏览器或文件管理器安装此来源的应用。已安装旧版的设备需要先卸载旧版再安装本版，并重新登录；抖音账号配置和发送记录保存在服务器，不受卸载影响。安装后请在应用内开启系统通知。</p></section>
-<section class="card"><h2>iPhone / iPad 主屏幕版</h2><p>这是可安装的网页应用，复用网站账号和普通用户功能，不需要 App Store 安装：</p><ol class="steps"><li>用 Safari 打开 <a href="/login">登录页</a>并登录。</li><li>点分享按钮，选择“添加到主屏幕”。</li><li>确认名称后添加，从主屏幕图标进入，开启“发送结果通知”。</li></ol><p class="muted">iOS 16.4 及以上版本支持网页推送。通知只在添加到主屏幕并从图标打开后开启；普通 Safari 标签页没有系统推送权限。授权后，发送成功或失败会由服务器推送，即使网页关闭也能收到。</p></section>
+<p class="muted">首次安装时 Android 可能要求允许浏览器或文件管理器安装此来源的应用。已安装旧版的设备需要先卸载旧版再安装本版，并重新登录；抖音账号配置和发送记录保存在服务器，不受卸载影响。</p></section>
+<section class="card"><h2>iPhone / iPad 主屏幕版</h2><p>这是可安装的网页应用，复用网站账号和普通用户功能，不需要 App Store 安装：</p><ol class="steps"><li>用 Safari 打开 <a href="/login">登录页</a>并登录。</li><li>点分享按钮，选择“添加到主屏幕”。</li><li>确认名称后添加，从主屏幕图标进入。</li></ol><p class="muted">发送结果通知通过你在网站「我的账号」填写的邮箱发送。</p></section>
 __COOKIE_TOOL_SECTION__
-<section class="card"><h2>安全与校验</h2><p>应用只连接本网站的 HTTPS 地址；TLS 校验失败时会停止连接，不会绕过证书检查。应用不请求通讯录、短信或定位权限。Android 通知需单独授权；用于检查发送结果的会话 Cookie 在设备上用 Android Keystore 加密保存。</p><p class="muted">直接下载适用于网站分发测试，不代表已通过 Google Play 商店审核。安装前可核对上方 SHA-256。</p></section>
+<section class="card"><h2>安全与校验</h2><p>应用只连接本网站的 HTTPS 地址；TLS 校验失败时会停止连接，不会绕过证书检查。应用不请求通讯录、短信、定位或发送结果通知权限。</p><p class="muted">直接下载适用于网站分发测试，不代表已通过 Google Play 商店审核。安装前可核对上方 SHA-256。</p></section>
 <div class="foot"><a href="/login">返回登录</a><a href="/">打开控制台</a></div></main></body></html>"""
 
 
@@ -12539,39 +12288,6 @@ class Handler(BaseHTTPRequestHandler):
                 mine.append(run)
         return mine[:cap]
 
-    def visible_notification_runs(self) -> list:
-        """Small, account-scoped send events for mobile notification polling."""
-        runs = load_sends(SEND_STORE_MAX)
-        if not self._is_admin():
-            scopes = set(self._scopes() or [])
-            names = {str(t.get("username") or "") for t in self.my_accounts()}
-            names.discard("")
-            runs = [
-                run for run in runs
-                if isinstance(run, dict)
-                and (
-                    (str(run.get("unique_id") or "") and str(run.get("unique_id") or "") in scopes)
-                    or (not str(run.get("unique_id") or "") and str(run.get("account") or "") in names)
-                )
-            ]
-        events = []
-        for run in runs:
-            if not isinstance(run, dict):
-                continue
-            status = str(run.get("status") or "")
-            if status in ("running", "queued"):
-                continue
-            stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-            event_id = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
-            events.append({
-                "event_id": event_id,
-                "at": str(run.get("at") or "")[:40],
-                "account": str(run.get("account") or "")[:80],
-                "unique_id": str(run.get("unique_id") or "")[:80],
-                "status": status[:24],
-            })
-        return events
-
     def visible_logs(self) -> str:
         parts = []
         run_log = tail(RUN_LOG)
@@ -12777,7 +12493,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/service-worker.js":
-            body = WEBPUSH_SERVICE_WORKER_JS.encode("utf-8")
+            body = LEGACY_PUSH_CLEANUP_SW_JS.encode("utf-8")
             self.send_response(200)
             self._sec_headers()
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
@@ -12982,12 +12698,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({"codes": redeem_code_overview()})
         elif path == "/api/mobile/notifications":
-            self._json({"runs": self.visible_notification_runs()})
-        elif path == "/api/webpush/vapid-key":
-            try:
-                self._json({"ok": True, "public_key": webpush_vapid_keys()["public_key"]})
-            except RuntimeError as error:
-                self._json({"ok": False, "error": str(error)}, 503)
+            # Kept for older APKs; send-result notifications are retired.
+            self._json({"runs": []})
+        elif path.startswith("/api/webpush/"):
+            self._json({"ok": False, "error": "发送结果推送已停用，请使用邮件通知"}, 410)
         elif path == "/api/sends":
             # limit 只是"这次想要几条"，真正的上限由角色决定：
             # 管理员最多 100 条，普通用户最多 2 条。不传 limit 就只回 2 条 ——
@@ -13071,6 +12785,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(image)
         elif path == "/api/logs":
+            if not self._is_admin():
+                self._json({"ok": False, "error": "仅管理员可以查看运行日志"}, 403)
+                return
             self._text(self.visible_logs())
         elif path == "/api/screenshot":
             query = parse_qs(urlparse(self.path).query)
@@ -13217,52 +12934,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             else:
                 self._json(result, 502)
-        elif path == "/api/webpush/status":
-            if not self._same_origin_request():
-                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
-                return
-            try:
-                payload = self._body()
-                endpoint = str(payload.get("endpoint") or "")
-                _webpush_endpoint_origin(endpoint)
-                subscriptions = _clean_push_subscriptions(WEBPUSH_SUBSCRIPTIONS_STORE.read())["users"]
-                active = any(
-                    item.get("endpoint") == endpoint
-                    for item in subscriptions.get(self._user(), [])
-                )
-            except ValueError as error:
-                self._json({"ok": False, "error": str(error)}, 400)
-                return
-            self._json({"ok": True, "active": active})
-        elif path == "/api/webpush/subscription":
-            if not self._same_origin_request():
-                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
-                return
-            try:
-                payload = self._body()
-                webpush_vapid_keys()
-                result = save_webpush_subscription(self._user(), payload)
-            except RuntimeError as error:
-                self._json({"ok": False, "error": str(error)}, 503)
-                return
-            except (ValueError, TypeError, KeyError) as error:
-                self._json({"ok": False, "error": str(error) or "设备订阅信息无效"}, 400)
-                return
-            self._json(result, 200 if result.get("ok") else 409)
-        elif path == "/api/webpush/unsubscribe":
-            if not self._same_origin_request():
-                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
-                return
-            try:
-                payload = self._body()
-                endpoint = str(payload.get("endpoint") or "")
-                if not endpoint:
-                    raise ValueError("设备订阅地址为空")
-                remove_webpush_subscription(self._user(), endpoint)
-            except ValueError as error:
-                self._json({"ok": False, "error": str(error)}, 400)
-                return
-            self._json({"ok": True})
+        elif path.startswith("/api/webpush/"):
+            self._json({"ok": False, "error": "发送结果推送已停用，请使用邮件通知"}, 410)
         elif path == "/api/schedule/check":
             payload = self._body()
             error = self._config_guard(payload)
@@ -13643,24 +13316,30 @@ class Handler(BaseHTTPRequestHandler):
         is_admin = self._is_admin()
         me = self._user()
         access = subscription_info(me)
-        # 普通用户首页直接展示今天自己的发送结果；管理员继续在完整记录页查看全站记录。
-        today_send = None
+        today = now_text()[:10]
+        visible_runs = load_sends(SEND_STORE_MAX)
         if not is_admin:
-            today = now_text()[:10]
-            today_runs = [
-                run for run in self.visible_sends(SEND_MAX_USER)
-                if str(run.get("at") or "").startswith(today)
+            visible_ids = set(str(x) for x in (self._scopes() or []))
+            visible_names = {str(task.get("username") or "") for task in self.my_accounts()}
+            visible_names.discard("")
+            visible_runs = [
+                run for run in visible_runs
+                if isinstance(run, dict) and (
+                    (str(run.get("unique_id") or "") and str(run.get("unique_id") or "") in visible_ids)
+                    or (not str(run.get("unique_id") or "") and str(run.get("account") or "") in visible_names)
+                )
             ]
-            latest = today_runs[0] if today_runs else None
-            today_send = {
-                "date": today,
-                "record": ({
-                    "at": str(latest.get("at") or ""),
-                    "account": str(latest.get("account") or ""),
-                    "status": str(latest.get("status") or ""),
-                    "detail": str(latest.get("detail") or ""),
-                } if latest else None),
-            }
+        today_runs = [
+            run for run in visible_runs
+            if isinstance(run, dict) and str(run.get("at") or "").startswith(today)
+        ]
+        today_rows = [{
+            "at": str(run.get("at") or "")[:40],
+            "account": str(run.get("account") or "")[:80],
+            "status": str(run.get("status") or "")[:24],
+            "detail": str(run.get("detail") or "")[:300],
+        } for run in today_runs]
+        today_send = {"date": today, "runs": today_rows, "record": today_rows[0] if today_rows else None}
         scopes = self._scopes()  # None = 管理员（全部）
         login_of = {}
         for name, item in load_users().items():
@@ -13766,6 +13445,8 @@ class Handler(BaseHTTPRequestHandler):
                     "started_at": None,
                     "stale": None,
                     "stuck": False,
+                    "timed_out": False,
+                    "timed_out_at": "",
                     "only": "",
                 }
 
@@ -14281,12 +13962,6 @@ def main() -> int:
     threading.Thread(
         target=_schedule_loop, args=(heartbeat_stop,), name="daily-scheduler", daemon=True
     ).start()
-    if _webpush_crypto():
-        threading.Thread(
-            target=_webpush_notify_loop, args=(heartbeat_stop,), name="webpush-notify", daemon=True
-        ).start()
-    else:
-        print("[panel] Web Push 暂不可用：未安装 cryptography 依赖", flush=True)
     if smtp_is_configured():
         threading.Thread(
             target=_email_notify_loop, args=(heartbeat_stop,), name="email-notify", daemon=True

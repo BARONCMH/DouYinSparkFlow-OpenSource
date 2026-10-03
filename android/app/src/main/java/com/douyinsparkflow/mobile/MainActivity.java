@@ -1,24 +1,16 @@
 package com.douyinsparkflow.mobile;
 
-import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
-import android.app.job.JobInfo;
-import android.app.job.JobScheduler;
 import android.annotation.SuppressLint;
-import android.content.ComponentName;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.os.Handler;
-import android.os.Looper;
-import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -36,25 +28,16 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
-
 public final class MainActivity extends Activity {
-    private static final int NOTIFICATION_PERMISSION_REQUEST = 44;
-    private static final int NOTIFICATION_JOB_ID = 78031;
+    private static final String SITE = normalizeSiteUrl(BuildConfig.SITE_URL);
     private WebView webView;
-    private Button notificationButton;
     private Button accountButton;
     private boolean loggingOut;
-    private final ExecutorService pollExecutor = Executors.newSingleThreadExecutor();
-    private final Handler pollingHandler = new Handler(Looper.getMainLooper());
-    private final Runnable foregroundPoll = new Runnable() {
-        @Override public void run() {
-            pollNotifications();
-            pollingHandler.postDelayed(this, 60_000L);
-        }
-    };
+
+    private static String normalizeSiteUrl(String value) {
+        String site = value == null ? "" : value.trim();
+        return site.endsWith("/") ? site : site + "/";
+    }
 
     @Override
     protected void onCreate(Bundle state) {
@@ -64,11 +47,8 @@ public final class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         buildLayout();
         configureWebView();
-        NotificationPoller.ensureChannel(this);
-        scheduleNotificationChecks();
-        if (state == null) webView.loadUrl(NotificationPoller.SITE);
+        if (state == null) webView.loadUrl(SITE);
         else webView.restoreState(state);
-        updateNotificationButton();
     }
 
     private void buildLayout() {
@@ -87,14 +67,6 @@ public final class MainActivity extends Activity {
         title.setTextSize(17);
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         bar.addView(title, new LinearLayout.LayoutParams(0, dp(44), 1f));
-
-        notificationButton = new Button(this);
-        notificationButton.setTextColor(Color.WHITE);
-        notificationButton.setTextSize(12);
-        notificationButton.setAllCaps(false);
-        notificationButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(8, 127, 140)));
-        notificationButton.setOnClickListener(v -> requestNotificationPermission());
-        bar.addView(notificationButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42)));
 
         accountButton = new Button(this);
         accountButton.setText("切换账号");
@@ -189,20 +161,14 @@ public final class MainActivity extends Activity {
                 manager.flush();
                 if (loggingOut && "/login".equals(Uri.parse(url).getPath())) {
                     loggingOut = false;
-                    SessionVault.clearAccountState(getApplicationContext());
                     manager.removeAllCookies(value -> manager.flush());
                     webView.clearHistory();
                     if (accountButton != null) accountButton.setEnabled(false);
-                    updateNotificationButton();
                     return;
                 }
-                String cookie = manager.getCookie(NotificationPoller.SITE);
+                String cookie = manager.getCookie(SITE);
                 boolean hasSession = hasNonEmptySid(cookie);
                 if (accountButton != null) accountButton.setEnabled(hasSession);
-                if (hasSession) SessionVault.saveSession(getApplicationContext(), cookie);
-                else SessionVault.clearAccountState(getApplicationContext());
-                if (hasSession) pollNotifications();
-                updateNotificationButton();
             }
         });
     }
@@ -225,18 +191,10 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("取消", null)
                 .setPositiveButton("退出并切换", (dialog, which) -> {
                     loggingOut = true;
-                    SessionVault.clearAccountState(getApplicationContext());
                     if (accountButton != null) accountButton.setEnabled(false);
-                    webView.loadUrl(NotificationPoller.SITE + "logout");
+                    webView.loadUrl(SITE + "logout");
                 })
                 .show();
-    }
-
-    private void pollNotifications() {
-        if (pollExecutor.isShutdown()) return;
-        try {
-            pollExecutor.execute(() -> NotificationPoller.poll(getApplicationContext()));
-        } catch (java.util.concurrent.RejectedExecutionException ignored) { }
     }
 
     private boolean isTrustedUrl(String value) {
@@ -244,90 +202,11 @@ public final class MainActivity extends Activity {
     }
 
     private boolean isTrustedOrigin(Uri uri) {
-        return NotificationPoller.isTrustedOrigin(uri);
-    }
-
-    private void requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION_REQUEST);
-        } else if (!systemNotificationsAllowed()) {
-            new AlertDialog.Builder(this)
-                    .setTitle("发送提醒未开启")
-                    .setMessage("请在系统设置中允许续火花发送结果通知。")
-                    .setNegativeButton("稍后", null)
-                    .setPositiveButton("打开设置", (dialog, which) -> {
-                        Intent settings = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                                .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
-                        try { startActivity(settings); }
-                        catch (Exception ignored) {
-                            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                    Uri.parse("package:" + getPackageName())));
-                        }
-                    })
-                    .show();
-        } else {
-            scheduleNotificationChecks();
-            Toast.makeText(this, "发送提醒已开启", Toast.LENGTH_SHORT).show();
-            pollNotifications();
-            updateNotificationButton();
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                scheduleNotificationChecks();
-                Toast.makeText(this, "发送提醒已开启", Toast.LENGTH_SHORT).show();
-                pollNotifications();
-            } else Toast.makeText(this, "你可以稍后在系统设置中开启通知", Toast.LENGTH_LONG).show();
-            updateNotificationButton();
-        }
-    }
-
-    private void scheduleNotificationChecks() {
-        JobScheduler scheduler = (JobScheduler) getSystemService(JOB_SCHEDULER_SERVICE);
-        if (scheduler == null) return;
-        ComponentName service = new ComponentName(this, NotificationJob.class);
-        JobInfo job = new JobInfo.Builder(NOTIFICATION_JOB_ID, service)
-                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
-                .setPeriodic(15 * 60 * 1000L, 5 * 60 * 1000L)
-                .setPersisted(false)
-                .build();
-        scheduler.schedule(job);
-    }
-
-    private void updateNotificationButton() {
-        if (notificationButton == null) return;
-        notificationButton.setText(systemNotificationsAllowed() ? "发送提醒已开" : "开启发送提醒");
-    }
-
-    private boolean systemNotificationsAllowed() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            return false;
-        }
-        android.app.NotificationManager manager = getSystemService(android.app.NotificationManager.class);
-        if (manager == null || !manager.areNotificationsEnabled()) return false;
-        android.app.NotificationChannel channel = manager.getNotificationChannel("send-results");
-        if (channel != null && channel.getImportance() == android.app.NotificationManager.IMPORTANCE_NONE) return false;
-        return true;
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        pollNotifications();
-        pollingHandler.removeCallbacks(foregroundPoll);
-        pollingHandler.postDelayed(foregroundPoll, 60_000L);
-    }
-
-    @Override
-    protected void onPause() {
-        pollingHandler.removeCallbacks(foregroundPoll);
-        super.onPause();
+        if (uri == null) return false;
+        Uri site = Uri.parse(SITE);
+        return "https".equalsIgnoreCase(uri.getScheme())
+                && site.getHost() != null && site.getHost().equalsIgnoreCase(uri.getHost())
+                && (uri.getPort() < 0 ? 443 : uri.getPort()) == (site.getPort() < 0 ? 443 : site.getPort());
     }
 
     @Override
@@ -344,8 +223,6 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        pollingHandler.removeCallbacks(foregroundPoll);
-        pollExecutor.shutdownNow();
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();
