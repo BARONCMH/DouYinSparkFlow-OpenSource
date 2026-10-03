@@ -6,6 +6,8 @@
 
 Start authorization from the account page, then scan the displayed QR code with the Douyin app and confirm on the phone. If Douyin asks for a secondary SMS verification, enter that code in the panel. Direct phone-number login has been replaced by QR authorization; manual browser interaction and Cookie import remain available as alternatives.
 
+Successful QR authorization stores an encrypted Playwright `storage_state` containing cookies and site local storage. Login checks and send tasks restore that state. Older encrypted Cookie-only accounts remain readable, and imported Cookie lists are wrapped as a storage state with an empty local-storage section.
+
 ## Deployment
 
 1. Use a dedicated Linux host and configure a reverse proxy with a valid TLS certificate.

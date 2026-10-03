@@ -1275,12 +1275,25 @@ def scroll_and_select_user(page, username, targets, skip=None):
 
 def do_user_task(browser, username, cookies, targets, unique_id=""):
     account = username
+    storage_state = None
+    if isinstance(cookies, dict):
+        if cookies.get("version") == 2 and isinstance(cookies.get("storage_state"), dict):
+            storage_state = cookies["storage_state"]
+        elif isinstance(cookies.get("cookies"), list) and isinstance(cookies.get("origins"), list):
+            storage_state = cookies
+        if storage_state is None:
+            logger.error("账号 %s 的浏览器凭据格式无效，跳过本次发送", account)
+            return
+        cookies = storage_state.get("cookies")
+        if not isinstance(cookies, list) or not cookies:
+            logger.error("账号 %s 的 storage_state 没有 Cookie，跳过本次发送", account)
+            return
     # 切到这个号自己的消息模板 / 一言类型 / 发送间隔（没单独配就用全局的）
     apply_account_settings(unique_id)
     # 好友映射是全局 dict：不清理的话，上一个账号抓到的好友会留到下一个账号，
     # 万一重名就可能匹配到别的账号的会话（现在靠 checkTargetName 兜着，但别留这个隐患）
     userIDDict.clear()
-    context = browser.new_context()  # 每个任务使用独立的上下文
+    context = browser.new_context(storage_state=storage_state) if storage_state else browser.new_context()
     context.set_default_navigation_timeout(
         config["browserTimeout"]
     )  # 设置导航超时时间为 120 秒
@@ -1292,8 +1305,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
 
     page.on("response", handle_response)  # 监听响应，收集好友完整信息用于匹配
 
-    # 注入 Cookie
-    context.add_cookies(cookies)
+    # 新凭据恢复完整 storage_state（含 Cookie 和 localStorage）；旧账号继续注入 Cookie。
+    if not storage_state:
+        context.add_cookies(cookies)
 
     # [本地增强] 记录本次发送结果，结束后写进 send-status.json 供控制台展示
     entry = {

@@ -1280,6 +1280,56 @@ def _clean_cookie_list(data) -> list:
     return result
 
 
+def _clean_storage_state(data) -> dict:
+    """Playwright storage_state（Cookie + 各站点 localStorage）。"""
+    if not isinstance(data, dict):
+        return {"cookies": [], "origins": []}
+    cookies = []
+    raw_cookies = data.get("cookies")
+    if isinstance(raw_cookies, list):
+        for item in raw_cookies:
+            if not isinstance(item, dict) or not item.get("name") or not item.get("domain"):
+                continue
+            cookie = {k: v for k, v in item.items() if v is not None}
+            cookie.setdefault("path", "/")
+            cookie.setdefault("expires", -1)
+            cookie.setdefault("httpOnly", False)
+            cookie.setdefault("secure", False)
+            if cookie.get("sameSite") not in ("Strict", "Lax", "None"):
+                cookie["sameSite"] = "Lax"
+            cookies.append(cookie)
+    origins = []
+    raw_origins = data.get("origins")
+    if isinstance(raw_origins, list):
+        for item in raw_origins:
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            if not isinstance(origin, str) or not origin.startswith(("https://", "http://")):
+                continue
+            raw_storage = item.get("localStorage")
+            local_storage = []
+            if isinstance(raw_storage, list):
+                local_storage = [
+                    {"name": entry["name"], "value": entry["value"]}
+                    for entry in raw_storage
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("name"), str)
+                    and isinstance(entry.get("value"), str)
+                ]
+            origins.append({"origin": origin, "localStorage": local_storage})
+    return {"cookies": cookies, "origins": origins}
+
+
+def _storage_state_envelope(state: dict) -> str:
+    cleaned = _clean_storage_state(state)
+    return json.dumps(
+        {"version": 2, "storage_state": cleaned},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def cookie_key(unique_id: str) -> str:
     return ("COOKIES_" + str(unique_id)).upper()
 
@@ -1422,32 +1472,51 @@ def account_settings(task: dict) -> dict:
     return out
 
 
-def load_cookies(unique_id: str) -> list:
-    """读取已保存的 Cookie（加密存的，这里解回来），顺手去掉 Playwright 不支持的字段。"""
+def load_storage_state(unique_id: str) -> dict:
+    """读取加密保存的浏览器状态；旧版 Cookie 列表会包装成空 localStorage 状态。"""
     uid = str(unique_id or "").strip()
     if not uid:
-        return []
+        return {"cookies": [], "origins": []}
     item = load_accounts().get(uid) or {}
     blob = str(item.get("cookies") or "")
     if not blob:
-        return []
+        return {"cookies": [], "origins": []}
     try:
-        return _clean_cookie_list(json.loads(decrypt_text(blob)))
+        payload = json.loads(decrypt_text(blob))
+        if isinstance(payload, list):
+            return _clean_storage_state({"cookies": _clean_cookie_list(payload), "origins": []})
+        if isinstance(payload, dict) and payload.get("version") == 2:
+            return _clean_storage_state(payload.get("storage_state"))
+        # 兼容直接保存的 Playwright storage_state 对象。
+        if isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
+            return _clean_storage_state(payload)
+        return {"cookies": [], "origins": []}
     except Exception as error:
         # 以前这里静默返回 []：界面上只看到"未授权"，根本查不出是密钥变了还是 Cookie 坏了
         _warn_decrypt(uid, error)
-        return []
+        return {"cookies": [], "origins": []}
+
+
+def load_cookies(unique_id: str) -> list:
+    """读取当前凭据里的 Cookie 项，兼容旧版 Cookie-only 账号。"""
+    return load_storage_state(unique_id).get("cookies", [])
+
+
+def save_storage_state(unique_id: str, state: dict, **account_fields) -> bool:
+    """加密保存 Playwright storage_state，其中包括 Cookie 和 localStorage。"""
+    uid = str(unique_id or "").strip()
+    cleaned = _clean_storage_state(state)
+    if not uid or not cleaned["cookies"]:
+        return False
+    save_account(uid, cookies=encrypt_text(_storage_state_envelope(cleaned)), **account_fields)
+    invalidate_shot_cache()
+    return True
 
 
 def save_cookies(unique_id: str, cookies: list) -> None:
-    """Cookie 加密后存进 accounts.json —— 直接 cat 那个文件看不到 sessionid。"""
-    uid = str(unique_id or "").strip()
-    if not uid:
-        return
+    """把导入的 Cookie 转成 storage_state 格式并加密存储。"""
     cleaned = _clean_cookie_list(cookies)
-    text = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-    save_account(uid, cookies=encrypt_text(text))
-    invalidate_shot_cache()
+    save_storage_state(unique_id, {"cookies": cleaned, "origins": []})
 
 
 def save_account_list(tasks: list, old_unique_id: str = "", new_unique_id: str = "") -> None:
@@ -4175,33 +4244,29 @@ class BrowserSession:
                 message="已检测到登录成功，但还没填「抖音号」。请在上方填写并保存配置，再点「导出 Cookies」",
             )
             return False
-        self._store(douyin)
-        return True
+        return self._store(context.storage_state())
 
-    def _store(self, cookies: list) -> None:
-        cleaned = []
-        for cookie in cookies:
-            item = {k: v for k, v in cookie.items() if k != "sameSite" and v is not None}
-            cleaned.append(item)
+    def _store(self, storage_state: dict) -> bool:
+        cleaned_state = _clean_storage_state(storage_state)
+        cleaned = cleaned_state["cookies"]
+        if not self._logged_in(cleaned):
+            self._set(message="没有取得完整的抖音浏览器状态，请重新扫码授权")
+            return False
         # 存到哪个账号以 owner 为准：unique_id 会被「保存配置」顺手改，owner 不会
         uid = str(self.owner or self.unique_id or "").strip()
         if not uid:
             self._set(message="还没给这台浏览器指定抖音号，先在上面的配置里填好再试")
-            return
+            return False
         key = cookie_key(uid)
 
         existing = load_accounts().get(uid)
-        if isinstance(existing, dict):
-            save_cookies(uid, cleaned)
-        else:
-            save_account(
-                uid,
-                username=self.username or uid,
-                targets=[],
-                cookies=encrypt_text(
-                    json.dumps(_clean_cookie_list(cleaned), ensure_ascii=False, separators=(",", ":"))
-                ),
-            )
+        account_fields = {} if isinstance(existing, dict) else {
+            "username": self.username or uid,
+            "targets": [],
+        }
+        if not save_storage_state(uid, cleaned_state, **account_fields):
+            self._set(message="浏览器状态没保存成功，请重新扫码授权")
+            return False
         try:
             RELOGIN_PATH.unlink()
         except Exception:
@@ -4217,8 +4282,10 @@ class BrowserSession:
             state="authorized",
             saved=key,
             phase="done",
-            message="登录成功，已保存 %d 个 Cookie 项到 %s" % (len(cleaned), key),
+            message="登录成功，已加密保存 %d 个 Cookie 和 %d 个站点的本地存储到 %s"
+            % (len(cleaned), len(cleaned_state["origins"]), key),
         )
+        return True
 
     # ------------------------------------------------------------------
     # 扫码登录流程
@@ -5423,7 +5490,8 @@ class LoginChecker:
         stop_watchdog = threading.Event()
         deadline = time.time() + CHECK_TIMEOUT
         try:
-            cookies = load_cookies(unique_id)
+            storage_state = load_storage_state(unique_id)
+            cookies = storage_state.get("cookies", [])
             if not cookies:
                 self._finish(unique_id, False, "还没有保存 Cookie，请先授权登录", {"reason": "no_cookie"})
                 return
@@ -5441,8 +5509,12 @@ class LoginChecker:
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-            context = instance.new_context(viewport=VIEWPORT, locale="zh-CN", user_agent=USER_AGENT)
-            context.add_cookies(cookies)
+            context = instance.new_context(
+                viewport=VIEWPORT,
+                locale="zh-CN",
+                user_agent=USER_AGENT,
+                storage_state=storage_state,
+            )
             page = context.new_page()
             cdp = context.new_cdp_session(page)
 
@@ -5999,7 +6071,28 @@ def accounts_env() -> dict:
         if not blob:
             continue
         try:
-            cookies[cookie_key(uid)] = decrypt_text(blob)
+            payload = json.loads(decrypt_text(blob))
+            if isinstance(payload, list):
+                payload = {
+                    "version": 2,
+                    "storage_state": _clean_storage_state({"cookies": payload, "origins": []}),
+                }
+            elif isinstance(payload, dict) and payload.get("version") == 2:
+                payload = {
+                    "version": 2,
+                    "storage_state": _clean_storage_state(payload.get("storage_state")),
+                }
+            elif isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
+                payload = {"version": 2, "storage_state": _clean_storage_state(payload)}
+            else:
+                continue
+            if not payload["storage_state"]["cookies"]:
+                continue
+            # utils.config currently applies unicode_escape to this legacy env
+            # value. Emit ASCII JSON and double its backslashes so that roundtrip
+            # preserves both non-ASCII localStorage values and escaped strings.
+            serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+            cookies[cookie_key(uid)] = serialized.replace("\\", "\\\\")
         except Exception:
             continue
     env = {"TASKS": json.dumps(tasks, ensure_ascii=False, separators=(",", ":"))}
