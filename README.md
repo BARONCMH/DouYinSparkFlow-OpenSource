@@ -24,7 +24,7 @@
 
 ## 📌 项目介绍
 
-本仓库也提供一个不依赖 Docker 的 [Windows 单用户版本](https://github.com/BARONCMH/DouYinSparkFlow-SingleUser)，数据保存在本机，支持一个使用者管理多个抖音号。
+本仓库也提供一个[单用户版本](https://github.com/BARONCMH/DouYinSparkFlow-SingleUser)，数据保存在本机，支持一个使用者管理多个抖音号；其 Docker 镜像和[纯新手部署教程](https://github.com/BARONCMH/DouYinSparkFlow-SingleUser/blob/main/DOCKER-%E5%B0%8F%E7%99%BD%E6%95%99%E7%A8%8B.md)也在单用户仓库中。
 
 **抖音火花自动续火脚本**，一款轻量实用的抖音互动脚本，可自动为你和抖音好友续火花，无需手动操作。
 
@@ -70,6 +70,7 @@
 | Cookie 与出口 IP | [docs/guide/02-cookie与出口IP.md](docs/guide/02-cookie与出口IP.md) |
 | 配置生成器 | [docs/guide/03-配置生成器.md](docs/guide/03-配置生成器.md) |
 | Docker 部署（推荐） | [docs/deploy/docker.md](docs/deploy/docker.md) |
+| 多用户面板 Docker 小白教程 | [docs/deploy/docker-小白教程.md](docs/deploy/docker-小白教程.md) |
 | 多用户 Web 面板部署 | [docs/deploy/panel.md](docs/deploy/panel.md) |
 | 云函数部署 | [docs/deploy/fc.md](docs/deploy/fc.md) |
 | 源码部署 | [docs/deploy/source.md](docs/deploy/source.md) |
@@ -93,24 +94,9 @@ docker compose logs -f
 
 ### 多用户面板自建
 
-面板是 **overlay**，不是独立镜像：以上游镜像为底座，挂载 `panel.py` 与 `tasks.py`。
+多用户面板现在提供独立公开 Docker 镜像，部署时不再需要源码挂载或本地构建。第一次使用请看[多用户面板 Docker 小白教程](docs/deploy/docker-小白教程.md)；域名、HTTPS、备份和故障排查请看[完整部署教程](docs/deploy/panel.md)。
 
-```sh
-# 1) 私有目录（只在本机存在，绝不提交）
-mkdir -p server-panel/config server-panel/logs
-printf 'TZ=Asia/Shanghai\n' > server-panel/config/.env
-
-# 2) 面板环境，必须设置 PANEL_PASSWORD
-cp server-panel/panel.env.example server-panel/panel.env
-
-# 3) 想让面板的下载路由提供成品，就把 downloads/ 里的文件放进去
-mkdir -p server-panel/logs/app-downloads
-
-# 4) 启动
-cd server-panel && docker compose --env-file panel.env -f compose.yml up -d
-```
-
-面板在容器内监听 `8080`，映射到宿主机 `127.0.0.1:18080`，前面需要自备带有效证书的 TLS 反向代理，不要把端口直接暴露到公网。**面板用户和抖音号在网页中管理；不要把 `.env.example` 里的示例 `TASKS` 与 `COOKIES_*` 复制进这个配置文件。**完整的 Docker、HTTPS、备份更新和故障排查步骤见[多用户 Web 面板部署教程](docs/deploy/panel.md)，实现说明见 [`server-panel/README.md`](server-panel/README.md)。
+容器默认只绑定本机 `127.0.0.1:18080`。公网访问必须经过有效 HTTPS 反向代理；不要直接把面板端口开放到公网。配置和日志分别保存在 `server-panel/config` 与 `server-panel/logs`。
 
 ### Android 客户端与 Cookie 工具
 

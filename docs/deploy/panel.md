@@ -2,6 +2,8 @@
 
 本文介绍如何把本仓库的多用户 Web 面板部署到自己的 Linux 服务器。面板使用 Docker Compose 运行，浏览器通过 HTTPS 访问；面板数据和账号配置保存在服务器的 `server-panel/config/` 与 `server-panel/logs/` 目录。
 
+第一次使用 Docker 的用户可以先看[多用户 Docker 小白教程](docker-小白教程.md)，本页适用于需要配置公网域名、HTTPS、备份和回滚的部署。
+
 > 本教程用于自建实例。自动化操作可能导致登录态失效、功能限制或账号处罚；只使用你本人拥有或已获授权的账号，并遵守抖音平台规则。
 
 ## 部署前准备
@@ -218,7 +220,7 @@ git rev-parse HEAD
 
 ### 更新
 
-更新 overlay 或镜像会重建容器，可能打断正在执行的发送任务。由于 `panel.py` 和 `tasks.py` 是从仓库目录挂载进容器的，请先确认没有任务运行并停止面板，再更新代码，避免容器运行期间直接替换挂载文件：
+更新镜像会重建容器，可能打断正在执行的发送任务。请先确认没有任务运行，再拉取并启动新镜像：
 
 ```bash
 cd /path/to/DouYinSparkFlow-OpenSource/server-panel
@@ -231,17 +233,14 @@ sudo docker compose --env-file panel.env -f compose.yml up -d
 sudo docker compose --env-file panel.env -f compose.yml logs --tail=100
 ```
 
-`compose.yml` 默认使用固定版本的 `PANEL_IMAGE`，不要擅自改为 `latest`。升级前查看仓库的变更说明；若 overlay 更新而镜像接口不兼容，请保留原提交号并先不要升级生产实例。
+Compose 默认使用公开的 `latest` 镜像。每次镜像发布也会生成 `sha-<提交号>` 标签；生产环境需要固定版本时，可在 Compose 的 `.env` 文件中设置 `PANEL_IMAGE=ghcr.io/baroncmh/douyinsparkflow-open-source-panel:sha-<提交号>`。升级前先备份 `config/` 与 `logs/`，记录正在使用的镜像标签。
 
 ### 回滚
 
-若升级后出现问题，先保留当前数据目录和日志。停止服务后，将代码检出到升级前记录的提交号，再按该版本的部署文件拉取并启动对应镜像：
+若升级后出现问题，先保留当前数据目录和日志。把 Compose `.env` 中的 `PANEL_IMAGE` 改回升级前记录的 `sha-<提交号>` 标签，再拉取并启动旧镜像：
 
 ```bash
 sudo docker compose --env-file panel.env -f compose.yml stop
-cd /path/to/DouYinSparkFlow-OpenSource
-git checkout --detach <升级前的提交号>
-cd server-panel
 sudo docker compose --env-file panel.env -f compose.yml pull
 sudo docker compose --env-file panel.env -f compose.yml up -d
 ```

@@ -1,6 +1,6 @@
-# Multi-user panel overlay
+# Multi-user panel Docker image
 
-`panel.py` and `tasks.py` are the server-side multi-user panel and worker overlay used with the upstream Docker image. The worker normalizer import is aligned with upstream `core.douyin_im.norm`. The overlay expects the upstream runtime modules and the compatible image version specified by `PANEL_IMAGE`.
+`panel.py` and `tasks.py` are packaged as a standalone image at `ghcr.io/baroncmh/douyinsparkflow-open-source-panel:latest`. The image uses the upstream runtime as its base and includes the required panel and worker files, so deployments no longer bind-mount source code.
 
 ## Douyin account authorization
 
@@ -10,7 +10,7 @@ Successful QR authorization stores an encrypted Playwright `storage_state` conta
 
 ## Deployment
 
-Follow the [detailed multi-user panel deployment guide](../docs/deploy/panel.md) for Docker, HTTPS reverse proxy, first login, backups, updates, rollback, and troubleshooting.
+Start with the [beginner Docker guide](../docs/deploy/docker-小白教程.md). Follow the [full deployment guide](../docs/deploy/panel.md) for HTTPS reverse proxy, first login, backups, updates, rollback, and troubleshooting.
 
 The panel's users and Douyin accounts are configured in its web interface. `config/.env` is for global settings such as the time zone and message template. Do not copy the root `.env.example` with its legacy sample `TASKS` and `COOKIES_*` values into a new panel deployment; the first startup can migrate those legacy values as an account.
 
@@ -26,10 +26,10 @@ To let the panel serve the public downloads, copy the files into `logs/app-downl
    cp ../downloads/Get-Douyin-Cookies.exe ../downloads/Get-Douyin-Cookies.exe.sha256 logs/app-downloads/
    ```
 
-`CONFIG_DIR`, `LOG_DIR`, `PANEL_BIND_PORT`, and `PANEL_IMAGE` can be set in the shell or a Compose `.env` file. `PANEL_ENV_FILE` selects the runtime environment file. By default, Compose uses the pinned image `ghcr.io/2061360308/douyinsparkflow:3.2.2` and binds the service to `127.0.0.1:18080`.
+`CONFIG_DIR`, `LOG_DIR`, `PANEL_BIND_PORT`, and `PANEL_IMAGE` can be set in the shell or a Compose `.env` file. `PANEL_ENV_FILE` selects the runtime environment file. By default, Compose pulls the public panel image and binds it to `127.0.0.1:18080`.
 
 ## Private data
 
 The config directory contains user/password databases, hashed redemption codes, session keys, account Cookies, and per-user email settings. The log directory contains send records and diagnostic output. Back up these paths securely; never commit or publish them. Use least-privilege filesystem permissions and keep the reverse proxy, base image, and host patched.
 
-This is a deployment overlay, not a standalone server image. Check the upstream image release notes before upgrading `PANEL_IMAGE`; custom overlays can depend on upstream interfaces.
+The panel image currently pins upstream runtime image `ghcr.io/2061360308/douyinsparkflow:3.2.2`. Rebuild the panel image after changing that base version.

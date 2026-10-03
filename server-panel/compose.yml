@@ -1,15 +1,16 @@
 services:
   douyin-spark-flow-panel:
-    image: ${PANEL_IMAGE:-ghcr.io/2061360308/douyinsparkflow:3.2.2}
+    image: ${PANEL_IMAGE:-ghcr.io/baroncmh/douyinsparkflow-open-source-panel:latest}
     container_name: douyin-spark-flow-panel
     restart: unless-stopped
     init: true
     shm_size: 1gb
-    entrypoint: ["python", "/app/panel/panel.py"]
     env_file:
       - ${PANEL_ENV_FILE:-./panel.env}
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 8080
       GITHUB_ACTIONS: "true"
       PYTHONUNBUFFERED: "1"
     ports:
@@ -17,6 +18,3 @@ services:
     volumes:
       - ${CONFIG_DIR:-./config}:/app/config
       - ${LOG_DIR:-./logs}:/app/logs
-      - ../core/douyin_im.py:/app/core/douyin_im.py:ro
-      - ./tasks.py:/app/core/tasks.py:ro
-      - ./panel.py:/app/panel/panel.py:ro
