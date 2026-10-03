@@ -1,6 +1,6 @@
 # Multi-user panel Docker image
 
-`panel.py` and `tasks.py` are packaged as a standalone image at `ghcr.io/baroncmh/douyinsparkflow-open-source-panel:latest`. The image uses the upstream runtime as its base and includes the required panel and worker files, so deployments no longer bind-mount source code.
+`panel.py` and `tasks.py` are packaged as a standalone image at `ghcr.io/baroncmh/douyinsparkflow-open-source-panel:latest`. The image uses Microsoft's Playwright Python runtime, installs this repository's pinned Python dependencies and verified CloakBrowser binary, and includes the panel and worker files. Deployments no longer depend on an external application image or bind-mount source code.
 
 ## Douyin account authorization
 
@@ -32,4 +32,4 @@ To let the panel serve the public downloads, copy the files into `logs/app-downl
 
 The config directory contains user/password databases, hashed redemption codes, session keys, account Cookies, and per-user email settings. The log directory contains send records and diagnostic output. Back up these paths securely; never commit or publish them. Use least-privilege filesystem permissions and keep the reverse proxy, base image, and host patched.
 
-The panel image currently pins upstream runtime image `ghcr.io/2061360308/douyinsparkflow:3.2.2`. Rebuild the panel image after changing that base version.
+The panel image pins the Playwright runtime tag and verifies the CloakBrowser archive checksum during build. Rebuild and publish it after changing the panel, worker, runtime source, or dependency pins.

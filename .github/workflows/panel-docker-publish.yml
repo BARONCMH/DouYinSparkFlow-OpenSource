@@ -8,7 +8,10 @@ on:
       - "server-panel/Dockerfile.dockerignore"
       - "server-panel/panel.py"
       - "server-panel/tasks.py"
-      - "core/douyin_im.py"
+      - "main.py"
+      - "requirements.txt"
+      - "core/**"
+      - "utils/**"
       - "server-panel/compose.yml"
       - ".github/workflows/panel-docker-publish.yml"
   workflow_dispatch:

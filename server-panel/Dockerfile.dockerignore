@@ -1,6 +1,10 @@
 **
+!requirements.txt
+!main.py
 !core/
-!core/douyin_im.py
+!core/**
+!utils/
+!utils/**
 !server-panel/
 !server-panel/panel.py
 !server-panel/tasks.py
