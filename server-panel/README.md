@@ -10,10 +10,13 @@ Successful QR authorization stores an encrypted Playwright `storage_state` conta
 
 ## Deployment
 
-1. Use a dedicated Linux host and configure a reverse proxy with a valid TLS certificate.
-2. Create private `config/` and `logs/` directories beside this file. Copy the root `.env.example` to `config/.env`, then add only your own task configuration and Cookies.
-3. Copy `panel.env.example` to `panel.env`, set a unique strong `PANEL_PASSWORD`, and set `WEBPUSH_SUBJECT` to your public HTTPS origin. Keep `panel.env`, `config/`, and `logs/` private.
-4. Put the public downloads in `logs/app-downloads/` if you want the panel's download routes to serve them:
+Follow the [detailed multi-user panel deployment guide](../docs/deploy/panel.md) for Docker, HTTPS reverse proxy, first login, backups, updates, rollback, and troubleshooting.
+
+The panel's users and Douyin accounts are configured in its web interface. `config/.env` is for global settings such as the time zone and message template. Do not copy the root `.env.example` with its legacy sample `TASKS` and `COOKIES_*` values into a new panel deployment; the first startup can migrate those legacy values as an account.
+
+Keep `panel.env`, `config/`, and `logs/` private. They contain credentials, encrypted account state, and logs. `PANEL_SECRET` must remain stable after account credentials are saved; if it is left empty, the panel persists a generated value in `config/panel-secret`.
+
+To let the panel serve the public downloads, copy the files into `logs/app-downloads/` from this directory:
 
    ```sh
    mkdir -p logs/app-downloads
@@ -21,9 +24,7 @@ Successful QR authorization stores an encrypted Playwright `storage_state` conta
    cp ../downloads/Get-Douyin-Cookies.exe ../downloads/Get-Douyin-Cookies.exe.sha256 logs/app-downloads/
    ```
 
-5. Start the container with `docker compose --env-file panel.env -f compose.yml up -d`. The panel listens on `127.0.0.1:18080`; proxy HTTPS traffic to that local port.
-
-`CONFIG_DIR`, `LOG_DIR`, `PANEL_BIND_PORT`, and `PANEL_IMAGE` can be set in the shell or a Compose `.env` file. `PANEL_ENV_FILE` selects the runtime environment file. The worker's task configuration is separate in `config/.env`.
+`CONFIG_DIR`, `LOG_DIR`, `PANEL_BIND_PORT`, and `PANEL_IMAGE` can be set in the shell or a Compose `.env` file. `PANEL_ENV_FILE` selects the runtime environment file. By default, Compose uses the pinned image `ghcr.io/2061360308/douyinsparkflow:3.2.2` and binds the service to `127.0.0.1:18080`.
 
 ## Private data
 

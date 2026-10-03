@@ -70,6 +70,7 @@
 | Cookie 与出口 IP | [docs/guide/02-cookie与出口IP.md](docs/guide/02-cookie与出口IP.md) |
 | 配置生成器 | [docs/guide/03-配置生成器.md](docs/guide/03-配置生成器.md) |
 | Docker 部署（推荐） | [docs/deploy/docker.md](docs/deploy/docker.md) |
+| 多用户 Web 面板部署 | [docs/deploy/panel.md](docs/deploy/panel.md) |
 | 云函数部署 | [docs/deploy/fc.md](docs/deploy/fc.md) |
 | 源码部署 | [docs/deploy/source.md](docs/deploy/source.md) |
 | 常见问题 | [docs/faq/faq.md](docs/faq/faq.md) |
@@ -97,7 +98,7 @@ docker compose logs -f
 ```sh
 # 1) 私有目录（只在本机存在，绝不提交）
 mkdir -p server-panel/config server-panel/logs
-cp .env.example server-panel/config/.env
+printf 'TZ=Asia/Shanghai\n' > server-panel/config/.env
 
 # 2) 面板环境，必须设 PANEL_PASSWORD 与 WEBPUSH_SUBJECT
 cp server-panel/panel.env.example server-panel/panel.env
@@ -109,7 +110,7 @@ mkdir -p server-panel/logs/app-downloads
 cd server-panel && docker compose --env-file panel.env -f compose.yml up -d
 ```
 
-面板在容器内监听 `8080`，映射到宿主机 `127.0.0.1:18080`，前面需要自备带有效证书的 TLS 反向代理，不要把端口直接暴露到公网。`PANEL_IMAGE` 必须与上游接口匹配，升级前先看上游 release notes。完整说明见 [`server-panel/README.md`](server-panel/README.md)。
+面板在容器内监听 `8080`，映射到宿主机 `127.0.0.1:18080`，前面需要自备带有效证书的 TLS 反向代理，不要把端口直接暴露到公网。**面板用户和抖音号在网页中管理；不要把 `.env.example` 里的示例 `TASKS` 与 `COOKIES_*` 复制进这个配置文件。**完整的 Docker、HTTPS、备份更新和故障排查步骤见[多用户 Web 面板部署教程](docs/deploy/panel.md)，实现说明见 [`server-panel/README.md`](server-panel/README.md)。
 
 ### Android 客户端与 Cookie 工具
 

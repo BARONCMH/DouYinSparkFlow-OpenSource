@@ -7,6 +7,7 @@
   - [配置生成器](guide/03-配置生成器.md)
 - 部署方式
   - [服务器 Docker（推荐）](deploy/docker.md)
+  - [多用户 Web 面板部署](deploy/panel.md)
   - [云函数](deploy/fc.md)
   - [GitHub Action（过时）](deploy/action.md)
   - [源码部署](deploy/source.md)
