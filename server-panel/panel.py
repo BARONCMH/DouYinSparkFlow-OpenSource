@@ -971,23 +971,30 @@ SMS_STRONG_WORDS = ("安全验证", "身份验证", "验证身份", "短信验�
 # 二级验证里「要用已登录的设备扫码/扫脸」那一档
 VERIFY_QR_WORDS = ("扫码验证", "使用已登录", "已登录账号", "设备扫码", "以确保为本人操作",
                    "本人操作", "扫脸", "人脸识别", "面部识别", "请使用抖音 App")
-# 二级验证有两种形态，**处理方式完全不同** —— 用户特意强调过「两个是不一样的，
-# 一个需要你点一下，一个直接就行」：
-#   ① 直接进扫脸/扫码页：什么都不用点，下面抓二维码那一步自己就能拿到；
-#   ② 先给一页「人脸识别 / 原设备验证」让你选：**必须点一下**才会出二维码。
-# 下面这组词只用来认「②那种选择页」，认到了才去点一下。
-VERIFY_CHOICE_WORDS = ("人脸识别", "原设备验证", "扫脸验证", "请选择验证方式",
-                       "选择验证方式", "换一种方式", "其他验证方式", "设备验证")
-# 选择页上要自动点的那一项。**只点「用原设备扫码」，绝不点人脸** ——
-# 人脸得在手机上做，面板点下去等于把用户带进死路。
-VERIFY_PICK_TEXTS = ("用原设备扫码", "使用原设备扫码", "原设备扫码", "原设备验证",
-                     "用已登录设备扫码", "已登录设备扫码", "用本机抖音扫码")
-VERIFY_PICK_EVERY = 8.0   # 秒：自动点「用原设备扫码」的间隔（点不动就交给用户手动）
+# 只有页面明确显示「选择验证方式」，或同时显示原设备和人脸两种选项时，
+# 才按选择页处理。直接进入二维码/人脸验证页时不点击，避免误触返回或换方式。
+VERIFY_CHOICE_PROMPT_WORDS = ("请选择验证方式", "选择验证方式", "请选择一种验证方式",
+                              "选择一种验证方式", "原设备扫码还是人脸", "原设备验证还是人脸")
+VERIFY_DEVICE_WORDS = ("用原设备扫码", "使用原设备扫码", "原设备扫码", "原设备验证",
+                       "使用原设备验证", "在原设备上验证", "用已登录设备扫码", "使用已登录设备扫码",
+                       "已登录设备扫码", "用已登录设备验证", "用本机抖音扫码", "已登录设备验证")
+VERIFY_FACE_WORDS = ("人脸验证", "人脸识别", "扫脸验证", "扫脸", "面部验证", "面部识别", "刷脸验证")
+VERIFY_DEVICE_PICK_TEXTS = ("用原设备扫码", "使用原设备扫码", "原设备扫码", "原设备验证",
+                            "使用原设备验证", "在原设备上验证", "用已登录设备扫码", "使用已登录设备扫码",
+                            "已登录设备扫码", "用已登录设备验证", "用本机抖音扫码", "已登录设备验证")
+VERIFY_FACE_PICK_TEXTS = ("人脸验证", "使用人脸验证", "通过人脸验证", "进行人脸验证", "人脸核验",
+                          "人脸识别", "使用人脸识别", "通过人脸识别", "扫脸验证", "扫脸",
+                          "面部验证", "面部识别", "刷脸验证", "刷脸")
+VERIFY_FACE_STAGE_WORDS = ("请进行人脸验证", "请完成人脸验证", "正在进行人脸验证",
+                           "人脸识别", "扫脸验证", "面部识别", "活体检测", "请眨眼", "正对屏幕")
+VERIFY_DEVICE_FALLBACK_AFTER = 10.0  # 原设备扫码点选后仍停留在选择页，等待页面稳定再退到人脸
+VERIFY_FACE_MANUAL_AFTER = 8.0       # 人脸入口点选后仍停留在选择页，交给用户在画面中操作
 # 「已经进二级验证了」的强特征词。特意比 SMS_STRONG_WORDS 窄：
 # 不能把「已发送 / 发送至」算进来 —— 那是手机号登录第一步就会出现的字，
 # 混进来会让面板在正常登录途中就误判成"到二级验证了"。
 VERIFY_STAGE_WORDS = ("设备验证", "二次验证", "二次校验", "为了你的账号安全",
-                      "人脸识别", "原设备验证", "扫脸验证", "验证登录密码",
+                      "人脸识别", "人脸验证", "原设备验证", "用原设备扫码", "已登录设备扫码",
+                      "请选择验证方式", "选择验证方式", "扫脸验证", "验证登录密码",
                       "完成身份验证")
 QR_EXPIRED_WORDS = ("已失效", "已过期", "点击刷新", "刷新二维码")
 SMS_BAD_WORDS = ("验证码错误", "验证码不正确", "验证码有误", "验证码已过期", "验证码失效",
@@ -3777,9 +3784,11 @@ class BrowserSession:
         self.verify_hint = ""        # 二级验证时给用户看的那句话
         # 「手动模式」：进了二级验证就把**可操作画面**交给用户 ——
         # 主界面那块画面会自动摊开并写明"可以直接点"，通用输入框就在它下面。
-        # 自动那套（自动点「用原设备扫码」+ 抓二维码摆出来）**并列保留**，两边不冲突。
+        # 验证方式选择页优先点「原设备扫码」；若页面停留在选择页，再尝试人脸入口。
         self.verify_manual = False
-        self._verify_pick_at = 0.0   # 上次自动点「用原设备扫码」的时刻
+        self._verify_pick_at = 0.0
+        self._verify_pick_method = ""  # device / face / manual；用于等页面变化并避免重复点击
+        self._verify_face_hint_shown = False
         self.qr_gone_at = 0.0        # 二维码消失的时刻
         self.phase = "idle"          # idle/opening/qr/scanned/sms/manual/done
         self.page_hint = ""          # 页面上抓到的提示或报错原文
@@ -3942,6 +3951,8 @@ class BrowserSession:
                 self.verify_hint = ""
                 self.verify_manual = False
                 self._verify_pick_at = 0.0
+                self._verify_pick_method = ""
+                self._verify_face_hint_shown = False
                 self.sms_proof = None
                 self.sms_proof_at = 0.0
                 self.phase = "opening"
@@ -4507,6 +4518,13 @@ class BrowserSession:
                 return got
         return None
 
+    def _is_verify_choice_page(self, page) -> bool:
+        """只把明确的方式选择页当作选择页；单独的人脸/扫码验证说明不触发点选。"""
+        prompt = self._has_words_any(page, VERIFY_CHOICE_PROMPT_WORDS)
+        device = self._has_words_any(page, VERIFY_DEVICE_WORDS)
+        face = self._has_words_any(page, VERIFY_FACE_WORDS)
+        return bool((prompt and (device or face)) or (device and face))
+
     def _login_step(self, page, context, cdp) -> bool:
         """授权流程的大脑：自动点开登录 -> 扒二维码 -> 扫完进二级验证。
 
@@ -4524,8 +4542,8 @@ class BrowserSession:
 
         # ---- 00) 进二级验证 → 切到「手动模式」，把可操作画面交给用户 ----
         # 用户要的是：二级验证一来就把实时画面摆出来让人自己操作（那块画面可以点），
-        # 输入用那个通用输入框。**同时自动那套并列保留** —— 下面 1c) 还会替他点
-        # 「用原设备扫码」，抓二维码那步也照旧把码摆出来，两边都能走。
+        # 输入用那个通用输入框。下面 1c) 会优先选择「用原设备扫码」，页面不前进时
+        # 再尝试人脸入口；抓到二维码后仍展示给用户扫码。
         # 判据三条，命中一条就算进了二级验证：
         #   ① 已经抓到二级验证的二维码   ② 已经提交过验证码（抖音正在要下一关）
         #   ③ 页面上出现二级验证的强特征词
@@ -4538,8 +4556,8 @@ class BrowserSession:
                     self.verify_manual = True
                 self._set(
                     message="抖音要求二级验证 —— 下面那块画面可以直接点，"
-                            "也可以打字用下面那个通用输入框；"
-                            "我同时会帮你点「用原设备扫码」、把二维码摆出来。"
+                            "也可以打字用下面那个通用输入框；验证方式会先选原设备扫码，"
+                            "无法继续时再尝试人脸。扫码和人脸核验请在抖音 App 中完成。"
                 )
 
         # ---- 0a) 验证码已经敲进抖音的框里了：等几秒，再替用户点「验证」 ----
@@ -4611,32 +4629,87 @@ class BrowserSession:
 
         qr = self._find_qr(page)
 
-        # ---- 1c) 二级验证「先让你选怎么验证」那一页：自动点「用原设备扫码」----
-        # 只处理「选择页」那种（形态②）：页面上有人脸识别/原设备验证那些字，而且**还没出二维码**。
-        # 形态①（直接扫脸/扫码）一个字都不用点，下面抓二维码那步自己就拿到了 ——
-        # 这两种必须分开，混在一起会在扫脸页上乱点，反而把人带进死路。
-        if (
-            not qr
-            and self.verify_manual
-            and now - self._verify_pick_at > VERIFY_PICK_EVERY
-            and self._has_words_any(page, VERIFY_CHOICE_WORDS)
-        ):
-            self._verify_pick_at = now
-            picked = self._click_text_any(page, VERIFY_PICK_TEXTS)
-            if picked:
+        # ---- 1c) 二级验证方式选择：原设备扫码优先，页面不前进再退到人脸 ----
+        # 直接出现二维码时上面的 qr 已命中，不在这里点；直接出现人脸流程时也只有在
+        # 文案明确表明这是「方式选择页」时才点。实际扫码/人脸核验由用户在抖音 App 完成。
+        choice_page = self._is_verify_choice_page(page)
+        if not choice_page and self._verify_pick_method:
+            # 上一项已离开选择页，视为抖音已经切换到下一步；后续若再弹新选择页重新优先扫码。
+            self._verify_pick_method = ""
+            self._verify_pick_at = 0.0
+        if not qr and self.verify_manual and choice_page:
+            method = self._verify_pick_method
+            if not method:
+                picked = self._click_text_any(page, VERIFY_DEVICE_PICK_TEXTS)
+                if picked:
+                    self._verify_pick_method = "device"
+                    self._verify_pick_at = now
+                    label = str(picked.get("text") or "原设备扫码")
+                    self._set(
+                        message="抖音要求选择验证方式，已优先选择「%s」。二维码出现后用已登录的抖音 App 扫描确认。"
+                                % label,
+                        page_hint="已选择原设备扫码；如果页面无法继续，会尝试人脸验证。",
+                    )
+                else:
+                    picked = self._click_text_any(page, VERIFY_FACE_PICK_TEXTS)
+                    if picked:
+                        self._verify_pick_method = "face"
+                        self._verify_pick_at = now
+                        label = str(picked.get("text") or "人脸验证")
+                        self._set(
+                            message="页面没有可用的原设备扫码入口，已切到「%s」。请按抖音 App 提示完成人脸验证。"
+                                    % label,
+                            page_hint="人脸验证需要你在抖音 App 中亲自完成。",
+                        )
+                    else:
+                        self._verify_pick_method = "manual"
+                        self._verify_pick_at = now
+                        self._set(
+                            message="没能识别验证方式按钮。请在下方可点击画面里优先选择「原设备扫码」；不行再选「人脸验证」。",
+                            page_hint="可以直接点击下方抖音画面选择验证方式。",
+                        )
+                return False
+
+            if method == "device" and now - self._verify_pick_at >= VERIFY_DEVICE_FALLBACK_AFTER:
+                picked = self._click_text_any(page, VERIFY_FACE_PICK_TEXTS)
+                if picked:
+                    self._verify_pick_method = "face"
+                    self._verify_pick_at = now
+                    label = str(picked.get("text") or "人脸验证")
+                    self._set(
+                        message="原设备扫码入口没有继续，已回退到「%s」。请在抖音 App 中按提示完成人脸验证。"
+                                % label,
+                        page_hint="人脸验证需要你在抖音 App 中亲自完成。",
+                    )
+                else:
+                    self._verify_pick_method = "manual"
+                    self._verify_pick_at = now
+                    self._set(
+                        message="原设备扫码入口没有继续，且没能自动选择人脸验证。请在下方可点击画面里选择人脸验证。",
+                        page_hint="验证画面可点击；请在抖音 App 中完成后续核验。",
+                    )
+                return False
+
+            if method == "face" and now - self._verify_pick_at >= VERIFY_FACE_MANUAL_AFTER:
+                self._verify_pick_method = "manual"
                 self._set(
-                    message="抖音让你选验证方式，已经帮你点了「%s」 —— "
-                            "二维码出来我就摆出来，你也可以直接在下面那块画面里操作。"
-                            % str(picked.get("text") or VERIFY_PICK_TEXTS[0]),
-                    page_hint="已自动选择：%s" % str(picked.get("text") or ""),
+                    message="已尝试打开人脸验证，但页面仍停在方式选择。请在下方可点击画面里选择验证方式，并按抖音 App 提示完成。",
+                    page_hint="验证画面可点击；人脸核验由你在抖音 App 中完成。",
                 )
-            else:
-                self._set(
-                    message="抖音让你选验证方式，但没能自动点上「用原设备扫码」 —— "
-                            "请在下面那块画面里自己点一下（那块画面是可以点的）。",
-                    page_hint="请手动点「用原设备扫码」",
-                )
+                return False
             return False
+
+        # 二级验证直接进入人脸页时不替用户采集或提交人脸，只提示下一步由抖音 App 完成。
+        face_stage = bool(not qr and self.verify_manual
+                          and self._has_words_any(page, VERIFY_FACE_STAGE_WORDS))
+        if face_stage and not self._verify_face_hint_shown:
+            self._verify_face_hint_shown = True
+            self._set(
+                message="抖音正在进行人脸验证，请在手机抖音 App 中按页面提示完成。下方画面可以点击查看；网页不会代替你完成人脸核验。",
+                page_hint="请在抖音 App 中完成身份验证。",
+            )
+        elif not face_stage:
+            self._verify_face_hint_shown = False
 
         if not qr and self.verify_qr:
             # 二维码没了（扫过了 / 验证过了）就把二级验证的提示收掉
@@ -7046,14 +7119,14 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 
 <section id="authbox"><h2><span class="step">2</span>授权登录</h2>
 <div class="authtabs" role="tablist" aria-label="选择登录方式">
-<button class="authtab on" id="tabmanual" type="button" role="tab" aria-selected="true" aria-label="手动授权，推荐方式">手动授权 <span class="auth-rec-badge">推荐</span></button>
-<button class="authtab" id="tabqr" type="button" role="tab" aria-selected="false">二维码授权</button>
+<button class="authtab on" id="tabqr" type="button" role="tab" aria-selected="true" aria-label="二维码登录，推荐方式">二维码登录 <span class="auth-rec-badge">推荐</span></button>
+<button class="authtab" id="tabmanual" type="button" role="tab" aria-selected="false">手动授权</button>
 <button class="authtab" id="tabcookie" type="button" role="tab" aria-selected="false">备用导入</button>
 </div>
 <div id="browserauthpane">
-<div id="manualauthnotice" class="auth-recommend" role="note">
+<div id="manualauthnotice" class="auth-recommend" role="note" hidden>
 <span class="ar-icon" aria-hidden="true">✓</span>
-<div><strong>推荐使用手动授权</strong><p>点「开始授权」后，可先用抖音 App 扫描二维码；也可以在下方画面里直接点选手机号登录并完成验证。登录成功后会自动加密保存并检查状态，无需复制 Cookie。</p></div>
+<div><strong>手动授权备用方式</strong><p>如果二维码登录无法继续，可在下方画面中直接操作抖音登录页。登录成功后会自动加密保存并检查状态，无需复制 Cookie。</p></div>
 </div>
 <div class="row">
 <button id="bstart" type="button">开始授权</button>
@@ -7065,9 +7138,9 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <p id="authstate" class="muted">尚未启动</p>
 <p class="muted" id="qrowner" hidden><span id="qrownertext"></span><button class="sm sec" id="bswitchwho" type="button" hidden>切到这个账号</button></p>
 <p class="muted" id="qrdiag" role="status"></p>
-<div id="qrloginbox" class="auth-recommend" role="note" hidden>
+<div id="qrloginbox" class="auth-recommend" role="note">
 <span class="ar-icon" aria-hidden="true">✓</span>
-<div><strong>使用抖音 App 扫码登录</strong><p>点「开始授权」后，等待二维码出现，再用抖音 App 扫描并确认。若网页和抖音 App 在同一部手机，可先保存二维码到相册，再从扫一扫里选择图片。</p></div>
+<div><strong>推荐使用二维码登录</strong><p>点「开始授权」后，等待二维码出现，再用抖音 App 扫描并确认。若遇到二级验证，会优先尝试原设备扫码；该方式无法继续时再尝试人脸验证。扫码和人脸核验都需要你在抖音 App 中亲自完成。</p></div>
 </div>
 <div id="qrarea" hidden style="margin-top:14px">
 <div class="row" style="align-items:flex-start">
@@ -8194,7 +8267,7 @@ function copyCookie(){
 }
 // ---- 二级验证短信只有一个入口：授权弹窗里的 wzcode 框（见 wzSubmit） ----
 var lastQrHash = '', lastWantSms = false, qrFailedHash = '';
-var wantManual = true, wantQr = false;
+var wantManual = false, wantQr = true;
 function setAuthMethod(method){
   if(['manual','qr','cookie'].indexOf(method) < 0){ return; }
   wantManual = method === 'manual';
@@ -8895,7 +8968,7 @@ function renderWizard(au, lv, sr){
   if(WZ.open && WZ.auto && act !== 'sms' && act !== 'done'){ wizardHide(); }
   if(act === 'scan'){
     var stip = $('wzscantip');
-    // 二级验证这一档是「手动验证」：面板不替你操作，得你自己在那块可点画面里弄。
+    // 验证入口由面板优先选择原设备扫码；实际扫码和人脸核验由用户在抖音 App 完成。
     // 画面和通用输入框都在主界面上（被这个弹窗盖着看不见），所以这里给说明 + 一个按钮。
     // 手动模式下 #wzmanualtip 已经把话说全了，上面那行状态就别再重复一遍（两段几乎一样的
     // 话叠在一起，用户会以为出了什么事）。
@@ -8911,10 +8984,9 @@ function renderWizard(au, lv, sr){
     if(au.manual){
       var mnt = $('wzmanualtip');
       if(mnt){
-        mnt.textContent = '抖音要求二级验证，这一步得你自己来：上面那块画面可以直接点 —— '
-          + '点「用原设备扫码」或者人脸都行；要打字就用主界面画面下面那个通用输入框，'
-          + '填完点「提交」。我同时会帮你点「用原设备扫码」、把二维码摆出来；'
-          + '登录成功我会自动把它收起来。';
+        mnt.textContent = '抖音要求二级验证：我会先尝试原设备扫码，无法继续时再尝试人脸验证。'
+          + '二维码请用已登录的抖音 App 扫描；扫脸或其他身份核验请按 App 提示亲自完成。'
+          + '下面画面可以直接点击，需要输入时用主界面下方的输入框。登录成功后会自动收起。';
       }
     }
   }
@@ -9258,7 +9330,7 @@ function refresh(){
       var il = au.idle_left;
       idleText = '　' + (il >= 60 ? (Math.ceil(il / 60) + ' 分钟') : (il + ' 秒')) + '没人操作就自动关掉浏览器';
     }
-    // 状态行跟着当前页签说话：扫码模式引导用户用抖音 App 确认，手动模式引导用户操作画面
+    // 状态行跟着当前页签说话：二维码模式引导用户用抖音 App 确认，手动模式引导用户操作画面
     var auMsg = String(au.message || '');
     if(String(au.phase || '') === 'qr' && !au.error){
       auMsg = wantManual
@@ -9288,9 +9360,13 @@ function refresh(){
       $('qrimg').removeAttribute('src');
     }
     if($('manualscreentip')){
-      $('manualscreentip').hidden = !(wantManual || qrFallback);
+      $('manualscreentip').hidden = !(wantManual || qrFallback || !!au.manual);
       var manualTipTitle = $('manualscreentip').querySelector('strong');
-      if(manualTipTitle){ manualTipTitle.textContent = qrFallback ? '二维码没识别到，可以点下面画面继续' : '下方画面可以直接点击'; }
+      if(manualTipTitle){
+        manualTipTitle.textContent = au.manual
+          ? '二级验证画面可以直接点击'
+          : (qrFallback ? '二维码没识别到，可以点下面画面继续' : '下方画面可以直接点击');
+      }
     }
     if(qrFallback && !shotManual){ setShot(true); }
     lastWantSms = wantSms;
