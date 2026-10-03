@@ -17,5 +17,6 @@ services:
     volumes:
       - ${CONFIG_DIR:-./config}:/app/config
       - ${LOG_DIR:-./logs}:/app/logs
+      - ../core/douyin_im.py:/app/core/douyin_im.py:ro
       - ./tasks.py:/app/core/tasks.py:ro
       - ./panel.py:/app/panel/panel.py:ro
