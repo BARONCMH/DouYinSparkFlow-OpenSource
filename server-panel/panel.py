@@ -98,7 +98,7 @@ SCHEDULE_INTERVAL = 5  # 秒：检查到期账号并启动排队中的定时任�
 CHECK_TIMEOUT = 120  # 秒：登录检测整体上限，超过就自动收尾，绝不允许一直卡着
 STUCK_AFTER = 90  # 秒：授权浏览器超过这么久没有新画面，就认为卡住了
 RUN_STUCK_AFTER = 180  # 秒：发送任务超过这么久没有新日志，就认为卡住了
-RUN_MAX_DURATION = 600  # 秒：单次发送任务的硬上限，超过后关闭任务及其子进程
+RUN_MAX_DURATION = 600  # 秒：每个抖音号独立的发送上限
 
 PANEL_USERNAME = os.getenv("PANEL_USERNAME", "admin")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "")
@@ -548,15 +548,15 @@ def _email_run_message(run: dict) -> tuple:
     labels = {
         "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
         "error": "发送出错", "no_login": "账号需要重新登录", "no_friend": "未找到目标好友",
-        "queue_timeout": "任务排队超时", "skipped": "任务已跳过", "timed_out": "发送任务超时",
+        "queue_timeout": "任务排队超时", "skipped": "任务已跳过", "timed_out": "单个抖音号发送超时",
     }
     label = labels.get(status, "发送任务已结束")
     account = str(run.get("account") or run.get("unique_id") or "你的账号")[:80]
     sent_at = str(run.get("at") or "")[:40]
     return "抖音火花发送通知：" + label, (
-        "你的发送任务已结束。\n\n"
+        ("这个抖音号的发送已结束。超过时限时，系统只会停止这个号，批次中的其他账号会继续。\n\n"
         "账号：%s\n结果：%s\n时间：%s\n\n"
-        "请登录面板查看发送详情。\n" % (account, label, sent_at)
+        "请登录面板查看发送详情。\n" % (account, label, sent_at))
     )
 
 
@@ -5817,6 +5817,29 @@ class TaskRunner:
                     timeout=10, check=False,
                 )
             else:
+                # Account workers use their own session so one account can be
+                # timed out without ending the supervisor. When the whole run is
+                # force-stopped, also kill descendants across those sessions.
+                descendants = []
+                pending = [process.pid]
+                seen = set()
+                while pending:
+                    parent_pid = pending.pop()
+                    if parent_pid in seen:
+                        continue
+                    seen.add(parent_pid)
+                    children_path = Path("/proc/%d/task/%d/children" % (parent_pid, parent_pid))
+                    try:
+                        children = [int(pid) for pid in children_path.read_text().split()]
+                    except Exception:
+                        children = []
+                    descendants.extend(children)
+                    pending.extend(children)
+                for pid in reversed(descendants):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
                 os.killpg(process.pid, signal.SIGKILL)
         except Exception:
             try:
@@ -5834,81 +5857,6 @@ class TaskRunner:
                 process.wait(timeout=2)
             except Exception:
                 pass
-
-    def _record_timeout_results(self, run_id: str, started_at: float) -> None:
-        """Finalize the active account and record selected accounts the killed batch never reached."""
-        try:
-            data = json.loads(SEND_LOG.read_text(encoding="utf-8")) if SEND_LOG.exists() else {"runs": []}
-            if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
-                data = {"runs": []}
-            runs = data["runs"]
-            started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
-            finished_text = now_text()
-            detail_active = "本次发送运行超过 10 分钟，系统已关闭任务及其子进程；本账号未完成。"
-            detail_pending = "发送批次超过 10 分钟，系统已关闭任务及其子进程；本账号未能开始发送。"
-            recorded = set()
-            changed = False
-
-            for run in runs:
-                if not isinstance(run, dict) or str(run.get("runner_id") or "") != run_id:
-                    continue
-                uid = str(run.get("unique_id") or "")
-                if uid:
-                    recorded.add(uid)
-                if str(run.get("status") or "") == "running":
-                    run.update({
-                        "status": "timed_out",
-                        "reason": "timeout",
-                        "detail": detail_active,
-                        "finished_at": finished_text,
-                        "timed_out": True,
-                    })
-                    changed = True
-
-            all_tasks = load_tasks()
-            requested_ids = {part.strip() for part in str(self.only or "").split(",") if part.strip()}
-            if not requested_ids:
-                requested_ids = {
-                    str(task.get("unique_id") or "")
-                    for task in all_tasks
-                    if isinstance(task, dict)
-                }
-            by_id = {
-                str(task.get("unique_id") or ""): task
-                for task in all_tasks
-                if isinstance(task, dict) and str(task.get("unique_id") or "") in requested_ids
-            }
-            for uid, task in by_id.items():
-                if not uid or uid in recorded:
-                    continue
-                if not [target for target in (task.get("targets") or []) if str(target).strip()]:
-                    continue
-                try:
-                    if not load_cookies(uid):
-                        continue
-                except Exception:
-                    continue
-                runs.insert(0, {
-                    "run_id": "%s:%s" % (run_id, uid),
-                    "runner_id": run_id,
-                    "at": started_text,
-                    "finished_at": finished_text,
-                    "account": str(task.get("username") or uid),
-                    "unique_id": uid,
-                    "targets": [str(target) for target in (task.get("targets") or [])],
-                    "friends": [],
-                    "status": "timed_out",
-                    "reason": "timeout",
-                    "detail": detail_pending,
-                    "timed_out": True,
-                })
-                changed = True
-
-            if changed:
-                runs[:] = runs[:SEND_STORE_MAX]
-                atomic_write(SEND_LOG, json.dumps(data, ensure_ascii=False, indent=1))
-        except Exception as error:
-            log_force("记录发送超时结果失败", type(error).__name__)
 
     def _record_aborted_results(self, run_id: str) -> None:
         """Keep a manually force-stopped run from remaining marked as running forever."""
@@ -5939,29 +5887,6 @@ class TaskRunner:
         except Exception as error:
             log_force("记录发送停止结果失败", type(error).__name__)
 
-    def _stop_if_expired(self, process, started_at: float) -> None:
-        with self.lock:
-            if self.process is not process or self.started_at != started_at or process.poll() is not None:
-                return
-            if self.handle is not None:
-                try:
-                    self.handle.write("\n===== %s任务运行超过 10 分钟，已自动停止=====\n" % now_text())
-                    self.handle.flush()
-                except Exception:
-                    pass
-            self._terminate_process_tree(process)
-            self._record_timeout_results(self.run_id, started_at)
-            self.timed_out = True
-            self.timed_out_at = now_text()
-            self._release_shared_lock()
-            if self.handle is not None:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
-            self._timeout_timer = None
-
     def start(self, only: str = "", source: str = "手动"):
         """only 传抖音号时，只跑这一个账号（账号级登录的用户只能跑自己的）。"""
         # 同样共用引擎锁：不会出现"检测刚起来，发送任务也起来了"
@@ -5981,6 +5906,7 @@ class TaskRunner:
                 environment.update(accounts_env())
                 self.run_id = uuid4().hex
                 environment["PANEL_RUN_ID"] = self.run_id
+                environment["PANEL_ACCOUNT_TIMEOUT_SECONDS"] = str(RUN_MAX_DURATION)
                 self.timed_out = False
                 self.timed_out_at = ""
                 if only:
@@ -6019,12 +5945,7 @@ class TaskRunner:
                     raise
                 self.started_at = time.time()
                 self.timed_out = False
-                self._timeout_timer = threading.Timer(
-                    RUN_MAX_DURATION, self._stop_if_expired, args=(self.process, self.started_at)
-                )
-                self._timeout_timer.daemon = True
-                self._timeout_timer.start()
-                return True, "任务已启动，单次最多运行 10 分钟"
+                return True, "任务已启动；每个抖音号最多运行 10 分钟，超时后继续下一个账号"
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -8736,16 +8657,11 @@ function renderTodaySend(s){
       : (mail.enabled ? ('已开启 · ' + (mail.address || '未填写邮箱')) : '尚未开启');
   }
   var runner = (s && s.runner) || {};
-  var timedOutToday = runner.timed_out && String(runner.timed_out_at || '').slice(0, 10) === date;
   state.className = 'today-state';
-  if(timedOutToday){
-    state.textContent = '任务运行超过 10 分钟，已自动停止';
-    state.classList.add('failed');
-    meta.textContent = '为避免任务长时间挂起，系统已关闭本次发送进程';
-  } else if(runner.running){
+  if(runner.running){
     state.textContent = '发送任务进行中';
     state.classList.add('pending');
-    meta.textContent = '单次任务最多运行 10 分钟，超时后会自动停止';
+    meta.textContent = '每个抖音号最多运行 10 分钟；超时只停止该号，随后继续其他账号';
   } else if(!run){
     state.textContent = s && s.is_admin ? '今天还没有全站发送记录' : '今天还没有发送记录';
     meta.textContent = date + ' · 手动运行发送任务后会更新';
@@ -8756,7 +8672,7 @@ function renderTodaySend(s){
       error:['今天任务出错','failed'], queued:['发送任务排队中','pending'],
       queue_timeout:['发送排队超时','failed'], skipped:['今天的发送已跳过','pending'],
       running:['发送任务进行中','pending'], no_friend:['未找到目标好友','failed'],
-      timed_out:['任务超时，已自动停止','failed']
+      timed_out:['此抖音号超过 10 分钟，已停止','failed']
     };
     var result = labels[run.status] || ['今天任务状态：' + (run.status || '未知'),'pending'];
     state.textContent = result[0];
@@ -8773,7 +8689,7 @@ function renderTodaySend(s){
         ok:['发送成功','g'], partial:['部分成功','y'], failed:['发送失败','r'],
         no_login:['登录失效','r'], error:['任务出错','r'], no_friend:['未找到好友','r'],
         queued:['排队中','y'], queue_timeout:['排队超时','r'], skipped:['已跳过','n'], running:['进行中','y'],
-        timed_out:['超时并自动停止','r']
+        timed_out:['此账号超时（其他账号继续）','r']
       };
       list.innerHTML = runs.slice(0, 8).map(function(item){
         var info = labels[item.status] || [item.status || '未知','n'];
@@ -9567,9 +9483,8 @@ function refresh(){
     }
     var rs = $('runstate');
     rs.textContent = s.runner.running
-      ? ('运行中…单次上限 10 分钟' + (s.runner.stuck ? '；超过 3 分钟没有新日志，可能卡住了，可点「强制停止」' : ''))
-      : (s.runner.timed_out ? '任务超过 10 分钟，已自动停止'
-        : (s.runner.returncode === null ? '尚未运行' : ('上次退出码 ' + s.runner.returncode)));
+      ? ('运行中…每个抖音号上限 10 分钟' + (s.runner.stuck ? '；超过 3 分钟没有新日志，可能卡住了，可点「强制停止」' : ''))
+      : (s.runner.returncode === null ? '尚未运行' : ('上次退出码 ' + s.runner.returncode));
   setBtn('bstart', au.running || !!ck2.running);
   if($('hbstart')){ $('hbstart').disabled = $('bstart').disabled; $('hbstart').title = $('bstart').title; }
   var ha = $('headacct');
@@ -9651,7 +9566,7 @@ var SEND_BADGE = {
   no_login:['登录已失效','r'],
   error:['运行出错','r'],
   running:['本次记录未正常结束','y'],
-  timed_out:['运行超过 10 分钟，已自动停止','r'],
+  timed_out:['此抖音号发送超过 10 分钟，已停止','r'],
   skipped:['上一轮还没跑完，本轮跳过','y'],
   queued:['排队中：等上一轮跑完接着发','y'],
   queue_timeout:['排队超时，本轮没发成','r']

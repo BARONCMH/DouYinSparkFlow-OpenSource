@@ -3,6 +3,9 @@ import json
 import os
 import random
 import re
+import signal
+import subprocess
+import sys
 import traceback
 from uuid import uuid4
 from utils.logger import setup_logger
@@ -1334,8 +1337,8 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
         "status": "running",
         "detail": "",
     }
-    # 先落一条进行中记录。若面板的 10 分钟硬上限先到，父进程会把它改成超时，
-    # 概览和邮箱通知仍能看到这次未完成的任务。
+    # 先落一条进行中记录。若这个抖音号超过独立的 10 分钟上限，监督进程
+    # 会只把当前账号改成超时；概览和邮箱通知仍能显示本账号未完成。
     record_run(entry)
     try:
         shot_session = context.new_cdp_session(page)
@@ -1607,6 +1610,13 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
 
 
 def runTasks():
+    if os.getenv("PANEL_ACCOUNT_CHILD") != "1" and os.getenv("PANEL_RUN_ID"):
+        _run_panel_accounts_separately()
+        return
+    _run_tasks_in_current_process()
+
+
+def _run_tasks_in_current_process():
     if not userData:
         logger.warning("没有可执行的账号，本次跳过（可能是账号缺少 Cookie）")
         return
@@ -1637,3 +1647,152 @@ def runTasks():
         browser.close()
 
         playwright.stop()
+
+
+def _terminate_account_process(process):
+    """Stop only one timed-out account worker and the browser it launched."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _record_account_timeout(user, started_at, timeout_seconds):
+    """Mark only the account that exceeded its own time limit."""
+    uid = str(user.get("unique_id") or "")
+    runner_id = str(os.getenv("PANEL_RUN_ID") or "")
+    run_id = "%s:%s" % (runner_id or "", uid)
+    account = str(user.get("username") or uid or "抖音账号")
+    started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
+    finished_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    detail = (
+        "此抖音号发送超过 %d 分钟，系统已停止该账号及其浏览器；"
+        "本账号未完成，后续账号会继续执行。" % max(1, timeout_seconds // 60)
+    )
+    try:
+        data = {"runs": []}
+        if os.path.exists(SEND_LOG):
+            try:
+                with open(SEND_LOG, encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict) and isinstance(loaded.get("runs"), list):
+                    data = loaded
+            except Exception:
+                pass
+        runs = data["runs"]
+        entry = next(
+            (
+                item for item in runs
+                if isinstance(item, dict)
+                and (
+                    str(item.get("run_id") or "") == run_id
+                    or (runner_id and str(item.get("runner_id") or "") == runner_id
+                        and str(item.get("unique_id") or "") == uid)
+                )
+            ),
+            None,
+        )
+        if entry is not None and str(entry.get("status") or "") != "running":
+            return
+        if entry is None:
+            entry = {
+                "run_id": run_id,
+                "runner_id": runner_id,
+                "at": started_text,
+                "account": account,
+                "unique_id": uid,
+                "targets": list(user.get("targets") or []),
+                "friends": [],
+            }
+            runs.insert(0, entry)
+        entry.update({
+            "status": "timed_out",
+            "reason": "timeout",
+            "detail": detail,
+            "finished_at": finished_text,
+            "timed_out": True,
+        })
+        runs[:] = runs[:KEEP_RUNS_MAX]
+        tmp = SEND_LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=1)
+        os.replace(tmp, SEND_LOG)
+    except Exception as error:
+        logger.error("记录账号 %s 的超时结果失败：%s", account, type(error).__name__)
+
+
+def _run_panel_accounts_separately():
+    """Give each panel-run account its own process and independent timeout."""
+    if not userData:
+        logger.warning("没有可执行的账号，本次跳过（可能是账号缺少 Cookie）")
+        return
+    try:
+        timeout_seconds = max(1, int(os.getenv("PANEL_ACCOUNT_TIMEOUT_SECONDS", "600")))
+    except (TypeError, ValueError):
+        timeout_seconds = 600
+
+    clear_abort_flag()
+    logger.info("开始执行任务；每个抖音号独立计时，上限 %d 秒", timeout_seconds)
+    for user in userData:
+        uid = str(user.get("unique_id") or "").strip()
+        account = str(user.get("username") or uid or "抖音账号")
+        if not uid:
+            logger.warning("账号 %s 缺少 unique_id，本次跳过", account)
+            continue
+        logger.info("开始处理账号 %s（独立上限 %d 秒）", account, timeout_seconds)
+        child_environment = os.environ.copy()
+        child_environment["RUN_ONLY_ACCOUNTS"] = uid
+        child_environment["PANEL_ACCOUNT_CHILD"] = "1"
+        options = {}
+        if os.name == "nt":
+            options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            options["start_new_session"] = True
+        started_at = time.time()
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "main.py"],
+                cwd=os.getcwd(),
+                env=child_environment,
+                **options,
+            )
+        except Exception as error:
+            logger.error("账号 %s 的发送进程启动失败：%s", account, error)
+            continue
+        try:
+            process.wait(timeout=timeout_seconds)
+            logger.info("账号 %s 任务完成（退出码 %s）", account, process.returncode)
+        except subprocess.TimeoutExpired:
+            # If the worker exited right at the deadline, don't convert a completed
+            # account run into a timeout.
+            if process.poll() is not None:
+                logger.info("账号 %s 在超时检查前已完成（退出码 %s）", account, process.returncode)
+                continue
+            logger.error("账号 %s 发送超过 %d 秒，停止该账号并继续后续账号", account, timeout_seconds)
+            _terminate_account_process(process)
+            _record_account_timeout(user, started_at, timeout_seconds)
