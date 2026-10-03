@@ -1106,11 +1106,6 @@ SMS_PWD_MAX = 64
 # 它**不做任何识别**，只把内容粘到抖音页面当前光标处（详见 _submit_text / _paste_text）。
 TEXT_MAX = 200
 
-# 手机号登录（面板主路径）：先切到这个标签，再填号码
-PHONE_TAB_TEXTS = ("验证码登录", "手机号登录", "接收短信验证码")
-# 手机号登录那一步的提交按钮：抖音那个弹窗写的是「登录」，不是「验证」
-PHONE_SUBMIT_TEXTS = ("登录", "立即登录")
-
 # 把文字对应的元素找出来，返回屏幕坐标 —— 点击由外面用真鼠标点
 _JS_FIND_TEXT_CENTER = """(texts) => {
   const wanted = (texts || []).map((t) => String(t || "").trim()).filter(Boolean);
@@ -3793,8 +3788,6 @@ class BrowserSession:
         self.qr_hash = ""            # 二维码指纹：变了说明换新了
         self.qr_at = 0.0             # 这张二维码是什么时候取到的
         self.qr_seen_at = 0.0        # 第一次看到二维码的时刻（"扫过了"要靠它判断）
-        self.phone_login = False     # 这次授权走的是「手机号 + 验证码」而不是扫码
-        self.phone_digits = 0        # 手机号填进去几位（只存长度，不存号码）
         self.verify_qr = False       # 抖音弹了二级验证，而且屏幕上有二维码可扫
         self.verify_hint = ""        # 二级验证时给用户看的那句话
         # 「手动模式」：进了二级验证就把**可操作画面**交给用户 ——
@@ -3965,8 +3958,6 @@ class BrowserSession:
                 self.sms_proof = None
                 self.sms_proof_at = 0.0
                 self.phase = "opening"
-                self.phone_login = False
-                self.phone_digits = 0
                 self.page_hint = ""
                 self.sms_hint = ""
                 self.sms_kind = "code"
@@ -4060,13 +4051,8 @@ class BrowserSession:
                             page.keyboard.press(str(command.get("key", "Enter")))
                         elif name == "goto":
                             page.goto(str(command.get("url", CHAT_URL)), wait_until="domcontentloaded", timeout=120000)
-                        elif name == "phone":
-                            self._submit_phone(page, str(command.get("phone") or ""))
                         elif name == "sms":
-                            if self.phone_login:
-                                self._submit_phone_code(page, str(command.get("code") or ""))
-                            else:
-                                self._submit_sms(page, str(command.get("code") or ""))
+                            self._submit_sms(page, str(command.get("code") or ""))
                         elif name == "pwd":
                             # 二级验证弹密码框：走独立通道，不跟"手机号登录"那条岔路混
                             # （那条是给验证码用的，会去填 input#button-input）
@@ -4500,47 +4486,6 @@ class BrowserSession:
             pass
 
 
-    # ---- 手机号登录：面板的主路径（扫码退到备用）--------------------------------
-    def _fill_input(self, page, selector: str, value: str) -> str:
-        """把值写进抖音的输入框，返回框里实际剩下的内容。
-
-        先用 Playwright 的 fill（它发出的 input 事件 React 认），不行再用
-        原生 setter 兜一次 —— 抖音的输入框是受控组件，直接改 value 会被抹掉。
-        """
-        try:
-            page.fill(selector, "", timeout=4000)
-            page.fill(selector, value, timeout=4000)
-            return str(page.input_value(selector, timeout=2000) or "")
-        except Exception:
-            pass
-        try:
-            got = page.evaluate(_JS_FILL_REACT_INPUT, {"selector": selector, "value": value})
-        except Exception:
-            return ""
-        return str(got.get("value") or "") if isinstance(got, dict) else ""
-
-    def _click_text_mouse(self, page, texts) -> str:
-        """按文字找到元素，用真鼠标点它，返回点到的文字。
-
-        抖音的发验证码/登录按钮用页内合成 click 点不动（试过，接口根本不发），
-        所以这里只算坐标，点击交给 page.mouse。
-        """
-        try:
-            hit = page.evaluate(_JS_FIND_TEXT_CENTER, list(texts))
-        except Exception:
-            return ""
-        if not (isinstance(hit, dict) and hit.get("ok")):
-            return ""
-        x = float(hit.get("x") or 0)
-        y = float(hit.get("y") or 0)
-        try:
-            page.mouse.move(x, y)
-            page.wait_for_timeout(60)
-            page.mouse.click(x, y)
-        except Exception:
-            return ""
-        return str(hit.get("text") or "")
-
     def _click_text_any(self, page, texts):
         """主页面和各个 iframe 依次找那个字去点，点到就返回点到的那个元素信息。
 
@@ -4556,143 +4501,6 @@ class BrowserSession:
             if isinstance(got, dict) and got.get("ok"):
                 return got
         return None
-
-    def _submit_phone(self, page, phone: str) -> None:
-        """手机号登录第一步：切到「验证码登录」-> 填手机号 -> 点「获取验证码」。"""
-        digits = re.sub(r"\D", "", phone or "")
-        if not re.fullmatch(r"1\d{10}", digits):
-            self._set(message="手机号要填 11 位数字，检查一下")
-            return
-
-        with self.lock:
-            self.phone_login = True
-        self._snap_now()
-
-        # 1) 登录弹窗没开就先点开
-        if not self._has_words(page, MODAL_WORDS):
-            try:
-                page.evaluate(_JS_CLICK_LOGIN, LOGIN_ENTRY_TEXTS)
-            except Exception:
-                pass
-            page.wait_for_timeout(1800)
-
-        # 2) 切到「验证码登录」：弹窗默认停在扫码，不切进去就没有手机号那个框
-        picked = self._click_text_mouse(page, PHONE_TAB_TEXTS)
-        if picked:
-            self._set(message="已切到「%s」" % picked)
-            page.wait_for_timeout(1500)
-
-        # 3) 填手机号（只回长度，手机号本身不写日志）
-        got = re.sub(r"\D", "", self._fill_input(page, "input#normal-input", digits))
-        with self.lock:
-            self.phone_digits = len(got)
-        if not got:
-            self._set(
-                message="没找到抖音的手机号输入框。请在下面截图里点一下手机号那一栏，"
-                        "再用上面那行「输入并发送」把号码填进去。",
-                page_hint="请手动点手机号输入框",
-            )
-            return
-        if got != digits:
-            self._set(message="手机号只填进去 %d 位，请检查一下（也可以手动补全）" % len(got))
-            return
-        page.wait_for_timeout(900)
-
-        # 4) 点「获取验证码」，同时看一眼抖音接口的返回 —— 光看页面文字看不出成败
-        clicked = ""
-        verdict = ""
-        detail = ""
-        try:
-            with page.expect_response(
-                lambda r: "/passport/web/" in r.url
-                and not re.search(
-                    r"challenge|qrcode|qrconnect|ticket_guard|login_guiding|ttwid",
-                    r.url,
-                    re.I,
-                ),
-                timeout=9000,
-            ) as caught:
-                clicked = self._click_text_mouse(page, SMS_SEND_TEXTS)
-            try:
-                raw = caught.value.text()[:400]
-            except Exception:
-                raw = ""
-            verdict, detail = judge_send_response(raw)
-        except Exception:
-            clicked = clicked or ""
-            page.wait_for_timeout(300)
-
-        with self.lock:
-            self.phase = "sms"
-
-        if clicked and verdict != "bad":
-            self._sms_send_at = time.time()
-            self._set(
-                message="手机号已经填进抖音并点了「%s」，短信到了就把验证码填在下面。" % clicked,
-                sms_hint="验证码已经发到你手机上：填在下面，我替你填进抖音并点「登录」。",
-                sms_result={"ok": True, "at": now_text(), "message": "已请求发送短信验证码"},
-            )
-            return
-        if verdict == "bad":
-            self._set(
-                message="抖音没接受这次发送（接口返回：%s）。检查一下号码，"
-                        "或者到下面截图里手动试一次。想自己操作画面就切到上面的「手动授权」页签。" % (detail or "未说明原因"),
-                sms_hint="抖音拒绝了这次验证码发送，看上面的提示。",
-                sms_result={"ok": False, "at": now_text(), "message": detail or "抖音拒绝了这次发送"},
-            )
-            return
-        self._set(
-            message="手机号填好了，但没能确认抖音发出验证码。请在下面截图里手动点一次「获取验证码」。",
-            page_hint="请手动点「获取验证码」",
-        )
-
-    def _submit_phone_code(self, page, code: str) -> None:
-        """手机号登录第二步：把验证码填进抖音的框，再用真鼠标点「登录」。"""
-        digits = re.sub(r"\D", "", code or "")
-        if not digits:
-            return
-        got = re.sub(r"\D", "", self._fill_input(page, "input#button-input", digits))
-        with self.lock:
-            self.sms_box_len = len(got)
-            self.sms_box_at = time.time()
-        if not got:
-            self._set(
-                phase="sms",
-                sms_result={"ok": False, "at": now_text(),
-                            "message": "验证码没写进抖音的框里，请在截图里点一下那个框再填一次"},
-            )
-            return
-        if got != digits:
-            self._set(
-                phase="sms",
-                sms_result={"ok": False, "at": now_text(),
-                            "message": "验证码只进去 %d 位，再填一次" % len(got)},
-            )
-            return
-
-        # 抖音认到码之后「登录」才会亮，等一会儿再点
-        page.wait_for_timeout(int(SMS_BEFORE_SUBMIT_WAIT * 1000))
-        clicked = ""
-        for _ in range(3):
-            clicked = self._click_text_mouse(page, PHONE_SUBMIT_TEXTS)
-            if clicked:
-                break
-            page.wait_for_timeout(1500)
-        with self.lock:
-            self._sms_submitted_at = time.time()
-        if clicked:
-            self._set(
-                phase="scanned",
-                sms_result={"ok": True, "at": now_text(),
-                            "message": "验证码已经填进抖音并点了「%s」，等结果…" % clicked},
-            )
-        else:
-            self._set(
-                phase="sms",
-                sms_result={"ok": False, "at": now_text(),
-                            "message": "验证码填好了，但没找到抖音的「登录」按钮，"
-                                       "请在截图里手动点一下登录"},
-            )
 
     def _login_step(self, page, context, cdp) -> bool:
         """授权流程的大脑：自动点开登录 -> 扒二维码 -> 扫完进二级验证。
@@ -4794,7 +4602,7 @@ class BrowserSession:
                 except Exception:
                     hit = None
                 if isinstance(hit, dict) and hit.get("ok"):
-                    self._set(message="已自动点开抖音登录弹窗：填手机号，或切到「手动授权」页签自己操作")
+                    self._set(message="已自动打开抖音登录页：请用抖音 App 扫码；遇到验证时按页面提示完成")
 
         qr = self._find_qr(page)
 
@@ -4847,7 +4655,7 @@ class BrowserSession:
                     if not self.qr_seen_at:
                         self.qr_seen_at = now
                         self.phase = "qr"
-                        self.message = "请在下面填手机号并点「手机号登录」；要自己操作画面就切到「手动授权」页签"
+                        self.message = "请用抖音 App 扫描页面上的二维码并确认登录；如果二维码无法识别，可在「手动授权」中操作画面"
                     elif self.phase in ("idle", "opening", "manual"):
                         self.phase = "qr"
                     self.qr_gone_at = 0.0
@@ -4950,8 +4758,8 @@ class BrowserSession:
             except Exception:
                 raw = None
             if isinstance(raw, dict):
-                msg = ("现在页面上那个是「手机号登录」用的验证码框，"
-                       "还没到二级验证这一步")
+                msg = ("现在检测到的是普通登录验证码输入框，"
+                       "请继续使用抖音 App 扫码确认，或在手动授权画面里操作")
             else:
                 msg = ("抖音页面上没找到验证码输入框（可能已经验证过了，"
                        "或者这一步不需要验证码）。状态没有变化")
@@ -5711,7 +5519,7 @@ class LoginChecker:
 
             if not conversations:
                 reason = "页面被登录弹窗挡住了" if info.get("loginDialog") else "页面里没有出现好友列表"
-                hint = "，Cookie 可能已过期，请重新授权登录" if has_session else "，请点「开始授权」用手机号登录"
+                hint = "，Cookie 可能已过期，请重新授权登录" if has_session else "，请点「开始授权」并用抖音 App 扫码"
                 self._finish(
                     unique_id,
                     False,
@@ -6850,7 +6658,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <section id="authbox"><h2><span class="step">2</span>授权登录</h2>
 <div class="authtabs" role="tablist" aria-label="选择登录方式">
 <button class="authtab on" id="tabmanual" type="button" role="tab" aria-selected="true" aria-label="手动授权，推荐方式">手动授权 <span class="auth-rec-badge">推荐</span></button>
-<button class="authtab" id="tabphone" type="button" role="tab" aria-selected="false">手机号授权</button>
+<button class="authtab" id="tabqr" type="button" role="tab" aria-selected="false">抖音扫码授权</button>
 <button class="authtab" id="tabcookie" type="button" role="tab" aria-selected="false">手动输入 Cookie</button>
 </div>
 <div id="browserauthpane">
@@ -6868,14 +6676,9 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <p id="authstate" class="muted">尚未启动</p>
 <p class="muted" id="qrowner" hidden><span id="qrownertext"></span><button class="sm sec" id="bswitchwho" type="button" hidden>切到这个账号</button></p>
 <p class="muted" id="qrdiag" role="status"></p>
-<div id="phonebox" hidden>
-<div class="row">
-<input id="phone" inputmode="numeric" maxlength="11" autocomplete="off" placeholder="手机号（11 位）" aria-label="手机号">
-<button class="sm" id="bphone" type="button">手机号登录</button>
-<span class="muted" id="phonestate" role="status"></span>
-</div>
-<p class="muted" id="phoneresult" role="status" style="margin:8px 0 0"></p>
-<p class="muted" id="savedat" role="status" style="margin:8px 0 0"></p>
+<div id="qrloginbox" class="auth-recommend" role="note" hidden>
+<span class="ar-icon" aria-hidden="true">✓</span>
+<div><strong>使用抖音 App 扫码登录</strong><p>点「开始授权」后，等待下方二维码出现，再用抖音 App 扫一扫并在手机上确认。若网页和抖音 App 在同一部手机，可先保存二维码到相册，再从扫一扫里选择图片。</p></div>
 </div>
 <div id="qrarea" hidden style="margin-top:14px">
 <div class="row" style="align-items:flex-start">
@@ -7013,7 +6816,7 @@ html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--bran
 <div><div class="muted">名下的抖音号</div><div class="kv" id="me_ids">—</div></div>
 <div><div class="muted">登录状态</div><div class="kv" id="me_badge">—</div></div>
 </div>
-<p class="muted">绑定新抖音号：去「抖音账户」页点「＋ 新增账号」，填一个自己起的标识（例如 myspark），再用手机号授权登录。</p>
+<p class="muted">绑定新抖音号：去「抖音账户」页点「＋ 新增账号」，填一个自己起的标识（例如 myspark），再用抖音 App 扫码授权。</p>
 </section>
 
 <section id="mobileapp">
@@ -7430,7 +7233,7 @@ function applyRole(s){
     ? '这里改的是你自己的面板登录密码。要改别人的密码、分配抖音号，去左边「管理」页。'
     : (mine
       ? ('你名下的抖音号：' + (s.my_ids || []).join('、') + '（每个普通用户只能绑 1 个，想换号就先删掉再建新的）。')
-      : '还没绑定抖音号：去「抖音账户」点「＋ 新增账号」，只填一个自己起的标识（例如 myspark），再用手机号授权登录。');
+      : '还没绑定抖音号：去「抖音账户」点「＋ 新增账号」，只填一个自己起的标识（例如 myspark），再用抖音 App 扫码授权。');
   var f = $('cfg');
   f.username.readOnly = false;
   f.unique_id.readOnly = false;
@@ -7946,13 +7749,14 @@ function copyCookie(){
     })
     .catch(function(){ fail('复制出错了，稍后再试'); });
 }
-// ---- 手机验证码只有一个入口：授权弹窗里的 wzcode 框（见 wzSubmit） ----
+// ---- 二级验证短信只有一个入口：授权弹窗里的 wzcode 框（见 wzSubmit） ----
 var lastQrHash = '', lastWantSms = false, qrFailedHash = '';
-var wantManual = true;
+var wantManual = true, wantQr = false;
 function setAuthMethod(method){
-  if(['manual','phone','cookie'].indexOf(method) < 0){ return; }
+  if(['manual','qr','cookie'].indexOf(method) < 0){ return; }
   wantManual = method === 'manual';
-  [['tabmanual','manual'],['tabphone','phone'],['tabcookie','cookie']].forEach(function(item){
+  wantQr = method === 'qr';
+  [['tabmanual','manual'],['tabqr','qr'],['tabcookie','cookie']].forEach(function(item){
     var tab = $(item[0]), selected = method === item[1];
     if(tab){
       tab.className = 'authtab' + (selected ? ' on' : '');
@@ -7961,17 +7765,20 @@ function setAuthMethod(method){
   });
   if($('browserauthpane')){ $('browserauthpane').hidden = method === 'cookie'; }
   if($('cookieauthpane')){ $('cookieauthpane').hidden = method !== 'cookie'; }
-  if($('phonebox')){ $('phonebox').hidden = method !== 'phone'; }
+  if($('qrloginbox')){ $('qrloginbox').hidden = method !== 'qr'; }
   if($('manualauthnotice')){ $('manualauthnotice').hidden = !wantManual; }
   if($('manualscreentip')){ $('manualscreentip').hidden = !wantManual; }
   if(wantManual){
     shotManual = false;
     setShot(true);
+  } else if(wantQr){
+    shotManual = false;
+    setShot(false);
   }
   if(typeof refresh === 'function'){ refresh(); }
 }
 if($('tabmanual')){ $('tabmanual').onclick = function(){ setAuthMethod('manual'); }; }
-if($('tabphone')){ $('tabphone').onclick = function(){ setAuthMethod('phone'); }; }
+if($('tabqr')){ $('tabqr').onclick = function(){ setAuthMethod('qr'); }; }
 if($('tabcookie')){ $('tabcookie').onclick = function(){ setAuthMethod('cookie'); }; }
 
 // 二维码取不下来（比如刚好在换新、或这张码不属于我）时把整块收起来，
@@ -7988,30 +7795,6 @@ if($('tabcookie')){ $('tabcookie').onclick = function(){ setAuthMethod('cookie')
     };
   }
 })();
-function sendPhone(){
-  var el = $('phone'), box = $('phonestate'), out = $('phoneresult');
-  if(!el){ return; }
-  var phone = String(el.value || '').replace(/[^0-9]/g, '');
-  if(!/^1\d{10}$/.test(phone)){
-    note('手机号要 11 位数字，检查一下', false);
-    if(el.focus){ el.focus(); }
-    return;
-  }
-  if(box){ box.textContent = '正在提交…'; }
-  if(out){ out.textContent = '正在把手机号填进抖音页面，这一步要等几秒…'; }
-  post('api/auth/phone', {phone: phone, unique_id: curUid()}).then(function(r){
-    if(box){ box.textContent = ''; }
-    if(!r.ok){ note(r.error || '提交失败，稍后再试', false); if(out){ out.textContent = r.error || '提交失败'; } return; }
-    note(r.message || '手机号已提交', true);
-    if(out){ out.textContent = '已提交：等手机收到短信，把验证码填在下面弹出来的「抖音要你做一次安全验证」窗口里。'; }
-  });
-}
-if($('bphone')){ $('bphone').onclick = sendPhone; }
-if($('phone')){
-  $('phone').addEventListener('keydown', function(e){
-    if(e.key === 'Enter'){ e.preventDefault(); sendPhone(); }
-  });
-}
 $('bcopycookie').onclick = copyCookie;
 $('bcheck').onclick = function(){
   if(!lockButton(this)){ return; }
@@ -8103,7 +7886,7 @@ function renderRelogin(info){
     + '<b>抖音登录已失效</b>（' + esc(info.at || '') + '，账号 ' + esc(info.account || '') + '）<br>'
     + esc(info.detail || '') + '<br>'
     + '<button id="breauth" type="button" style="margin-top:8px">重新授权登录</button>'
-    + '<span class="muted" style="margin-left:8px">点它打开抖音登录页，用手机号收验证码登录即可（也可以切「手动授权」自己在画面里操作）；3 分钟没人操作会自动关掉浏览器</span>'
+    + '<span class="muted" style="margin-left:8px">点它打开抖音登录页，再用抖音 App 扫描二维码确认（也可以切「手动授权」直接操作画面）；3 分钟没人操作会自动关掉浏览器</span>'
     + '</div>';
   var btn = $('breauth');
   if(btn){
@@ -8121,7 +7904,7 @@ function renderRelogin(info){
       if(!uid){ flash('先在「1 账号」里选好要授权的账号，再点「开始授权」', false); return; }
       if(hit){ selectAccount(hit.unique_id); }
       post('api/browser/start', {unique_id: uid, username: hit ? hit.username : ''}).then(function(r){
-        flash(r.ok ? ('已给「' + uid + '」启动授权，往下滚到第 2 步填手机号') : (r.error || '启动失败'), !!r.ok);
+        flash(r.ok ? ('已给「' + uid + '」启动授权，往下滚到第 2 步用抖音 App 扫码') : (r.error || '启动失败'), !!r.ok);
         if(r.ok){ $('authbox').scrollIntoView({behavior:'smooth', block:'start'}); }
       });
     };
@@ -8186,7 +7969,7 @@ function renderStatus(s){
   }
 
 
-  if(cur._new){ badge('新账号：填个「抖音号」，点下面「开始授权」就能用手机号登录', 'n'); }
+  if(cur._new){ badge('新账号：填个「抖音号」，点下面「开始授权」后用抖音 App 扫码', 'n'); }
   else if(runningThis){ badge('正在检测登录状态…', 'y'); }
   else if(chk && chk.ok && !ready){ badge('已登录（还没填「目标好友」，填完点「保存配置」后可以手动运行）', 'y'); }
   else if(chk && chk.ok){ badge('已登录 - ' + chk.at, 'g'); }
@@ -8965,24 +8748,25 @@ function refresh(){
       var il = au.idle_left;
       idleText = '　' + (il >= 60 ? (Math.ceil(il / 60) + ' 分钟') : (il + ' 秒')) + '没人操作就自动关掉浏览器';
     }
-    // 状态行跟着当前页签说话：手机号模式下别提二维码，手动授权下别再叫去填手机号
+    // 状态行跟着当前页签说话：扫码模式引导用户用抖音 App 确认，手动模式引导用户操作画面
     var auMsg = String(au.message || '');
     if(String(au.phase || '') === 'qr' && !au.error){
       auMsg = wantManual
         ? '手动授权模式：抖音登录页已经打开了，在下面的画面里自己操作就行。'
-        : '填写手机号并点击「手机号登录」。';
+        : (wantQr ? '请用抖音 App 扫描上方二维码，并在手机上确认登录。' : auMsg);
     }
     $('authstate').innerHTML = '<span class="dot ' + (AUTH_COLOR[au.state] || 'n') + '"></span><span>'
       + esc(auMsg) + (au.error ? esc('（' + au.error + '）') : '')
       + (au.stuck ? esc('　画面 90 秒没更新，好像卡住了，请点下面的「强制停止」') : '')
       + esc(idleText) + '</span>';
 
-    // ---- 二维码（手动授权下、且抖音页面上有码时才摆；它在上，画面在下）----
+    // ---- 二维码：手动授权和扫码授权都展示 ----
     var qh = String(au.qr_hash || '');
     var ph = String(au.phase || '');
     var wantSms = (ph === 'sms');
+    var qrFallback = wantQr && ph === 'manual';
     // 没二维码 / 不是我的浏览器 / 这张图刚才没取下来，都不摆这个块（宁可没有，也不留一张破图）
-    var showQr = wantManual && (ph !== 'sms') && lv.mine !== false && !!qh && qh !== qrFailedHash;
+    var showQr = (wantManual || wantQr) && ph === 'qr' && lv.mine !== false && !!qh && qh !== qrFailedHash;
     $('qrarea').hidden = !showQr;
     if(qh && qh !== lastQrHash){
       lastQrHash = qh;
@@ -8993,6 +8777,12 @@ function refresh(){
       lastQrHash = '';
       $('qrimg').removeAttribute('src');
     }
+    if($('manualscreentip')){
+      $('manualscreentip').hidden = !(wantManual || qrFallback);
+      var manualTipTitle = $('manualscreentip').querySelector('strong');
+      if(manualTipTitle){ manualTipTitle.textContent = qrFallback ? '二维码没识别到，可以点下面画面继续' : '下方画面可以直接点击'; }
+    }
+    if(qrFallback && !shotManual){ setShot(true); }
     lastWantSms = wantSms;
     // 这台浏览器正在给谁授权：和上面选中的账号不是同一个时，说清楚并给个一键切换
     var qo = $('qrowner'), qot = $('qrownertext'), sw = $('bswitchwho');
@@ -9080,11 +8870,11 @@ function refresh(){
       : '';
     if(lv.has_image || au.has_image){
       // 浏览器一开跑就自动把画面显示出来（用户手动收起的除外）。
-      // 手机号模式下不摊开：不然第 2 步会被画面挤下去。
+      // 扫码模式先突出二维码；二维码无法识别时由 qrFallback 展开可点击画面。
       // 手动授权模式下**一定摊开** —— 那个模式的重点就是这块能点的画面。
       if(!shotAutoDone && !shotManual){
         shotAutoDone = true;
-        setShot(wantManual);
+        setShot(wantManual || qrFallback);
       }
       if(shotOpen){
         $('shotempty').hidden = true;
@@ -11856,7 +11646,7 @@ REGISTER_HTML = """<!doctype html>
 <style>__CSS__</style></head><body><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><div class="box">
 <div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>抖音火花助手 · 控制台</i></div></div>
 <h2>注册一个账号</h2>
-<p class="tip">注册后登录控制台，绑定你自己的抖音号（手机号登录或扫码授权），就能自己设目标好友和发送配置。别人的账号互相看不到。</p>
+<p class="tip">注册后登录控制台，绑定你自己的抖音号并用抖音 App 扫码授权，就能自己设目标好友和发送配置。别人的账号互相看不到。</p>
 <form method="post" action="/register">
 <label for="rg-user">登录名（2-32 位字母、数字或 _ . @ -）</label>
 <input id="rg-user" name="username" maxlength="32" autocomplete="username"
@@ -12708,7 +12498,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(
                     {
                         "ok": False,
-                        "error": "「%s」还没保存过 Cookie：先点「开始授权」用手机号登录" % unique_id,
+                        "error": "「%s」还没保存过 Cookie：先点「开始授权」并用抖音 App 扫码" % unique_id,
                     },
                     404,
                 )
@@ -13244,20 +13034,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._browser_command(path, payload, sess)
         elif path == "/api/auth/phone":
-            payload = self._body()
-            if not self._browser_owner_ok(payload):
-                self._json({"ok": False, "error": "当前授权浏览器不属于你名下的抖音号"}, 403)
-                return
-            sess = self._my_session(payload)
-            if sess is None or not sess.running():
-                self._json({"ok": False, "error": "授权浏览器没在运行：先点「开始授权」"}, 409)
-                return
-            phone = re.sub(r"\D", "", str(payload.get("phone") or ""))
-            if not re.fullmatch(r"1\d{10}", phone):
-                self._json({"ok": False, "error": "请填 11 位手机号"}, 400)
-                return
-            browser.send("phone", unique_id=str(payload.get("unique_id") or ""), scopes=self._scopes(), phone=phone)
-            self._reply(True, "手机号已提交，正在填进抖音页面…")
+            self._json({"ok": False, "error": "手机号直登已替换为抖音 App 扫码授权，请启动扫码登录"}, 410)
         elif path == "/api/auth/sms":
             payload = self._body()
             if not self._browser_owner_ok(payload):

@@ -2,6 +2,10 @@
 
 `panel.py` and `tasks.py` are the server-side multi-user panel and worker overlay used with the upstream Docker image. The worker normalizer import is aligned with upstream `core.douyin_im.norm`. The overlay expects the upstream runtime modules and the compatible image version specified by `PANEL_IMAGE`.
 
+## Douyin account authorization
+
+Start authorization from the account page, then scan the displayed QR code with the Douyin app and confirm on the phone. If Douyin asks for a secondary SMS verification, enter that code in the panel. Direct phone-number login has been replaced by QR authorization; manual browser interaction and Cookie import remain available as alternatives.
+
 ## Deployment
 
 1. Use a dedicated Linux host and configure a reverse proxy with a valid TLS certificate.
