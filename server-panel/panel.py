@@ -6499,7 +6499,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>DouYinSparkFlow 控制台</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#0b0a0b">
+<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/apple-touch-icon.png"><meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="续火花"><meta name="apple-mobile-web-app-status-bar-style" content="default">
 <script>(function(){var t="dark";try{var saved=localStorage.getItem("dsh-theme");if(saved==="dark"||saved==="light")t=saved;}catch(e){}document.documentElement.setAttribute("data-theme",t);})();</script>
 <style>
@@ -7092,21 +7092,96 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 @media(max-width:720px){html[data-theme] .overview-layout{grid-template-columns:1fr}}
 @media(max-width:560px){html[data-theme] main.main{padding-right:12px;padding-left:12px}html[data-theme] .top{margin-right:-12px;margin-left:-12px;padding-right:12px;padding-left:12px;gap:7px}html[data-theme] .overview-heading h2{font-size:21px}html[data-theme] .overview-stats{padding:7px 0}html[data-theme] .overview-stat{padding:7px 12px}html[data-theme] .overview-stat:nth-child(2){border-right:0}html[data-theme] .overview-stat:nth-child(n+3){border-top:1px solid var(--line)}html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{padding:15px 14px}html[data-theme] .today-status{align-items:flex-start;padding:14px}html[data-theme] .opensource-promo{align-items:flex-start}html[data-theme] .opensource-promo a{margin-left:44px}}
 
+/* 2026-10 clean white console: restrained type, neutral navigation and clearly separated pages. */
+html[data-theme]{color-scheme:light;--brand:#171717;--brand-dark:#333;--brand-soft:#f5f5f5;--brand-line:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--line2:#f7f7f7;--bg:#fff;--card:#fff;--side:#fff;--side2:#f4f4f4;--sideink:#404040;--ok:#167344;--ok-bg:#eef7f1;--ok-line:#c7e6d1;--warn:#805700;--warn-bg:#fbf5e8;--warn-line:#ead6a8;--bad:#b4232f;--bad-bg:#fff1f1;--bad-line:#f0c4c7;--neu:#525252;--neu-bg:#f4f4f4;--neu-line:#e5e5e5}
+html[data-theme] body{background:#fff;color:#171717;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
+html[data-theme] .app{grid-template-columns:238px minmax(0,1fr);min-height:100vh;background:#fff}
+html[data-theme] .side{gap:18px;padding:22px 15px;background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}
+html[data-theme] .brand{gap:10px;padding:3px 8px 17px;border-bottom:1px solid #ededed}
+html[data-theme] .brand .logo{width:30px;height:30px;border-radius:9px;box-shadow:none;background-color:#171717}
+html[data-theme] .brand b{color:#171717;font-size:14px}
+html[data-theme] .brand i{color:#737373}
+html[data-theme] nav{gap:4px}
+html[data-theme] .nav{min-height:42px;padding:9px 11px;border:0;border-radius:8px;color:#525252;font-size:13px;font-weight:500}
+html[data-theme] .nav:hover:not(:disabled){background:#f7f7f7;color:#171717}
+html[data-theme] .nav.on{background:#f1f1f1;color:#171717;box-shadow:none;font-weight:700}
+html[data-theme] .nav.on .ni{background:#171717}
+html[data-theme] .side-foot{gap:8px;padding:14px 8px 0;border-top:1px solid #ededed}
+html[data-theme] .side-foot .who{color:#737373;font-weight:500}
+html[data-theme] .side-foot a{color:#525252;padding:5px 0;text-decoration:none}
+html[data-theme] .side-foot a:hover{color:#111;text-decoration:underline}
+html[data-theme] main.main{width:100%;max-width:1480px;margin:0 auto;padding:26px clamp(20px,4vw,56px) 56px}
+html[data-theme] .top{position:sticky;top:0;z-index:120;min-height:56px;margin:-26px calc(-1 * clamp(20px,4vw,56px)) 26px;padding:10px clamp(20px,4vw,56px);background:#fff;border-bottom:1px solid #ededed}
+html[data-theme] .top h1{font-size:21px;letter-spacing:-.45px}
+html[data-theme] .panel{margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{margin:0 0 15px;padding:20px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:none}
+html[data-theme] .panel>section h2,html[data-theme] .panel .col>section h2,html[data-theme] .overview-layout>section h2{font-size:15px;letter-spacing:-.15px}
+html[data-theme] .step{display:none}
+html[data-theme] #p-accounts .account-stack>section{margin:0 0 15px;padding:20px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:none}
+html[data-theme] .overview-heading{margin:0 0 17px}
+html[data-theme] .overview-heading h2{font-size:23px;letter-spacing:-.6px}
+html[data-theme] .overview-heading p{color:#737373}
+html[data-theme] .today-status{margin-bottom:14px;padding:17px 19px;border:1px solid #e5e5e5;border-left:3px solid #171717;border-radius:11px;background:#fff;box-shadow:none}
+html[data-theme] .today-mark{background:#171717;color:#fff}
+html[data-theme] .today-copy b{color:#171717}
+html[data-theme] .today-state{color:#262626}
+html[data-theme] .overview-stats{border:1px solid #e5e5e5;border-radius:11px;background:#fff}
+html[data-theme] .overview-stat{background:transparent}
+html[data-theme] .overview-stat b{color:#171717}
+html[data-theme] #todaySuccessCount{color:#167344}
+html[data-theme] .overview-layout{grid-template-columns:minmax(0,1.55fr) minmax(260px,.8fr);gap:15px}
+html[data-theme] .overview-layout>section{margin:0;padding:19px 20px}
+html[data-theme] .overview-layout>section:last-child{background:#fff}
+html[data-theme] .overview-run{border-top-color:#ededed}
+html[data-theme] .overview-run-main b{color:#171717}
+html[data-theme] .overview-run-main span,html[data-theme] .overview-shortcut span{color:#737373}
+html[data-theme] button{min-height:39px;border-radius:8px;background:#171717;color:#fff;font-weight:600;box-shadow:none}
+html[data-theme] button:hover:not(:disabled){background:#333}
+html[data-theme] button.sm{min-height:33px}
+html[data-theme] button.ghost,html[data-theme] button.sec{border:1px solid #dedede;background:#fff;color:#262626}
+html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){border-color:#bdbdbd;background:#f7f7f7;color:#111}
+html[data-theme] button.authtab{border:1px solid transparent;background:transparent;color:#404040;font-weight:500}
+html[data-theme] button.authtab.on{border-color:#171717;background:#171717;color:#fff;font-weight:700}
+html[data-theme] .authtabs{border-color:#e5e5e5;background:#f7f7f7}
+html[data-theme] .auth-recommend,html[data-theme] .manual-screen-tip{border-color:#e5e5e5;border-radius:10px;background:#fafafa}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{border-color:#dedede;border-radius:8px;background:#fff;color:#171717}
+html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline:3px solid #e8e8e8;border-color:#999}
+html[data-theme] .badge{border-radius:7px}
+html[data-theme] .facts>div{background:#fafafa;border:1px solid #f0f0f0}
+html[data-theme] #guide,html[data-theme] #themebtn,html[data-theme] #hbstart,html[data-theme] .head-mid,html[data-theme] #accountMenu,html[data-theme] #adminlink,html[data-theme] #mobileapp,html[data-theme] #accountswitch{display:none!important}
+html[data-theme] details.adv,html[data-theme] .auth-advanced{display:none!important}
+html[data-theme] #statusbox .facts>div:not(:last-child),html[data-theme] #checkbar,html[data-theme] #checktime,html[data-theme] #checkresult{display:none!important}
+html[data-theme] #acctabs,html[data-theme] #task-acctabs{display:flex;flex-wrap:wrap;gap:8px}
+html[data-theme] #acctabs button,html[data-theme] #task-acctabs button{max-width:100%;border:1px solid #e5e5e5;border-radius:8px;background:#fff;color:#262626}
+html[data-theme] #acctabs button.on,html[data-theme] #task-acctabs button.on{border-color:#171717;background:#f4f4f4;color:#171717}
+html[data-theme] #acctabs button.on .dot,html[data-theme] #task-acctabs button.on .dot{background:#171717}
+html[data-theme] #task-account-card{padding:15px 18px}
+html[data-theme] .task-intro{margin:0 0 15px;padding:0 2px}
+html[data-theme] .task-intro h2{margin:0;font-size:23px}
+html[data-theme] .task-intro p{margin:5px 0 0;color:#737373;font-size:13px}
+html[data-theme] #cfgbox textarea{min-height:90px}
+html[data-theme] #runbox .row{margin-top:0}
+html[data-theme] #runbox button{min-width:150px}
+html[data-theme] .opensource-promo{display:none!important}
+html[data-theme] a{color:#262626}
+html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
+@media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;display:flex;flex-direction:column;align-items:stretch;gap:0;height:auto;min-height:0;width:100%;padding:4px 8px calc(6px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid #e8e8e8;box-shadow:0 -5px 18px rgba(0,0,0,.04)}html[data-theme] .brand{display:none}html[data-theme] nav{height:53px;gap:3px;overflow-x:auto;flex-wrap:nowrap}html[data-theme] .nav{flex:1 0 64px;min-width:64px;min-height:49px;padding:4px 3px;display:flex;flex-direction:column;justify-content:center;gap:3px;text-align:center;font-size:10.5px;white-space:nowrap}html[data-theme] .side-foot{display:flex;justify-content:space-between;align-items:center;height:28px;gap:10px;margin:0;border:0;padding:0 9px}html[data-theme] .side-foot .who{display:none}html[data-theme] main.main{padding:12px 18px calc(114px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 18px;padding:9px 18px}html[data-theme] .overview-layout{grid-template-columns:1fr}}
+@media(max-width:560px){html[data-theme] main.main{padding-right:13px;padding-left:13px}html[data-theme] .top{margin-right:-13px;margin-left:-13px;padding-right:13px;padding-left:13px}html[data-theme] .overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}html[data-theme] .overview-stat:nth-child(2){border-right:0}html[data-theme] .overview-stat:nth-child(n+3){border-top:1px solid var(--line)}html[data-theme] .panel>section,html[data-theme] .overview-layout>section{padding:15px 14px}html[data-theme] #task-account-card{padding:13px}}
+
 </style></head><body>
 <div class="app">
 <aside class="side">
 <div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>续火花控制台</i></div></div>
 <nav id="nav" aria-label="主菜单">
 <button class="nav on" type="button" data-go="overview"><i class="ni ni-overview"></i>概览</button>
-<button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户</button>
+<button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户配置</button>
+<button class="nav" type="button" data-go="tasks"><i class="ni ni-records"></i>任务配置</button>
 <button class="nav" type="button" data-go="records"><i class="ni ni-records"></i>发送记录</button>
-<button class="nav" type="button" data-go="me"><i class="ni ni-me"></i>我的账号</button>
 </nav>
 <div class="side-foot">
 <span class="who" id="whoami">—</span>
-<a id="adminlink" href="/admin" hidden>管理控制台</a>
-<a href="/download">下载手机 App</a>
-<a href="/logout">退出登录</a>
+<a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">GitHub 仓库 ↗</a>
+<a href="/logout">切换账号</a>
 </div>
 </aside>
 <main class="main">
@@ -7121,17 +7196,11 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
   <div class="account-panel">
     <div class="account-id"><b id="accountWho">—</b><span id="accountRole">普通用户</span></div>
     <a id="accountAdminLink" href="/admin">管理员登录</a>
-    <a href="/download">下载手机 App</a>
     <a class="account-exit" href="/logout">切换账号 / 退出登录</a>
   </div>
 </details>
 </div>
 <div id="flash" role="status" aria-live="polite"></div>
-<section class="opensource-promo" aria-label="开源项目">
-  <span class="promo-mark" aria-hidden="true">GH</span>
-  <div class="promo-copy"><h2>项目已开源</h2><p>查看源代码，下载 Android App 和 Windows Cookie 工具。</p></div>
-  <a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">查看项目 <span aria-hidden="true">↗</span></a>
-</section>
 <div id="notice" hidden>
 <div class="n-head"><b>公告</b><span class="sp"></span><button id="notice_x" class="ghost sm" type="button" aria-label="关闭公告">知道了</button></div>
 <div class="n-body" id="notice_text" hidden></div>
@@ -7332,6 +7401,12 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 </div><!-- /cols -->
 </section><!-- /p-accounts -->
 
+<!-- ===== 任务配置 ===== -->
+<section class="panel" id="p-tasks">
+<div class="task-intro"><div><h2>任务配置</h2><p>选择要配置的抖音账号，设置目标好友和每日发送时间。</p></div></div>
+<section id="task-account-card"><h2>当前抖音账号</h2><div id="task-acctabs"></div></section>
+</section><!-- /p-tasks -->
+
 <!-- ===== 发送记录 ===== -->
 <section class="panel" id="p-records">
 <section id="sendsbox"><h2>发送记录 <span class="muted" id="sendssum"></span></h2>
@@ -7369,12 +7444,6 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 <p class="muted" id="sub_result" role="status"></p>
 </section>
 
-<section id="mobileapp">
-<h2>手机应用</h2>
-<p class="muted">Android 可下载并安装应用；iPhone / iPad 可按说明把手机网页添加到主屏幕。</p>
-<a href="/download">下载手机 App 与安装说明 →</a>
-</section>
-
 <section id="email-notification-settings">
 <h2>邮件通知</h2>
 <p class="muted">SMTP 由站点管理员配置。填写自己的收件邮箱后，可先发送测试邮件；开启后，只会收到自己名下账号的发送结果。</p>
@@ -7389,12 +7458,6 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 <span class="muted" id="email_state" role="status" aria-live="polite">读取邮件通知设置…</span>
 </div>
 <p class="muted">邮件服务器未配置时，地址仍可保存，但不会发送通知。测试邮件发送成功只代表 SMTP 已接收，请同时检查垃圾邮件文件夹。</p>
-</section>
-
-<section id="accountswitch">
-<h2>切换面板账号</h2>
-<p class="muted">退出后会回到登录页，你可以登录其他账号或注册新账号。</p>
-<button type="button" onclick="if(confirm('确定退出当前账号并返回登录页？')) location.href='/logout'">退出并切换账号</button>
 </section>
 
 <section id="mebox" hidden>
@@ -7478,6 +7541,26 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 </div>
 <script>
 var $ = function(id){ return document.getElementById(id); };
+(function splitAccountAndTaskPages(){
+  var accountsPage = $('p-accounts'), tasksPage = $('p-tasks');
+  if(!accountsPage || !tasksPage){ return; }
+  var oldColumns = accountsPage.querySelector('.cols');
+  if(oldColumns){
+    var accountStack = document.createElement('div');
+    accountStack.className = 'account-stack';
+    accountsPage.insertBefore(accountStack, oldColumns);
+    ['acctbox','authbox','statusbox'].forEach(function(id){
+      var item = $(id); if(item){ accountStack.appendChild(item); }
+    });
+    oldColumns.remove();
+  }
+  ['cfgbox','runbox'].forEach(function(id){
+    var item = $(id); if(item){ tasksPage.appendChild(item); }
+  });
+  ['mobileapp','accountswitch'].forEach(function(id){
+    var item = $(id); if(item){ item.remove(); }
+  });
+})();
 // 每个普通用户最多能绑几个抖音号（由服务端注入，改后端常量这里跟着变）
 var MAX_PER_USER = __MAX_ACCOUNTS__;
 // 「还要等多久」说成人话（授权位被占满时用）
@@ -7645,6 +7728,7 @@ function renderAcctTabs(){
     var head = (nm && nm !== a.unique_id) ? (nm + '（' + a.unique_id + '）') : a.unique_id;
     var label = head + ' · ' + info.t;
     b.type = 'button';
+    b.setAttribute('data-account-uid', a.unique_id);
     if(!ADDING && CUR_ACCT && a.unique_id === CUR_ACCT.unique_id){ b.className = 'on'; }
     // 名字太长就省略号收尾，别把整行撑破；完整内容放在悬停提示和无障碍标签里
     b.innerHTML = '<span class="dot ' + info.c + '"></span><span class="nm">' + esc(label) + '</span>';
@@ -7654,6 +7738,19 @@ function renderAcctTabs(){
     box.appendChild(b);
   });
 }
+function mirrorTaskAccountTabs(){
+  var source = $('acctabs'), target = $('task-acctabs');
+  if(!source || !target){ return; }
+  target.innerHTML = source.innerHTML;
+  Array.prototype.forEach.call(target.querySelectorAll('button'), function(button){
+    var uid = button.getAttribute('data-account-uid');
+    button.onclick = uid ? function(){ selectAccount(uid); } : function(){ showPanel('accounts'); };
+  });
+}
+if(typeof MutationObserver !== 'undefined' && $('acctabs')){
+  new MutationObserver(mirrorTaskAccountTabs).observe($('acctabs'), {childList:true, subtree:true});
+}
+mirrorTaskAccountTabs();
 function fillForm(a){
   a = a || {};
   var f = $('cfg');
@@ -7667,8 +7764,8 @@ function fillForm(a){
   // 这三项跟着抖音号走：这个号自己设过就用它自己的，没设过就显示全局默认值
   var st = a.settings || {};
   f.message_template.value = (st.template !== undefined) ? st.template : (GLOBALCFG.message_template || '');
-  f.delay_min.value = (st.delay_min !== undefined) ? st.delay_min : (GLOBALCFG.delay_min === undefined ? '0' : GLOBALCFG.delay_min);
-  f.delay_max.value = (st.delay_max !== undefined) ? st.delay_max : (GLOBALCFG.delay_max === undefined ? '0' : GLOBALCFG.delay_max);
+  f.delay_min.value = '0';
+  f.delay_max.value = '0';
   f.hitokoto_types.value = (st.hitokoto_types !== undefined) ? st.hitokoto_types : (GLOBALCFG.hitokoto_types || '');
   f.tz.value = GLOBALCFG.tz || 'Asia/Shanghai';
   f.log_level.value = GLOBALCFG.log_level || 'INFO';
@@ -8822,8 +8919,8 @@ function guideSetOpen(open){
   try { window.localStorage.setItem(GUIDE_OPEN_KEY, open ? '1' : '0'); } catch(e){}
 }
 // ---- 左侧导航：切换内容面板 ----
-var PANELS = {overview:'概览', accounts:'抖音账户', records:'发送记录', me:'我的账号'};
-var PANEL_ORDER = ['overview', 'accounts', 'records', 'me'];
+var PANELS = {overview:'概览', accounts:'抖音账户配置', tasks:'任务配置', records:'发送记录', me:'我的账号'};
+var PANEL_ORDER = ['overview', 'accounts', 'tasks', 'records', 'me'];
 function showPanel(go){
   if(PANELS[go] === undefined){ go = 'overview'; }
   PANEL_ORDER.forEach(function(k){
@@ -8843,8 +8940,8 @@ function initNav(){
   });
   var saved = '';
   try { saved = window.localStorage.getItem('panel:go') || ''; } catch(e){}
-  // 兼容旧版保存过的「管理」页状态：主控制台已移除该页，回到概览
-  if(saved === 'admin'){ saved = ''; }
+  // 兼容旧版菜单状态；「我的账号」从概览入口打开，不放在主导航。
+  if(saved === 'admin' || saved === 'me' || ['overview','accounts','tasks','records'].indexOf(saved) < 0){ saved = ''; }
   showPanel(saved || 'overview');
 }
 function guideScrollTo(id){
@@ -10186,6 +10283,28 @@ html[data-theme="dark"]{--brand:#64cdb8;--brand2:#7fddc9;--soft:#183e39;--softli
 @media(max-width:900px){.app{display:block}.side{position:fixed;inset:auto 0 0;height:auto;width:100%;padding:4px 7px calc(5px + env(safe-area-inset-bottom));z-index:150;box-shadow:0 -8px 26px #0c2b2a2e}.brand,.side-foot{display:none}nav{height:55px;display:flex;flex-direction:row;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;gap:3px}nav::-webkit-scrollbar{display:none}.nav{flex:1 0 62px;min-width:62px;min-height:51px;padding:5px 4px;display:flex;flex-direction:column;justify-content:center;gap:3px;font-size:10.5px;line-height:1.1;text-align:center;white-space:nowrap}.nav .ni{width:18px;height:18px}.nav .pill{display:none}.main{padding:12px 14px calc(92px + env(safe-area-inset-bottom))}.top{position:sticky;top:0;margin:-12px -14px 12px;padding:10px 14px;background:#f2f7f5f2;border-bottom:1px solid var(--line)}.grid2{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.tblwrap{max-width:calc(100vw - 56px);overscroll-behavior-x:contain}}
 @media(max-width:560px){.main{padding-left:11px;padding-right:11px}.top{margin-left:-11px;margin-right:-11px;padding:10px 11px}.card{padding:14px}input,textarea,select{font-size:16px}button{min-height:44px}.kpis{gap:8px}.kpi{padding:12px}.kpi b{font-size:23px}.row>button{flex:1 1 auto}.tblwrap{max-width:calc(100vw - 44px)}}
 
+/* Match the clean white visual system used by the account console. */
+html[data-theme]{color-scheme:light;--brand:#171717;--brand2:#333;--soft:#f5f5f5;--softline:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--bg:#fff;--card:#fff;--ok:#167344;--okbg:#eef7f1;--okline:#c7e6d1;--warn:#805700;--warnbg:#fbf5e8;--warnline:#ead6a8;--bad:#b4232f;--badbg:#fff1f1;--badline:#f0c4c7;--side:#fff;--side2:#f4f4f4;--sideink:#404040}
+html[data-theme] body{background:#fff;color:#171717}
+html[data-theme] .side{background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}
+html[data-theme] .brand{border-bottom-color:#ededed}
+html[data-theme] .brand b,html[data-theme] .side-foot .who{color:#171717}
+html[data-theme] .brand i,html[data-theme] .side-foot a{color:#737373}
+html[data-theme] .nav{color:#525252;border-color:transparent}
+html[data-theme] .nav:hover{background:#f7f7f7;color:#171717}
+html[data-theme] .nav.on{background:#f1f1f1;color:#171717;box-shadow:none}
+html[data-theme] .nav.on .ni{background:#171717}
+html[data-theme] .main{max-width:1600px}
+html[data-theme] .top{background:#fff;border-bottom:1px solid #ededed;backdrop-filter:none}
+html[data-theme] .card,html[data-theme] .kpi{border-color:#e5e5e5;border-radius:12px;box-shadow:none}
+html[data-theme] button{background:#171717;border-radius:8px;box-shadow:none}
+html[data-theme] button:hover:not(:disabled){background:#333}
+html[data-theme] button.ghost,html[data-theme] button.sec{background:#fff;color:#262626;border-color:#dedede}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{background:#fff;border-color:#dedede;color:#171717}
+html[data-theme] th{background:#fff;color:#737373}
+html[data-theme] #themebtn{display:none!important}
+@media(max-width:900px){html[data-theme] .side{box-shadow:none;border-top:1px solid #e8e8e8}html[data-theme] .top{background:#fff}}
+
 /* Red and black by default; the theme button switches to white and red. */
 html[data-theme="dark"]{color-scheme:dark;--brand:#f04452;--brand2:#d92e3e;--soft:#311519;--softline:#79333d;--ink:#f5f2f3;--ink2:#ded6d8;--muted:#a49a9d;--line:#393336;--bg:#0b0a0b;--card:#151214;--side:#070607;--side2:#1b1518;--sideink:#d8cfd2;--ok:#5bd59e;--okbg:#12271f;--okline:#2a5841;--warn:#f4c35d;--warnbg:#2b2112;--warnline:#6e5221;--bad:#ff7d85;--badbg:#311519;--badline:#79333d}
 html[data-theme="light"]{color-scheme:light;--brand:#ca2638;--brand2:#a91d2d;--soft:#fff0f2;--softline:#efb5bc;--ink:#241b1d;--ink2:#57474a;--muted:#806f72;--line:#eadcdf;--bg:#fff9f9;--card:#fff;--side:#fff;--side2:#fff0f2;--sideink:#58494c;--ok:#087a50;--okbg:#e7f7ee;--okline:#b3e2c6;--warn:#8a5a00;--warnbg:#fdf5da;--warnline:#eedca2;--bad:#a91d2d;--badbg:#fdebed;--badline:#efb5bc}
@@ -10310,8 +10429,8 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
   <div class="side-foot">
     <span class="who" id="whoami">管理员</span>
     <a href="/">我的控制台</a>
-    <a href="/download">下载手机 App</a>
-    <a href="/logout">退出登录</a>
+    <a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">GitHub 仓库 ↗</a>
+    <a href="/logout">切换账号</a>
   </div>
 </aside>
 
@@ -10327,7 +10446,6 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
       <div class="account-panel">
         <div class="account-id"><b id="accountWho">管理员</b><span id="accountRole">管理员账号</span></div>
         <a href="/">我的控制台</a>
-        <a href="/download">下载手机 App</a>
         <a class="account-exit" href="/logout">切换账号 / 退出登录</a>
       </div>
     </details>
@@ -12197,6 +12315,17 @@ html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(-
 html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
 @media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
 @media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
+html[data-theme]{color-scheme:light;--auth-bg:#fff;--auth-card:#fff;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-red:#171717;--auth-soft:#f5f5f5}
+html[data-theme] body{color:#171717;background:#fff}
+html[data-theme] .box{border-color:#e5e5e5;box-shadow:0 12px 36px rgba(0,0,0,.05)}
+html[data-theme] h2,html[data-theme] label{color:#171717}
+html[data-theme] p.tip,html[data-theme] .foot{color:#737373}
+html[data-theme] input{background:#fff;color:#171717;border-color:#dedede}
+html[data-theme] input:focus{outline-color:#e8e8e8;border-color:#999}
+html[data-theme] form>button:not(.eye),html[data-theme] button:not(.eye){background:#171717;box-shadow:none}
+html[data-theme] .foot a{color:#333}
+html[data-theme] .auth-theme{display:none!important}
+@media(max-width:480px){html[data-theme] .box{margin:20px auto}}
 """
 
 ADMIN_LOGIN_CSS = """
@@ -12306,6 +12435,17 @@ html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(-
 html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
 @media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
 @media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
+html[data-theme]{color-scheme:light;--auth-bg:#fff;--auth-card:#fff;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-red:#171717;--auth-soft:#f5f5f5}
+html[data-theme] body{color:#171717;background:#fff}
+html[data-theme] .box{border-color:#e5e5e5;box-shadow:0 12px 36px rgba(0,0,0,.05)}
+html[data-theme] h2,html[data-theme] label{color:#171717}
+html[data-theme] p.tip,html[data-theme] .foot{color:#737373}
+html[data-theme] input{background:#fff;color:#171717;border-color:#dedede}
+html[data-theme] input:focus{outline-color:#e8e8e8;border-color:#999}
+html[data-theme] form>button:not(.eye),html[data-theme] button:not(.eye){background:#171717;box-shadow:none}
+html[data-theme] .foot a{color:#333}
+html[data-theme] .auth-theme{display:none!important}
+@media(max-width:480px){html[data-theme] .box{margin:20px auto}}
 """
 
 ADMIN_LOGIN_HTML = """<!doctype html>
@@ -12369,7 +12509,7 @@ LOGIN_HTML = """<!doctype html>
 <label class="keep" for="lg-keep"><input type="checkbox" id="lg-keep"> 记住账号（下次自动填好）</label>
 <button id="lg-go">登录</button></form>
 __ERROR__
-<p class="foot">__REGOFFER__<br><a href="/download">下载手机 App</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a><br><span style="color:#a3aab8">忘了密码？找管理员重置 · </span><a href="/login?next=/admin" style="font-weight:400;color:#a3aab8">管理员入口</a></p>
+<p class="foot">__REGOFFER__<br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a><br><span style="color:#a3aab8">忘了密码？找管理员重置 · </span><a href="/login?next=/admin" style="font-weight:400;color:#a3aab8">管理员入口</a></p>
 </div>
 <script>
 (function(){
@@ -12422,7 +12562,7 @@ REGISTER_HTML = """<!doctype html>
 <p class="hint bad" id="rg-hint" role="alert" hidden></p>
 <button id="rg-go">注册并登录</button></form>
 __ERROR__
-<p class="foot">已经有账号了？<a href="/login">去登录</a> · <a href="/download">下载手机 App</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
+<p class="foot">已经有账号了？<a href="/login">去登录</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
 </div>
 <script>
 (function(){
