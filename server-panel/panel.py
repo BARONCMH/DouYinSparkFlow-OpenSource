@@ -7552,11 +7552,14 @@ var $ = function(id){ return document.getElementById(id); };
     ['acctbox','authbox','statusbox'].forEach(function(id){
       var item = $(id); if(item){ accountStack.appendChild(item); }
     });
-    oldColumns.remove();
   }
+  // Move the task form before deleting its old two-column wrapper. Removing
+  // the wrapper first also removes cfgbox/runbox from the document, which
+  // caused the next event binding to throw and left every navigation button inert.
   ['cfgbox','runbox'].forEach(function(id){
     var item = $(id); if(item){ tasksPage.appendChild(item); }
   });
+  if(oldColumns){ oldColumns.remove(); }
   ['mobileapp','accountswitch'].forEach(function(id){
     var item = $(id); if(item){ item.remove(); }
   });
@@ -8184,7 +8187,8 @@ function scheduleCheckLater(){
 }
 ['f_times','f_targets','f_dmax'].forEach(function(id){ var el = $(id); if(el){ el.addEventListener('input', function(){ if(id === 'f_times'){ SCHEDULE_AUTOFILL = false; } scheduleCheckLater(); }); } });
 
-$('cfg').addEventListener('submit', function(e){
+var cfgForm = $('cfg');
+if(cfgForm){ cfgForm.addEventListener('submit', function(e){
   e.preventDefault();
   var f = e.target, data = {};
   var sb = $('bsubmit');
@@ -8214,7 +8218,7 @@ $('cfg').addEventListener('submit', function(e){
     } else { flash(r.error || '保存失败', false); }
     done();
   }).catch(function(){ flash('保存失败：网络断了或后端没响应，稍后再试', false); done(); });
-});
+}); }
 $('baddacct').onclick = function(){
   var f = $('cfg');
   var draft = (f.unique_id.value || '').trim();
