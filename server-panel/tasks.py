@@ -272,10 +272,10 @@ SEARCH_INPUT_SELECTOR = "input[placeholder*='搜索']"
 SEARCH_RESULT_BOX_SELECTOR = "[class*='SearchPanelitembox']"
 SEARCH_RESULT_TITLE_SELECTOR = "[class*='SearchPanelitemtitle']"
 SEARCH_RESULT_BUTTON_SELECTOR = "[class*='SearchPanelitemchat_btn']"
-CHAT_HEADER_TITLE_SELECTOR = ".RightPanelHeadertitle"
+CHAT_HEADER_TITLE_SELECTOR = ".RightPanelHeadertitle, .RightPanelHeaderTitle, [data-e2e='chat-title']"
 SEARCH_RESULT_TIMEOUT = 15  # 等搜索结果出来
 SEARCH_OPEN_TIMEOUT = 45  # 点完"发消息"之后，等右边聊天窗口确认切过去
-CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
+CONVERSATION_ITEM_SELECTOR = '[data-e2e="conversation-item"], .conversationConversationItemwrapper'
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
 # 抖音输入区有稳定 data-e2e / contenteditable 挂点；保留容器类名作旧版兜底。
@@ -453,19 +453,92 @@ def _find_search_hit(page, name):
     return None
 
 
+def _conversation_row_is_active(page, name):
+    """标题栏还没渲染时，用列表选中态辅助确认当前会话。"""
+    try:
+        rows = page.locator(CONVERSATION_ITEM_SELECTOR)
+        for index in range(rows.count()):
+            row = rows.nth(index)
+            try:
+                title = row.locator(CONVERSATION_TITLE_SELECTOR).inner_text()
+            except Exception:
+                continue
+            if not _name_matches(title, name):
+                continue
+            cls = row.get_attribute("class") or ""
+            if "curConversation" in cls or row.get_attribute("aria-selected") == "true":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _chat_is_open_for(page, name):
-    """右边聊天窗口的标题是不是这个名字。
+    """确认右侧聊天标题或列表选中态对应目标好友。
 
     这一步是安全闸：如果点完搜索结果其实没切过去（聊天客户端还没连上时就会这样），
     右边标题还是上一个人的名字，这里会判 False，宁可这个好友不发，也不能把消息发错人。
     """
     try:
-        title = page.evaluate(
-            "() => { const e = document.querySelector('.RightPanelHeadertitle'); return e ? (e.innerText || '') : ''; }"
-        )
+        titles = page.locator(CHAT_HEADER_TITLE_SELECTOR).all_inner_texts()
     except Exception:
-        return False
-    return _name_matches(title, name)
+        titles = []
+    visible_titles = [str(title or "").strip() for title in titles if str(title or "").strip()]
+    if visible_titles:
+        return any(_name_matches(title, name) for title in visible_titles)
+    return _conversation_row_is_active(page, name)
+
+
+def _activate_chat_by_row(page, row, username, name, timeout=10):
+    """用抖音当前聊天界面能处理的事件序列打开已匹配的会话。
+
+    在线上页面，Playwright locator/mouse/CDP 点击可能只留下列表项、没有切换右侧聊天。
+    对准确的 data-e2e 会话项派发鼠标事件后才会触发聊天详情请求。确认标题或选中态后，
+    调用方才允许输入消息。
+    """
+    dispatched = False
+    try:
+        row.evaluate(
+            """el => {
+              for (const type of ['mousedown', 'mouseup', 'click']) {
+                el.dispatchEvent(new MouseEvent(type, {
+                  bubbles: true, cancelable: true, view: window
+                }));
+              }
+            }"""
+        )
+        dispatched = True
+    except Exception as error:
+        logger.warning(
+            f"账号 {username} 触发好友 {name} 的会话点击失败：{type(error).__name__}"
+        )
+
+    if dispatched:
+        deadline = time.monotonic() + max(1, timeout)
+        while time.monotonic() < deadline:
+            if _chat_is_open_for(page, name):
+                logger.debug(f"账号 {username} 已确认打开好友 {name} 的聊天窗口")
+                return True
+            try:
+                page.wait_for_timeout(200)
+            except Exception:
+                time.sleep(0.2)
+
+    # 兼容兜底：后续页面若不再响应合成事件，再试普通点击。
+    try:
+        row.click(timeout=5000)
+    except Exception:
+        pass
+    deadline = time.monotonic() + max(1, timeout)
+    while time.monotonic() < deadline:
+        if _chat_is_open_for(page, name):
+            logger.debug(f"账号 {username} 通过兼容点击确认打开好友 {name} 的聊天窗口")
+            return True
+        try:
+            page.wait_for_timeout(200)
+        except Exception:
+            time.sleep(0.2)
+    return False
 
 
 def open_chat_by_search(page, username, name):
@@ -1104,9 +1177,10 @@ def scroll_and_select_user(page, username, targets, skip=None):
                     continue
 
                 if targetSymbol:
-                    element.click()
-                    
-                    yield targetSymbol
+                    chat_opened = _activate_chat_by_row(
+                        page, element, username, targetSymbol
+                    )
+                    yield (targetSymbol, chat_opened)
 
                     # [修改] 标记已找到，如果全找到了直接退出
                     if targetSymbol in remaining_targets:
@@ -1283,7 +1357,7 @@ def scroll_and_select_user(page, username, targets, skip=None):
             if name in skip_live:
                 continue
             if open_chat_by_search(page, username, name):
-                yield name
+                yield (name, _chat_is_open_for(page, name))
         close_search_panel(page)
 
 
@@ -1406,7 +1480,12 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
         # 滚动并选择用户
         handled = 0
         seen_targets = set()  # 记下真正在列表里匹配上的好友，循环完就知道谁没找到
-        for target in scroll_and_select_user(page, account, targets, skip=seen_targets):
+        for selection in scroll_and_select_user(page, account, targets, skip=seen_targets):
+            if isinstance(selection, (tuple, list)) and len(selection) == 2:
+                target, chat_opened = selection
+            else:
+                # 兼容仍只返回好友名称的旧选择器。
+                target, chat_opened = selection, True
             seen_targets.add(target)
             if abort_requested():
                 logger.warning(f"账号 {account} 收到强制停止指令，放弃给剩余好友发送")
@@ -1450,6 +1529,15 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 "message": "",
             }
             logger.debug(f"账号 {account} 已选中好友 {target} 发送消息")
+
+            if not chat_opened:
+                item["reason"] = "chat_not_open"
+                item["detail"] = "好友已在列表中找到，但抖音没有确认切换到该聊天窗口；消息未发送"
+                item["shot"] = capture_shot(shot_session, account, target)
+                logger.error(f"账号 {account} 给 {target} 发送失败：{item['detail']}")
+                entry["friends"].append(item)
+                record_run(entry, cleanup_shots=False)
+                continue
 
             # 第一步：点开好友后，聊天输入框有没有出来
             try:
