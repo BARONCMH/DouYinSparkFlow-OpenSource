@@ -1590,9 +1590,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
             try:
                 logger.debug(f"账号 {account} 准备发送消息给好友 {target}")
                 watcher.reset()
-                send_button = page.locator(CHAT_SEND_BUTTON_SELECTOR).filter(
-                    visible=True
-                ).last
+                # CloakBrowser's humanized locator resolver accepts a plain CSS
+                # selector and a trailing .last, but not chained filter().
+                send_button = page.locator(CHAT_SEND_BUTTON_SELECTOR).last
                 if send_button.count() > 0:
                     send_button.click(timeout=5000)
                 else:
