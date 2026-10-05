@@ -23,6 +23,7 @@ from core.douyin_im import (
     decode_user_info,
     envelope,
     fake_sec_uid,
+    match_contact_name,
     peer_uid_of,
     scan,
     split_message_lines,
@@ -211,6 +212,21 @@ class MatchTests(unittest.TestCase):
         k, how = self.s._match(dom, {_norm("甲同学"): "甲同学"})
         self.assertEqual(how, "title")
         self.assertIsNotNone(k)
+
+    def test_display_name_matches_even_when_profile_aliases_differ(self):
+        self.assertEqual(
+            match_contact_name("Echo.", ["Echo."], ["short-id", "uid", "other nickname"]),
+            "Echo.",
+        )
+
+    def test_configured_id_can_still_match_profile_alias(self):
+        self.assertEqual(
+            match_contact_name("显示名", ["target_id"], ["short-id", "target_id"]),
+            "target_id",
+        )
+
+    def test_unrelated_name_does_not_match_by_substring(self):
+        self.assertIsNone(match_contact_name("Echo.朋友", ["Echo."]))
 
 
 class JoinTests(unittest.TestCase):

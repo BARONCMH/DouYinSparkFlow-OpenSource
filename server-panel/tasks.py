@@ -10,7 +10,7 @@ import traceback
 from uuid import uuid4
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
-from core.douyin_im import norm
+from core.douyin_im import match_contact_name, norm
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 from playwright.sync_api import Response
@@ -278,7 +278,14 @@ SEARCH_OPEN_TIMEOUT = 45  # 点完"发消息"之后，等右边聊天窗口确�
 CONVERSATION_ITEM_SELECTOR = ".conversationConversationItemwrapper"
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
-CHAT_EDITOR_SELECTOR = ".messageEditorimChatEditorContainer"
+# 抖音输入区有稳定 data-e2e / contenteditable 挂点；保留容器类名作旧版兜底。
+CHAT_EDITOR_SELECTOR = (
+    '[data-e2e="msg-input"] .public-DraftEditor-content, '
+    '.DraftEditor-root [contenteditable="true"], '
+    '[data-e2e="msg-input"] [contenteditable="true"], '
+    '.messageEditorimChatEditorContainer [contenteditable="true"], '
+    ".messageEditorimChatEditorContainer"
+)
 
 # [修复] 判断"好友列表到底加载出来没有"用的阈值
 LIST_READY_MIN_ITEMS = 5  # 会话条目到这么多，就认为列表已经画出来了
@@ -338,21 +345,12 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
                 raise
 
 def checkTargetName(targetName, targets):
-    """检查targetName是否为目标
-    """
-    
-    targetSymbol = None
-    
-    targetName = norm(targetName)
-    
-    if targetName in userIDDict:
-        matched = next((v for v in userIDDict[targetName] if v and v in targets), None)
-        if matched is not None:
-            targetSymbol = matched
-    else:
-        if targetName in targets:
-            targetSymbol = targetName
-    return targetSymbol
+    displayed = norm(targetName)
+    return match_contact_name(
+        displayed,
+        targets,
+        aliases=userIDDict.get(displayed, []),
+    )
 
 
 def conversation_count(page) -> int:
@@ -1458,7 +1456,7 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 page.wait_for_selector(CHAT_EDITOR_SELECTOR, timeout=45000)
             except Exception:
                 item["reason"] = "no_editor"
-                item["detail"] = "点开这个好友后 45 秒内没出现聊天输入框，消息没发出去"
+                item["detail"] = "好友已在列表中找到并点击，但聊天输入框 45 秒内仍未加载出来，消息没发出去"
                 item["shot"] = capture_shot(shot_session, account, target)
                 logger.error(f"账号 {account} 给 {target} 发送失败：{item['detail']}")
                 entry["friends"].append(item)

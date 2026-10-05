@@ -712,6 +712,29 @@ def _norm(s):
 norm = _norm
 
 
+def match_contact_name(displayed, targets, aliases=()):
+    """把会话显示名匹配到配置目标，先看显示名本身，再看接口返回的身份别名。
+
+    资料接口偶尔给出的昵称/备注与会话标题不同。即使有身份映射，也必须保留
+    对可见标题的精确匹配，否则目标名称刚好是映射键时会被映射分支漏掉。
+    """
+    shown = _norm(displayed)
+    if not shown:
+        return None
+
+    normalized_targets = [(_norm(target), target) for target in targets or []]
+    for normalized, target in normalized_targets:
+        if normalized and normalized == shown:
+            return target
+
+    by_name = {normalized: target for normalized, target in normalized_targets if normalized}
+    for alias in aliases or ():
+        matched = by_name.get(_norm(alias))
+        if matched is not None:
+            return matched
+    return None
+
+
 def split_message_lines(text):
     """把消息正文断成「要逐行键入」的段列表。两种换行都认。
 
