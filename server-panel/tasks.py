@@ -287,6 +287,7 @@ CHAT_EDITOR_SELECTOR = (
     '[data-e2e="msg-input"] [contenteditable="true"], '
     '.DraftEditor-root [contenteditable="true"]'
 )
+CHAT_SEND_BUTTON_SELECTOR = '[class~="e2e-send-msg-btn"]'
 
 # [修复] 判断"好友列表到底加载出来没有"用的阈值
 LIST_READY_MIN_ITEMS = 5  # 会话条目到这么多，就认为列表已经画出来了
@@ -1589,7 +1590,14 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
             try:
                 logger.debug(f"账号 {account} 准备发送消息给好友 {target}")
                 watcher.reset()
-                chat_input.press("Enter")
+                send_button = page.locator(CHAT_SEND_BUTTON_SELECTOR).filter(
+                    visible=True
+                ).last
+                if send_button.count() > 0:
+                    send_button.click(timeout=5000)
+                else:
+                    # 旧版页面可能没有稳定的发送按钮挂点，再回退到 Enter。
+                    chat_input.press("Enter")
                 receipt = watcher.collect(page, message, wait_ms=2500)
 
                 leftover = None
