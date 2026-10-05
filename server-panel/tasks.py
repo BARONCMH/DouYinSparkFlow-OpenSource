@@ -1594,7 +1594,18 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 # selector and a trailing .last, but not chained filter().
                 send_button = page.locator(CHAT_SEND_BUTTON_SELECTOR).last
                 if send_button.count() > 0:
-                    send_button.click(timeout=5000)
+                    # The current IM view ignores Playwright/CDP click on this
+                    # SVG, just as it does for conversation rows. Dispatch the
+                    # same bubbling mouse sequence that triggers its React handler.
+                    send_button.evaluate(
+                        """el => {
+                          for (const type of ['mousedown', 'mouseup', 'click']) {
+                            el.dispatchEvent(new MouseEvent(type, {
+                              bubbles: true, cancelable: true, view: window
+                            }));
+                          }
+                        }"""
+                    )
                 else:
                     # 旧版页面可能没有稳定的发送按钮挂点，再回退到 Enter。
                     chat_input.press("Enter")
