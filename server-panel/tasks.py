@@ -475,28 +475,36 @@ def _conversation_row_is_active(page, name):
     return False
 
 
-def _chat_is_open_for(page, name):
-    """确认右侧聊天标题或列表选中态对应目标好友。
+def _chat_is_open_for(page, name, display_name=None):
+    """确认右侧标题或列表选中态对应目标好友。
 
     这一步是安全闸：如果点完搜索结果其实没切过去（聊天客户端还没连上时就会这样），
     右边标题还是上一个人的名字，这里会判 False，宁可这个好友不发，也不能把消息发错人。
+    配置目标可能是抖音号/UID，而会话标题显示昵称；display_name 是已通过身份别名匹配的
+    那一行的可见名称，不能再拿原始 UID 去和昵称硬比较。
     """
+    expected_names = [str(value or "").strip() for value in (name, display_name)]
+    expected_names = [value for value in expected_names if value]
     try:
         titles = page.locator(CHAT_HEADER_TITLE_SELECTOR).all_inner_texts()
     except Exception:
         titles = []
     visible_titles = [str(title or "").strip() for title in titles if str(title or "").strip()]
     if visible_titles:
-        return any(_name_matches(title, name) for title in visible_titles)
-    return _conversation_row_is_active(page, name)
+        return any(
+            _name_matches(title, expected)
+            for title in visible_titles
+            for expected in expected_names
+        )
+    return any(_conversation_row_is_active(page, expected) for expected in expected_names)
 
 
-def _activate_chat_by_row(page, row, username, name, timeout=10):
+def _activate_chat_by_row(page, row, username, name, display_name=None, timeout=10):
     """用抖音当前聊天界面能处理的事件序列打开已匹配的会话。
 
     在线上页面，Playwright locator/mouse/CDP 点击可能只留下列表项、没有切换右侧聊天。
     对准确的 data-e2e 会话项派发鼠标事件后才会触发聊天详情请求。确认标题或选中态后，
-    调用方才允许输入消息。
+    调用方才允许输入消息。display_name 是 checkTargetName 已通过身份别名确认的会话行标题。
     """
     dispatched = False
     try:
@@ -518,7 +526,7 @@ def _activate_chat_by_row(page, row, username, name, timeout=10):
     if dispatched:
         deadline = time.monotonic() + max(1, timeout)
         while time.monotonic() < deadline:
-            if _chat_is_open_for(page, name):
+            if _chat_is_open_for(page, name, display_name):
                 logger.debug(f"账号 {username} 已确认打开好友 {name} 的聊天窗口")
                 return True
             try:
@@ -533,7 +541,7 @@ def _activate_chat_by_row(page, row, username, name, timeout=10):
         pass
     deadline = time.monotonic() + max(1, timeout)
     while time.monotonic() < deadline:
-        if _chat_is_open_for(page, name):
+        if _chat_is_open_for(page, name, display_name):
             logger.debug(f"账号 {username} 通过兼容点击确认打开好友 {name} 的聊天窗口")
             return True
         try:
@@ -577,6 +585,11 @@ def open_chat_by_search(page, username, name):
             continue
 
         try:
+            display_name = hit.locator(SEARCH_RESULT_TITLE_SELECTOR).inner_text().strip()
+        except Exception:
+            display_name = ""
+
+        try:
             button = hit.locator(SEARCH_RESULT_BUTTON_SELECTOR)
             if button.count() > 0:
                 button.first.click(timeout=8000)
@@ -588,7 +601,7 @@ def open_chat_by_search(page, username, name):
 
         deadline = time.time() + SEARCH_OPEN_TIMEOUT
         while time.time() < deadline:
-            if _chat_is_open_for(page, name):
+            if _chat_is_open_for(page, name, display_name):
                 logger.info(f"账号 {username} 用搜索框找到并打开了好友 {name}")
                 return True
             time.sleep(0.5)
@@ -1180,7 +1193,7 @@ def scroll_and_select_user(page, username, targets, skip=None):
 
                 if targetSymbol:
                     chat_opened = _activate_chat_by_row(
-                        page, element, username, targetSymbol
+                        page, element, username, targetSymbol, display_name=targetName
                     )
                     yield (targetSymbol, chat_opened)
 
@@ -1360,7 +1373,9 @@ def scroll_and_select_user(page, username, targets, skip=None):
             if name in skip_live:
                 continue
             if open_chat_by_search(page, username, name):
-                yield (name, _chat_is_open_for(page, name))
+                # open_chat_by_search 已按搜索结果显示名完成切换确认；这里再用配置里的
+                # 抖音号/UID 比较聊天标题昵称会把成功结果重新判失败。
+                yield (name, True)
         close_search_panel(page)
 
 
