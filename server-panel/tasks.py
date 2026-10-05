@@ -1311,10 +1311,10 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
     userIDDict.clear()
     context = browser.new_context(storage_state=storage_state) if storage_state else browser.new_context()
     context.set_default_navigation_timeout(
-        config["browserTimeout"]
+        config["browserActionTimeout"]
     )  # 设置导航超时时间为 120 秒
     context.set_default_timeout(
-        config["browserTimeout"]
+        config["browserActionTimeout"]
     )  # 设置所有操作的默认超时时间为 120 秒
 
     page = context.new_page()
