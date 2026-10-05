@@ -1620,7 +1620,9 @@ def _run_tasks_in_current_process():
     if not userData:
         logger.warning("没有可执行的账号，本次跳过（可能是账号缺少 Cookie）")
         return
-    playwright, browser = get_browser()
+    # core.browser.get_browser returns the CloakBrowser Browser instance
+    # directly; it does not return a (Playwright, Browser) tuple.
+    browser = get_browser()
     try:
         # 检查是否启用多任务和任务数量
         # 创建信号量以限制并发任务数量
@@ -1646,7 +1648,6 @@ def _run_tasks_in_current_process():
         # 关闭浏览器实例
         browser.close()
 
-        playwright.stop()
 
 
 def _terminate_account_process(process):
@@ -1746,6 +1747,69 @@ def _record_account_timeout(user, started_at, timeout_seconds):
         logger.error("记录账号 %s 的超时结果失败：%s", account, type(error).__name__)
 
 
+def _record_account_process_failure(user, started_at, returncode=None, detail=""):
+    """Record worker crashes that happen before do_user_task can create a result."""
+    uid = str(user.get("unique_id") or "")
+    runner_id = str(os.getenv("PANEL_RUN_ID") or "")
+    run_id = "%s:%s" % (runner_id, uid)
+    account = str(user.get("username") or uid or "抖音账号")
+    finished_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    if not detail:
+        if returncode is not None and returncode < 0 and os.name != "nt":
+            try:
+                signal_name = signal.Signals(-returncode).name
+            except (ValueError, AttributeError):
+                signal_name = "信号 %d" % -returncode
+            detail = "发送进程被 %s 中断（退出码 %s）" % (signal_name, returncode)
+        else:
+            detail = "发送进程异常退出（退出码 %s）" % returncode
+    try:
+        data = {"runs": []}
+        if os.path.exists(SEND_LOG):
+            try:
+                with open(SEND_LOG, encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict) and isinstance(loaded.get("runs"), list):
+                    data = loaded
+            except Exception:
+                pass
+        runs = data["runs"]
+        entry = next(
+            (
+                item for item in runs
+                if isinstance(item, dict)
+                and str(item.get("run_id") or "") == run_id
+            ),
+            None,
+        )
+        if entry is not None and str(entry.get("status") or "") != "running":
+            return
+        if entry is None:
+            entry = {
+                "run_id": run_id,
+                "runner_id": runner_id,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)),
+                "account": account,
+                "unique_id": uid,
+                "targets": list(user.get("targets") or []),
+                "friends": [],
+            }
+            runs.insert(0, entry)
+        entry.update({
+            "status": "error",
+            "reason": "process_error",
+            "detail": detail,
+            "finished_at": finished_text,
+        })
+        runs[:] = runs[:KEEP_RUNS_MAX]
+        tmp = SEND_LOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=1)
+        os.replace(tmp, SEND_LOG)
+    except Exception as error:
+        logger.error("记录账号 %s 的进程错误失败：%s", account, type(error).__name__)
+
+
 def _run_panel_accounts_separately():
     """Give each panel-run account its own process and independent timeout."""
     if not userData:
@@ -1758,11 +1822,13 @@ def _run_panel_accounts_separately():
 
     clear_abort_flag()
     logger.info("开始执行任务；每个抖音号独立计时，上限 %d 秒", timeout_seconds)
+    any_failure = False
     for user in userData:
         uid = str(user.get("unique_id") or "").strip()
         account = str(user.get("username") or uid or "抖音账号")
         if not uid:
             logger.warning("账号 %s 缺少 unique_id，本次跳过", account)
+            any_failure = True
             continue
         logger.info("开始处理账号 %s（独立上限 %d 秒）", account, timeout_seconds)
         child_environment = os.environ.copy()
@@ -1783,16 +1849,30 @@ def _run_panel_accounts_separately():
             )
         except Exception as error:
             logger.error("账号 %s 的发送进程启动失败：%s", account, error)
+            any_failure = True
+            _record_account_process_failure(
+                user, started_at, detail="发送进程启动失败，请查看运行日志。"
+            )
             continue
         try:
             process.wait(timeout=timeout_seconds)
             logger.info("账号 %s 任务完成（退出码 %s）", account, process.returncode)
+            if process.returncode != 0:
+                any_failure = True
+                _record_account_process_failure(user, started_at, process.returncode)
         except subprocess.TimeoutExpired:
             # If the worker exited right at the deadline, don't convert a completed
             # account run into a timeout.
             if process.poll() is not None:
                 logger.info("账号 %s 在超时检查前已完成（退出码 %s）", account, process.returncode)
+                if process.returncode != 0:
+                    any_failure = True
+                    _record_account_process_failure(user, started_at, process.returncode)
                 continue
             logger.error("账号 %s 发送超过 %d 秒，停止该账号并继续后续账号", account, timeout_seconds)
             _terminate_account_process(process)
             _record_account_timeout(user, started_at, timeout_seconds)
+            any_failure = True
+    if any_failure:
+        logger.error("本轮至少有一个抖音账号未正常完成；请检查发送记录和运行日志")
+        raise SystemExit(1)

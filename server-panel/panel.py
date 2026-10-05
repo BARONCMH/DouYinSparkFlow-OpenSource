@@ -6820,6 +6820,9 @@ section.panel.on{display:block}
 #guide li.done{background:var(--ok-bg);border-color:var(--ok-line)}
 #guide li.done .gdot{background:var(--ok);color:#fff;border-color:var(--ok)}
 #guide li.done .gtxt b{color:var(--ok)}
+#guide li.failed{background:var(--bad-bg);border-color:var(--bad-line)}
+#guide li.failed .gdot{background:var(--bad);color:#fff;border-color:var(--bad)}
+#guide li.failed .gtxt b{color:var(--bad)}
 #guide li.cur{background:var(--brand-soft);border-color:var(--brand-line);box-shadow:0 0 0 1px var(--brand-line) inset}
 #guide li.cur .gdot{background:linear-gradient(160deg,#ff8a2b,#ff3d2e);color:#fff;border-color:transparent}
 #guide li.cur .gtxt b{color:var(--brand-dark)}
@@ -8978,16 +8981,20 @@ function renderGuide(s, cur){
   var authed = hasUid && !!cur.has_cookie && (!chk || chk.ok !== false);
   var checked = !!(chk && chk.ok);
   var ready = !!(cur.ready || (cur.targets && cur.targets.length));
-  var ran = !!(s && s.runner && s.runner.returncode !== null && s.runner.returncode !== undefined);
-  var done = [hasUid, authed, checked, ready, ran];
+  var exitCode = s && s.runner ? s.runner.returncode : null;
+  var hasRun = exitCode !== null && exitCode !== undefined;
+  var runSucceeded = hasRun && Number(exitCode) === 0;
+  var runFailed = hasRun && !runSucceeded;
+  var done = [hasUid, authed, checked, ready, runSucceeded];
   var current = -1;
   for(var i = 0; i < done.length; i++){ if(!done[i]){ current = i; break; } }
   for(var k = 0; k < done.length; k++){
     var li = $('g' + (k + 1));
     if(li){
-      li.className = done[k] ? 'done' : (k === current ? 'cur' : '');
+      var failed = k === 4 && runFailed;
+      li.className = done[k] ? 'done' : (failed ? 'failed' : (k === current ? 'cur' : ''));
       var dot = li.querySelector ? li.querySelector('.gdot') : null;
-      if(dot){ dot.textContent = done[k] ? '✓' : String(k + 1); }
+      if(dot){ dot.textContent = done[k] ? '✓' : (failed ? '!' : String(k + 1)); }
     }
     var act = $('gact' + (k + 1));
     if(act){ act.hidden = (k !== current); }
@@ -8998,6 +9005,8 @@ function renderGuide(s, cur){
     g3act.textContent = (autoState === 'pending' || autoState === 'running')
       ? '查看状态' : (cur.has_cookie && !checked ? '手动检测' : '查看状态');
   }
+  var g5act = $('gact5');
+  if(g5act){ g5act.textContent = runFailed ? '查看运行错误' : '去运行'; }
 }
 function guideAction(step){
   if(step === 1 || step === 4){
