@@ -278,13 +278,14 @@ SEARCH_OPEN_TIMEOUT = 45  # 点完"发消息"之后，等右边聊天窗口确�
 CONVERSATION_ITEM_SELECTOR = '[data-e2e="conversation-item"], .conversationConversationItemwrapper'
 CONVERSATION_TITLE_SELECTOR = ".conversationConversationItemtitle"
 CONVERSATION_LIST_SELECTOR = ".conversationConversationListwrapper"
-# 抖音输入区有稳定 data-e2e / contenteditable 挂点；保留容器类名作旧版兜底。
+# 抖音输入区选择真实可编辑的 contenteditable 节点，避免匹配到外层容器。
 CHAT_EDITOR_SELECTOR = (
-    '[data-e2e="msg-input"] .public-DraftEditor-content, '
-    '.DraftEditor-root [contenteditable="true"], '
+    # New Douyin chat uses a Slate editor (data-placeholder="发送消息") inside
+    # the msg-input container. Select the editable node itself; the old
+    # messageEditorimChatEditorContainer is only a wrapper and Playwright rejects
+    # typing into it as non-editable.
     '[data-e2e="msg-input"] [contenteditable="true"], '
-    '.messageEditorimChatEditorContainer [contenteditable="true"], '
-    ".messageEditorimChatEditorContainer"
+    '.DraftEditor-root [contenteditable="true"]'
 )
 
 # [修复] 判断"好友列表到底加载出来没有"用的阈值
