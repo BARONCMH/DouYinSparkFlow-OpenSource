@@ -21,15 +21,12 @@ import queue
 import re
 import secrets
 import signal
-import smtplib
-import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
-from email.message import EmailMessage
-from email.utils import formataddr
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 try:
@@ -38,8 +35,9 @@ except ImportError:  # pragma: no cover
     fcntl = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse, urlsplit
-from uuid import uuid4
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from dotenv import dotenv_values
 
@@ -68,8 +66,6 @@ ABORT_PATH = LOG_DIR / "abort-run.json"
 RESTART_FLAG = LOG_DIR / "restart-requested.json"
 AUTO_AUTH_SECONDS = 20 * 60  # 一次授权的绝对上限（兜底），正常情况下面那个"没动静"就会先把它关掉
 AUTH_IDLE_STOP = 3 * 60  # 秒：授权浏览器超过 3 分钟没人扫码/没操作，就自动关掉，别占着浏览器
-AUTH_AUTO_CHECK_WAIT_SECONDS = 300  # 授权成功后，最多排队 5 分钟等待资源进行登录检测
-_AUTH_AUTO_CHECK_LOCK = threading.RLock()
 # 发送记录：worker（tasks.py 里的 KEEP_RUNS_MAX）只保留最近 100 次，面板这边照这个上限给管理员看
 SEND_STORE_MAX = 100
 SEND_MAX_USER = 2  # 普通用户最多看自己名下最近 2 次
@@ -98,7 +94,6 @@ SCHEDULE_INTERVAL = 5  # 秒：检查到期账号并启动排队中的定时任�
 CHECK_TIMEOUT = 120  # 秒：登录检测整体上限，超过就自动收尾，绝不允许一直卡着
 STUCK_AFTER = 90  # 秒：授权浏览器超过这么久没有新画面，就认为卡住了
 RUN_STUCK_AFTER = 180  # 秒：发送任务超过这么久没有新日志，就认为卡住了
-RUN_MAX_DURATION = 600  # 秒：每个抖音号独立的发送上限
 
 PANEL_USERNAME = os.getenv("PANEL_USERNAME", "admin")
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "")
@@ -114,8 +109,10 @@ SESSION_REVOKE_PATH = Path("/app/config/session-revoked.json")  # 退出登录�
 NOTICE_PATH = Path("/app/config/panel-notice.json")  # 主界面公告条 + 管理员联系方式（给「全体同志」看的那份）
 MESSAGES_PATH = Path("/app/config/panel-messages.json")  # 定向消息（管理员单独发给指定用户），显示在他们控制台最上方
 CODES_PATH = Path("/app/config/panel-redeem-codes.json")  # 一次性兑换码（只保存哈希）
-EMAIL_SETTINGS_PATH = Path("/app/config/panel-email-settings.json")
-EMAIL_NOTIFY_STATE_PATH = LOG_DIR / "email-notify-state.json"
+WEBPUSH_SUBSCRIPTIONS_PATH = Path("/app/config/panel-webpush-subscriptions.json")
+WEBPUSH_VAPID_PATH = Path("/app/config/panel-webpush-vapid.json")
+WEBPUSH_STATE_PATH = LOG_DIR / "webpush-state.json"
+WEBPUSH_LIB_DIR = Path("/app/config/webpush-lib")
 MAX_BODY_BYTES = 1000000  # 单次请求体上限，超过直接回 413
 BODY_READ_TIMEOUT = 15  # 秒：读请求体的总时限，客户端只报长度不发内容时不能一直等
 
@@ -342,195 +339,292 @@ USERS_STORE = JsonStore(USERS_PATH)
 ACCOUNTS_STORE = JsonStore(ACCOUNTS_PATH)
 CODES_STORE = JsonStore(CODES_PATH, default=lambda: {"codes": []})
 LOGIN_FAILS_STORE = JsonStore(LOGIN_FAILS_PATH)
-EMAIL_SETTINGS_STORE = JsonStore(
-    EMAIL_SETTINGS_PATH, default=lambda: {"users": {}}
+WEBPUSH_SUBSCRIPTIONS_STORE = JsonStore(
+    WEBPUSH_SUBSCRIPTIONS_PATH, default=lambda: {"users": {}}
 )
-EMAIL_NOTIFY_STATE_STORE = JsonStore(
-    EMAIL_NOTIFY_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
+WEBPUSH_STATE_STORE = JsonStore(
+    WEBPUSH_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
 )
 
-EMAIL_ADDRESS_RE = re.compile(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]{2,}")
-EMAIL_TEST_COOLDOWN = 60
-EMAIL_ADDRESS_TEST_COOLDOWN = 300
-EMAIL_NOTIFY_POLL_SECONDS = 5
+_WEBPUSH_KEY_LOCK = threading.Lock()
+_WEBPUSH_CRYPTO_CACHE = None
+_WEBPUSH_SUBJECT = (os.getenv("WEBPUSH_SUBJECT") or "https://124.220.96.161/").strip()
+_WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER = 5
+_WEBPUSH_POLL_SECONDS = 5
 
 
-def _valid_email_address(value: str) -> str:
-    address = str(value or "").strip()
-    if not address:
-        return ""
-    if len(address) > 254 or not EMAIL_ADDRESS_RE.fullmatch(address):
-        raise ValueError("邮箱地址格式不正确")
-    return address
-
-
-def email_preferences(username: str) -> dict:
-    data = EMAIL_SETTINGS_STORE.read()
-    users = data.get("users") if isinstance(data, dict) else {}
-    item = users.get(str(username or "")) if isinstance(users, dict) else None
-    if not isinstance(item, dict):
-        item = {}
+def _webpush_crypto():
+    """Load the optional cryptography wheel from the persistent config volume."""
+    global _WEBPUSH_CRYPTO_CACHE
+    if _WEBPUSH_CRYPTO_CACHE is False:
+        return None
+    if _WEBPUSH_CRYPTO_CACHE is not None:
+        return _WEBPUSH_CRYPTO_CACHE
+    if WEBPUSH_LIB_DIR.is_dir() and str(WEBPUSH_LIB_DIR) not in sys.path:
+        sys.path.insert(0, str(WEBPUSH_LIB_DIR))
     try:
-        address = _valid_email_address(item.get("address") or "")
-    except ValueError:
-        address = ""
-    return {"address": address, "enabled": bool(item.get("enabled")) and bool(address)}
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, utils
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except Exception:
+        _WEBPUSH_CRYPTO_CACHE = False
+        return None
+    _WEBPUSH_CRYPTO_CACHE = (hashes, serialization, ec, utils, AESGCM)
+    return _WEBPUSH_CRYPTO_CACHE
 
 
-def save_email_preferences(username: str, address: str, enabled: bool) -> dict:
-    name = str(username or "").strip()
-    if not name:
-        return {"ok": False, "error": "当前登录账号无效"}
-    try:
-        address = _valid_email_address(address)
-    except ValueError as error:
-        return {"ok": False, "error": str(error)}
-    enabled = bool(enabled)
-    if enabled and not address:
-        return {"ok": False, "error": "请先填写收件邮箱"}
-
-    def _apply(data):
-        users = data.get("users") if isinstance(data, dict) else {}
-        users = dict(users) if isinstance(users, dict) else {}
-        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
-        test_limits = dict(test_limits) if isinstance(test_limits, dict) else {}
-        previous = users.get(name) if isinstance(users.get(name), dict) else {}
-        record = dict(previous)
-        if str(previous.get("address") or "") != address:
-            record["last_test_at"] = 0
-        record.update({"address": address, "enabled": enabled and bool(address)})
-        users[name] = record
-        return {"users": users, "test_limits": test_limits}
-
-    EMAIL_SETTINGS_STORE.update(_apply)
-    return {
-        "ok": True,
-        "message": "邮件通知设置已保存",
-        "settings": email_preferences(name),
-    }
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-def _smtp_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None or not str(value).strip():
-        return bool(default)
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+def _b64url_decode(value: str) -> bytes:
+    text = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        raise ValueError("invalid base64url")
+    return base64.urlsafe_b64decode(text + "=" * ((4 - len(text) % 4) % 4))
 
 
-def _smtp_config() -> dict:
-    host = str(os.getenv("SMTP_HOST") or "").strip()
-    username = str(os.getenv("SMTP_USERNAME") or "").strip()
-    password = str(os.getenv("SMTP_PASSWORD") or "")
-    sender = str(os.getenv("SMTP_FROM") or username).strip()
-    if not host or not sender:
-        raise ValueError("邮件服务尚未配置")
-    try:
-        sender = _valid_email_address(sender)
-        port = int(os.getenv("SMTP_PORT") or "587")
-    except (TypeError, ValueError) as error:
-        raise ValueError("SMTP 参数配置无效") from error
-    if not 1 <= port <= 65535:
-        raise ValueError("SMTP 端口配置无效")
-    use_ssl = _smtp_flag("SMTP_USE_SSL", False)
-    starttls = _smtp_flag("SMTP_STARTTLS", not use_ssl)
-    if use_ssl and starttls:
-        raise ValueError("SMTP_SSL 与 SMTP_STARTTLS 不能同时启用")
-    if not use_ssl and not starttls:
-        raise ValueError("SMTP 必须启用 SSL 或 STARTTLS")
-    if bool(username) != bool(password):
-        raise ValueError("SMTP 用户名和授权码需要同时设置")
-    return {
-        "host": host,
-        "port": port,
-        "username": username,
-        "password": password,
-        "sender": sender,
-        "sender_name": str(os.getenv("SMTP_FROM_NAME") or "DouYinSparkFlow").strip(),
-        "use_ssl": use_ssl,
-        "starttls": starttls,
-    }
-
-
-def smtp_is_configured() -> bool:
-    try:
-        _smtp_config()
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
-def send_smtp_email(recipient: str, subject: str, body: str) -> dict:
-    try:
-        config = _smtp_config()
-        recipient = _valid_email_address(recipient)
-        if not recipient:
-            raise ValueError("收件邮箱为空")
-        message = EmailMessage()
-        message["From"] = formataddr((config["sender_name"], config["sender"]), charset="utf-8")
-        message["To"] = recipient
-        message["Subject"] = str(subject)
-        message.set_content(str(body))
-        context = ssl.create_default_context()
-        if config["use_ssl"]:
-            connection = smtplib.SMTP_SSL(
-                config["host"], config["port"], timeout=15, context=context
+def webpush_vapid_keys() -> dict:
+    """Create one persistent P-256 VAPID key pair, then reuse it for all devices."""
+    crypto = _webpush_crypto()
+    if not crypto:
+        raise RuntimeError("Web Push 的加密组件尚未安装")
+    _hashes, _serialization, ec, _utils, _aesgcm = crypto
+    with _WEBPUSH_KEY_LOCK:
+        if WEBPUSH_VAPID_PATH.exists():
+            data = read_json(WEBPUSH_VAPID_PATH, dict)
+            private_hex = str(data.get("private_hex") or "") if isinstance(data, dict) else ""
+            public_text = str(data.get("public_key") or "") if isinstance(data, dict) else ""
+            if not re.fullmatch(r"[0-9a-f]{64}", private_hex):
+                raise RuntimeError("VAPID 密钥文件格式无效")
+            private_value = int(private_hex, 16)
+            private = ec.derive_private_key(private_value, ec.SECP256R1())
+            public_raw = private.public_key().public_bytes(
+                _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
             )
-        else:
-            connection = smtplib.SMTP(config["host"], config["port"], timeout=15)
-        with connection as server:
-            server.ehlo()
-            if config["starttls"]:
-                server.starttls(context=context)
-                server.ehlo()
-            if config["username"]:
-                server.login(config["username"], config["password"])
-            refused = server.send_message(message)
-            if refused:
-                raise RuntimeError("SMTP 拒收邮件")
-        return {"ok": True}
-    except Exception as error:
-        log_force("邮件发送失败", type(error).__name__)
-        return {"ok": False, "error": "邮件发送失败，请管理员检查 SMTP 配置和服务器出站端口"}
-
-
-def reserve_email_test(username: str, address: str) -> int:
-    """Reserve per-user and per-address test-mail slots; return seconds remaining."""
-    now = int(time.time())
-    outcome = {"remaining": 0}
-    address_key = hashlib.sha256(str(address or "").strip().lower().encode("utf-8")).hexdigest()
-
-    def _apply(data):
-        users = data.get("users") if isinstance(data, dict) else {}
-        users = dict(users) if isinstance(users, dict) else {}
-        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
-        test_limits = (
-            {str(key): _epoch(value) for key, value in test_limits.items()
-             if now - _epoch(value) < EMAIL_ADDRESS_TEST_COOLDOWN * 2}
-            if isinstance(test_limits, dict) else {}
+            if not hmac.compare_digest(_b64url_encode(public_raw), public_text):
+                raise RuntimeError("VAPID 密钥对不匹配")
+            return {"private": private, "public_key": public_text, "public_raw": public_raw}
+        private = ec.generate_private_key(ec.SECP256R1())
+        private_value = private.private_numbers().private_value
+        public_raw = private.public_key().public_bytes(
+            _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
         )
-        name = str(username or "")
-        record = dict(users.get(name) or {})
-        user_remaining = EMAIL_TEST_COOLDOWN - (now - _epoch(record.get("last_test_at")))
-        address_remaining = EMAIL_ADDRESS_TEST_COOLDOWN - (now - _epoch(test_limits.get(address_key)))
-        remaining = max(user_remaining, address_remaining, 0)
-        if remaining:
-            outcome["remaining"] = remaining
-        else:
-            record["last_test_at"] = now
-            users[name] = record
-            test_limits[address_key] = now
-        return {"users": users, "test_limits": test_limits}
-
-    EMAIL_SETTINGS_STORE.update(_apply)
-    return max(0, int(outcome["remaining"]))
+        data = {
+            "private_hex": "%064x" % private_value,
+            "public_key": _b64url_encode(public_raw),
+            "created_at": now_text(),
+        }
+        atomic_write(WEBPUSH_VAPID_PATH, json.dumps(data, ensure_ascii=False, indent=2), 0o600)
+        return {"private": private, "public_key": data["public_key"], "public_raw": public_raw}
 
 
-def _send_event_id(run: dict) -> str:
-    stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
+def _hkdf_extract(salt: bytes, key_material: bytes) -> bytes:
+    return hmac.new(salt or (b"\x00" * 32), key_material, hashlib.sha256).digest()
 
 
-def _send_run_visible(run: dict, username: str, users: dict, accounts_by_name: dict) -> bool:
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    output = bytearray()
+    previous = b""
+    counter = 1
+    while len(output) < length:
+        previous = hmac.new(prk, previous + info + bytes([counter]), hashlib.sha256).digest()
+        output.extend(previous)
+        counter += 1
+        if counter > 256:
+            raise ValueError("HKDF output is too long")
+    return bytes(output[:length])
+
+
+def _webpush_endpoint_origin(endpoint: str) -> str:
+    parsed = urlsplit(str(endpoint or ""))
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "fcm.googleapis.com" or host.endswith(".fcm.googleapis.com")
+        or host == "push.services.mozilla.com" or host.endswith(".push.services.mozilla.com")
+        or host == "push.apple.com" or host.endswith(".push.apple.com")
+    )
+    if (
+        parsed.scheme != "https" or not allowed or not parsed.path.startswith("/")
+        or parsed.username or parsed.password or parsed.port not in (None, 443)
+        or len(endpoint) > 2048
+    ):
+        raise ValueError("推送地址不受支持")
+    return "https://" + parsed.netloc.lower()
+
+
+def _vapid_authorization(endpoint: str, keypair: dict) -> str:
+    crypto = _webpush_crypto()
+    if not crypto:
+        raise RuntimeError("Web Push 的加密组件尚未安装")
+    hashes, _serialization, _ec, utils, _aesgcm = crypto
+    header = _b64url_encode(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
+    claims = {
+        "aud": _webpush_endpoint_origin(endpoint),
+        "exp": int(time.time()) + 12 * 60 * 60,
+        "sub": _WEBPUSH_SUBJECT,
+    }
+    body = _b64url_encode(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = (header + "." + body).encode("ascii")
+    der = keypair["private"].sign(signing_input, _ec_signature_algorithm())
+    r, s = utils.decode_dss_signature(der)
+    return "vapid t=%s.%s.%s, k=%s" % (
+        header, body, _b64url_encode(r.to_bytes(32, "big") + s.to_bytes(32, "big")),
+        keypair["public_key"],
+    )
+
+
+def _ec_signature_algorithm():
+    crypto = _webpush_crypto()
+    if not crypto:
+        raise RuntimeError("Web Push 的加密组件尚未安装")
+    return crypto[2].ECDSA(crypto[0].SHA256())
+
+
+def _webpush_encrypt(subscription: dict, payload: bytes) -> tuple:
+    crypto = _webpush_crypto()
+    if not crypto:
+        raise RuntimeError("Web Push 的加密组件尚未安装")
+    _hashes, _serialization, ec, _utils, aes_gcm = crypto
+    keys = subscription.get("keys") if isinstance(subscription, dict) else None
+    if not isinstance(keys, dict):
+        raise ValueError("订阅密钥无效")
+    user_public = _b64url_decode(keys.get("p256dh") or "")
+    auth_secret = _b64url_decode(keys.get("auth") or "")
+    if len(user_public) != 65 or user_public[0] != 4 or len(auth_secret) != 16:
+        raise ValueError("订阅密钥长度无效")
+    user_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), user_public)
+    server_private = ec.generate_private_key(ec.SECP256R1())
+    server_public = server_private.public_key().public_bytes(
+        _serialization.Encoding.X962, _serialization.PublicFormat.UncompressedPoint
+    )
+    shared_secret = server_private.exchange(ec.ECDH(), user_key)
+    key_info = b"WebPush: info\x00" + user_public + server_public
+    input_key_material = _hkdf_expand(_hkdf_extract(auth_secret, shared_secret), key_info, 32)
+    salt = os.urandom(16)
+    prk = _hkdf_extract(salt, input_key_material)
+    content_key = _hkdf_expand(prk, b"Content-Encoding: aes128gcm\x00", 16)
+    nonce = _hkdf_expand(prk, b"Content-Encoding: nonce\x00", 12)
+    encrypted = aes_gcm(content_key).encrypt(nonce, payload + b"\x02", None)
+    record_size = 4096
+    body = salt + record_size.to_bytes(4, "big") + bytes([len(server_public)]) + server_public + encrypted
+    return body, server_public
+
+
+class _NoWebPushRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def send_webpush(subscription: dict, message: dict) -> str:
+    """Send one encrypted Web Push. Returns sent, expired, or retry."""
+    try:
+        endpoint = str(subscription.get("endpoint") or "")
+        _webpush_endpoint_origin(endpoint)
+        keys = webpush_vapid_keys()
+        body, _server_public = _webpush_encrypt(
+            subscription, json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        request = Request(
+            endpoint,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": _vapid_authorization(endpoint, keys),
+                "Content-Encoding": "aes128gcm",
+                "Content-Type": "application/octet-stream",
+                "TTL": "86400",
+                "Urgency": "high",
+            },
+        )
+        opener = build_opener(_NoWebPushRedirect())
+        with opener.open(request, timeout=6) as response:
+            return "sent" if 200 <= response.status < 300 else "retry"
+    except HTTPError as error:
+        if error.code in (404, 410):
+            return "expired"
+        log_force("Web Push 服务暂不可用", "HTTP %d" % error.code)
+        return "retry"
+    except (URLError, TimeoutError, OSError) as error:
+        # Never put subscription endpoints or cryptographic material in logs.
+        log_force("Web Push 发送失败", type(error).__name__)
+        return "retry"
+    except (ValueError, TypeError, RuntimeError) as error:
+        log_force("Web Push 订阅无效", type(error).__name__)
+        return "expired"
+
+
+def _clean_push_subscriptions(data) -> dict:
+    users = data.get("users") if isinstance(data, dict) else None
+    cleaned = {}
+    if isinstance(users, dict):
+        for name, records in users.items():
+            if not isinstance(records, list):
+                continue
+            valid = [
+                item for item in records
+                if isinstance(item, dict) and isinstance(item.get("endpoint"), str)
+                and isinstance(item.get("keys"), dict)
+            ]
+            if valid:
+                cleaned[str(name)] = valid[:_WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER]
+    return {"users": cleaned}
+
+
+def save_webpush_subscription(username: str, subscription: dict) -> dict:
+    endpoint = str(subscription.get("endpoint") or "")
+    _webpush_endpoint_origin(endpoint)
+    keys = subscription.get("keys") if isinstance(subscription.get("keys"), dict) else {}
+    p256dh = _b64url_encode(_b64url_decode(str(keys.get("p256dh") or "")))
+    auth = _b64url_encode(_b64url_decode(str(keys.get("auth") or "")))
+    if len(_b64url_decode(p256dh)) != 65 or len(_b64url_decode(auth)) != 16:
+        raise ValueError("订阅密钥长度无效")
+    crypto = _webpush_crypto()
+    if not crypto:
+        raise RuntimeError("Web Push 的加密组件尚未安装")
+    try:
+        crypto[2].EllipticCurvePublicKey.from_encoded_point(
+            crypto[2].SECP256R1(), _b64url_decode(p256dh)
+        )
+    except Exception as error:
+        raise ValueError("订阅公钥无效") from error
+    record = {"endpoint": endpoint, "keys": {"p256dh": p256dh, "auth": auth}, "at": now_text()}
+    result = {"ok": True}
+
+    def apply(data):
+        users = _clean_push_subscriptions(data)["users"]
+        current_records = [item for item in users.get(username, []) if item.get("endpoint") != endpoint]
+        if len(current_records) >= _WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER:
+            result.update({"ok": False, "error": "一个账号最多开启 5 台设备的通知，请先关闭其他设备"})
+            return {"users": users}
+        # A push endpoint belongs to one panel login only, even on a shared device.
+        for name in list(users):
+            users[name] = [item for item in users[name] if item.get("endpoint") != endpoint]
+            if not users[name]:
+                users.pop(name, None)
+        users[username] = current_records + [record]
+        return {"users": users}
+
+    WEBPUSH_SUBSCRIPTIONS_STORE.update(apply)
+    return result
+
+
+def remove_webpush_subscription(username: str, endpoint: str) -> None:
+    if endpoint:
+        _webpush_endpoint_origin(endpoint)
+
+    def apply(data):
+        users = _clean_push_subscriptions(data)["users"]
+        if username in users:
+            users[username] = [item for item in users[username] if item.get("endpoint") != endpoint]
+            if not users[username]:
+                users.pop(username, None)
+        return {"users": users}
+
+    WEBPUSH_SUBSCRIPTIONS_STORE.update(apply)
+
+
+def _push_run_visible(run: dict, username: str, users: dict, accounts_by_name: dict) -> bool:
     if username == PANEL_USERNAME:
         return True
     item = users.get(username) if isinstance(users, dict) else None
@@ -538,109 +632,105 @@ def _send_run_visible(run: dict, username: str, users: dict, accounts_by_name: d
     uid = str(run.get("unique_id") or "")
     if uid:
         return uid in scopes
-    owned_names = {str(accounts_by_name.get(key) or "") for key in scopes}
+    owned_names = {
+        str(accounts_by_name.get(uid) or "") for uid in scopes
+    }
     owned_names.discard("")
     return str(run.get("account") or "") in owned_names
 
 
-def _email_run_message(run: dict) -> tuple:
+def _push_event_id(run: dict) -> str:
+    stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
+
+
+def _push_message(run: dict, event_id: str) -> dict:
     status = str(run.get("status") or "")
     labels = {
         "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
         "error": "发送出错", "no_login": "账号需要重新登录", "no_friend": "未找到目标好友",
-        "queue_timeout": "任务排队超时", "skipped": "任务已跳过", "timed_out": "单个抖音号发送超时",
     }
+    account = str(run.get("account") or run.get("unique_id") or "你的账号")[:60]
     label = labels.get(status, "发送任务已结束")
-    account = str(run.get("account") or run.get("unique_id") or "你的账号")[:80]
-    sent_at = str(run.get("at") or "")[:40]
-    return "抖音火花发送通知：" + label, (
-        ("这个抖音号的发送已结束。超过时限时，系统只会停止这个号，批次中的其他账号会继续。\n\n"
-        "账号：%s\n结果：%s\n时间：%s\n\n"
-        "请登录面板查看发送详情。\n" % (account, label, sent_at))
-    )
+    return {
+        "title": label,
+        "body": account + " · " + label,
+        "url": "/",
+        "tag": "send-" + event_id,
+    }
 
 
-def _email_notify_loop(stop_event: threading.Event) -> None:
-    """Send one account-scoped email for each completed run to opted-in users."""
+def _webpush_notify_loop(stop_event: threading.Event) -> None:
+    """Watch completed send records and deliver account-scoped Web Push notifications."""
     try:
-        state = EMAIL_NOTIFY_STATE_STORE.read()
+        state = WEBPUSH_STATE_STORE.read()
         if not isinstance(state, dict) or not state.get("initialized"):
-            baseline = [_send_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
-            EMAIL_NOTIFY_STATE_STORE.write({
-                "initialized": True, "seen": baseline[-500:], "retry_after": {}, "delivered": {},
-            })
+            baseline = [_push_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
+            WEBPUSH_STATE_STORE.write({"initialized": True, "seen": baseline[-500:], "retry_after": {}})
     except Exception as error:
-        log_force("邮件通知初始化失败", type(error).__name__)
-    while not stop_event.wait(EMAIL_NOTIFY_POLL_SECONDS):
+        log_force("Web Push 初始化失败", type(error).__name__)
+    while not stop_event.wait(_WEBPUSH_POLL_SECONDS):
         try:
-            state = EMAIL_NOTIFY_STATE_STORE.read()
+            state = WEBPUSH_STATE_STORE.read()
             seen_order = [str(item) for item in (state.get("seen") or [])]
             seen = set(seen_order)
             retry_after = state.get("retry_after") if isinstance(state.get("retry_after"), dict) else {}
-            delivered = state.get("delivered") if isinstance(state.get("delivered"), dict) else {}
             runs = [item for item in load_sends(SEND_STORE_MAX) if isinstance(item, dict)]
             events = []
             for run in reversed(runs):
                 status = str(run.get("status") or "")
-                event_id = _send_event_id(run)
+                event_id = _push_event_id(run)
                 if (status in ("running", "queued") or event_id in seen
                         or int(retry_after.get(event_id) or 0) > int(time.time())):
                     continue
                 events.append((run, event_id))
             if not events:
                 continue
-            preferences = EMAIL_SETTINGS_STORE.read()
-            recipients = preferences.get("users") if isinstance(preferences, dict) else {}
-            recipients = recipients if isinstance(recipients, dict) else {}
+            subscriptions = _clean_push_subscriptions(WEBPUSH_SUBSCRIPTIONS_STORE.read())["users"]
             users = load_users()
             accounts_by_name = {
                 str(task.get("unique_id") or ""): str(task.get("username") or "")
                 for task in load_tasks()
             }
             for run, event_id in events:
-                subject, body = _email_run_message(run)
-                failed = False
-                delivered_for_event = set(str(x) for x in (delivered.get(event_id) or []))
-                for username, preference in recipients.items():
-                    if not isinstance(preference, dict) or not preference.get("enabled"):
+                message = _push_message(run, event_id)
+                retry = False
+                for username, records in subscriptions.items():
+                    if not _push_run_visible(run, username, users, accounts_by_name):
                         continue
-                    try:
-                        address = _valid_email_address(preference.get("address") or "")
-                    except ValueError:
-                        continue
-                    if not address or not _send_run_visible(run, str(username), users, accounts_by_name):
-                        continue
-                    if str(username) in delivered_for_event:
-                        continue
-                    result = send_smtp_email(address, subject, body)
-                    if result.get("ok"):
-                        delivered_for_event.add(str(username))
-                    else:
-                        failed = True
-                if failed:
-                    delivered[event_id] = sorted(delivered_for_event)
+                    expired = []
+                    for subscription in records:
+                        result = send_webpush(subscription, message)
+                        if result == "expired":
+                            expired.append(str(subscription.get("endpoint") or ""))
+                        elif result == "retry":
+                            retry = True
+                    if expired:
+                        for endpoint in expired:
+                            try:
+                                remove_webpush_subscription(username, endpoint)
+                            except Exception:
+                                pass
+                if retry:
                     retry_after[event_id] = int(time.time()) + 30
                 else:
                     seen.add(event_id)
                     seen_order.append(event_id)
                     retry_after.pop(event_id, None)
-                    delivered.pop(event_id, None)
             pending_ids = {
-                _send_event_id(run) for run in runs
+                _push_event_id(run) for run in runs
                 if str(run.get("status") or "") not in ("running", "queued")
-                and _send_event_id(run) not in seen
+                and _push_event_id(run) not in seen
             }
             retry_after = {
                 key: value for key, value in retry_after.items()
                 if key in pending_ids and int(value or 0) > int(time.time()) - 86400
             }
-            delivered = {key: value for key, value in delivered.items() if key in pending_ids}
-            EMAIL_NOTIFY_STATE_STORE.write({
-                "initialized": True, "seen": seen_order[-500:],
-                "retry_after": retry_after, "delivered": delivered,
+            WEBPUSH_STATE_STORE.write({
+                "initialized": True, "seen": seen_order[-500:], "retry_after": retry_after,
             })
         except Exception as error:
-            log_force("邮件通知后台检查失败", type(error).__name__)
+            log_force("Web Push 后台检查失败", type(error).__name__)
 
 
 # 退出登录「黑名单」：令牌一旦进来，签名再对也不认。
@@ -974,13 +1064,18 @@ VERIFY_QR_WORDS = ("扫码验证", "使用已登录", "已登录账号", "设备
 # 只有页面明确显示「选择验证方式」，或同时显示两种以上验证选项时，才按选择页处理。
 # 直接进入二维码/人脸验证页时不点击，避免误触返回或换方式。
 VERIFY_CHOICE_PROMPT_WORDS = ("请选择验证方式", "选择验证方式", "请选择一种验证方式",
-                              "选择一种验证方式", "原设备扫码还是人脸", "原设备验证还是人脸")
+                              "选择一种验证方式", "原设备扫码还是人脸", "原设备验证还是人脸",
+                              "登录双重验证", "双重验证", "安全验证方式", "身份验证", "安全验证", "请选择验证", "验证方式")
 VERIFY_PHONE_WORDS = ("接收短信验证码", "通过短信验证", "使用短信验证", "短信验证",
                       "手机短信验证", "手机号验证", "手机号码验证", "手机验证",
-                      "通过手机号验证", "通过手机验证", "使用手机号验证", "使用手机验证")
+                      "通过手机号验证", "通过手机验证", "使用手机号验证", "使用手机验证",
+                      "接收验证码", "短信验证码", "手机验证码", "手机号验证码",
+                      "使用手机验证码", "通过手机验证码", "发送短信验证码")
 VERIFY_PHONE_PICK_TEXTS = ("接收短信验证码", "通过短信验证", "使用短信验证", "短信验证",
                            "手机短信验证", "手机号验证", "手机号码验证", "手机验证",
-                           "通过手机号验证", "通过手机验证", "使用手机号验证", "使用手机验证")
+                           "通过手机号验证", "通过手机验证", "使用手机号验证", "使用手机验证",
+                           "接收验证码", "短信验证码", "手机验证码", "手机号验证码",
+                           "使用手机验证码", "通过手机验证码", "发送短信验证码")
 VERIFY_DEVICE_WORDS = ("用原设备扫码", "使用原设备扫码", "原设备扫码", "原设备验证",
                        "使用原设备验证", "在原设备上验证", "用已登录设备扫码", "使用已登录设备扫码",
                        "已登录设备扫码", "用已登录设备验证", "用本机抖音扫码", "已登录设备验证")
@@ -1017,6 +1112,7 @@ SMS_SETTLE = 3.0         # 点完「验证」等这么久，再看抖音的结�
 SMS_CHOICE_TEXTS = VERIFY_PHONE_PICK_TEXTS
 # 万一还要再点一下才发短信（按钮文字完全一致才点，不能是那个行的名字）
 SMS_SEND_TEXTS = ("获取验证码", "发送验证码", "获取短信验证码")
+SMS_CHOICE_EVERY = 8.0   # 秒：同一次授权里最快多久去点一次
 SMS_SEND_EVERY = 30.0    # 秒：自动点「获取验证码」的间隔（不能狂发短信）
 SMS_BEFORE_SUBMIT_WAIT = 3.5  # 秒：验证码敲进去后先等几秒，让抖音认到，再点「验证」
 SMS_TYPE_DELAY = 120          # 毫秒：一个数字一个数字敲（跟真人一样），敲得太快页面会丢
@@ -1029,6 +1125,11 @@ SMS_PWD_MAX = 64
 # 所以上限给得比密码还宽一点，只防手滑粘进一整篇文章。字符一律不过滤。
 # 它**不做任何识别**，只把内容粘到抖音页面当前光标处（详见 _submit_text / _paste_text）。
 TEXT_MAX = 200
+
+# 手机号登录（面板主路径）：先切到这个标签，再填号码
+PHONE_TAB_TEXTS = ("验证码登录", "手机号登录", "接收短信验证码")
+# 手机号登录那一步的提交按钮：抖音那个弹窗写的是「登录」，不是「验证」
+PHONE_SUBMIT_TEXTS = ("登录", "立即登录")
 
 # 把文字对应的元素找出来，返回屏幕坐标 —— 点击由外面用真鼠标点
 _JS_FIND_TEXT_CENTER = """(texts) => {
@@ -1204,56 +1305,6 @@ def _clean_cookie_list(data) -> list:
     return result
 
 
-def _clean_storage_state(data) -> dict:
-    """Playwright storage_state（Cookie + 各站点 localStorage）。"""
-    if not isinstance(data, dict):
-        return {"cookies": [], "origins": []}
-    cookies = []
-    raw_cookies = data.get("cookies")
-    if isinstance(raw_cookies, list):
-        for item in raw_cookies:
-            if not isinstance(item, dict) or not item.get("name") or not item.get("domain"):
-                continue
-            cookie = {k: v for k, v in item.items() if v is not None}
-            cookie.setdefault("path", "/")
-            cookie.setdefault("expires", -1)
-            cookie.setdefault("httpOnly", False)
-            cookie.setdefault("secure", False)
-            if cookie.get("sameSite") not in ("Strict", "Lax", "None"):
-                cookie["sameSite"] = "Lax"
-            cookies.append(cookie)
-    origins = []
-    raw_origins = data.get("origins")
-    if isinstance(raw_origins, list):
-        for item in raw_origins:
-            if not isinstance(item, dict):
-                continue
-            origin = item.get("origin")
-            if not isinstance(origin, str) or not origin.startswith(("https://", "http://")):
-                continue
-            raw_storage = item.get("localStorage")
-            local_storage = []
-            if isinstance(raw_storage, list):
-                local_storage = [
-                    {"name": entry["name"], "value": entry["value"]}
-                    for entry in raw_storage
-                    if isinstance(entry, dict)
-                    and isinstance(entry.get("name"), str)
-                    and isinstance(entry.get("value"), str)
-                ]
-            origins.append({"origin": origin, "localStorage": local_storage})
-    return {"cookies": cookies, "origins": origins}
-
-
-def _storage_state_envelope(state: dict) -> str:
-    cleaned = _clean_storage_state(state)
-    return json.dumps(
-        {"version": 2, "storage_state": cleaned},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
 def cookie_key(unique_id: str) -> str:
     return ("COOKIES_" + str(unique_id)).upper()
 
@@ -1396,51 +1447,80 @@ def account_settings(task: dict) -> dict:
     return out
 
 
-def load_storage_state(unique_id: str) -> dict:
-    """读取加密保存的浏览器状态；旧版 Cookie 列表会包装成空 localStorage 状态。"""
+def _cookie_list_from_blob(data) -> list:
+    """把两种凭据格式都摊成一份 Cookie 数组。
+
+    v1：直接存 Cookie 数组；
+    v2：存 {"version":2,"storage_state":{"cookies":[...],"origins":[...]}}
+        （新版扫码存的是这个，除了 Cookie 还带 localStorage）。
+    以前只认 v1，于是所有用 v2 存的号（ddy 等）在这里**静默返回空** ——
+    「一键复制 Cookie」和一切依赖它的功能都拿不到东西，界面上只显示"没保存过 Cookie"，
+    查不出原因。这里把 v2 也接上。
+    """
+    if isinstance(data, dict):
+        state = data.get("storage_state")
+        if isinstance(state, dict) and isinstance(state.get("cookies"), list):
+            return _clean_cookie_list(state["cookies"])
+        if isinstance(data.get("cookies"), list):
+            return _clean_cookie_list(data["cookies"])
+        return []
+    return _clean_cookie_list(data)
+
+
+def load_storage_state(unique_id: str):
+    """取这个号的完整浏览器凭据（能直接喂给 Playwright 的 storage_state）。
+
+    v2 的号带着 localStorage，必须整份用上；v1 的号只有 Cookie，包成 storage_state 形状。
+    返回 None 表示这个号还没凭据 / 解不开。
+    """
     uid = str(unique_id or "").strip()
     if not uid:
-        return {"cookies": [], "origins": []}
+        return None
     item = load_accounts().get(uid) or {}
     blob = str(item.get("cookies") or "")
     if not blob:
-        return {"cookies": [], "origins": []}
+        return None
     try:
-        payload = json.loads(decrypt_text(blob))
-        if isinstance(payload, list):
-            return _clean_storage_state({"cookies": _clean_cookie_list(payload), "origins": []})
-        if isinstance(payload, dict) and payload.get("version") == 2:
-            return _clean_storage_state(payload.get("storage_state"))
-        # 兼容直接保存的 Playwright storage_state 对象。
-        if isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
-            return _clean_storage_state(payload)
-        return {"cookies": [], "origins": []}
+        data = json.loads(decrypt_text(blob))
     except Exception as error:
-        # 以前这里静默返回 []：界面上只看到"未授权"，根本查不出是密钥变了还是 Cookie 坏了
         _warn_decrypt(uid, error)
-        return {"cookies": [], "origins": []}
+        return None
+    if isinstance(data, dict) and data.get("version") == 2 and isinstance(data.get("storage_state"), dict):
+        return data["storage_state"]
+    if isinstance(data, dict) and isinstance(data.get("cookies"), list) and isinstance(data.get("origins"), list):
+        return data
+    cookies = _cookie_list_from_blob(data)
+    if not cookies:
+        return None
+    return {"cookies": cookies, "origins": []}
 
 
 def load_cookies(unique_id: str) -> list:
-    """读取当前凭据里的 Cookie 项，兼容旧版 Cookie-only 账号。"""
-    return load_storage_state(unique_id).get("cookies", [])
-
-
-def save_storage_state(unique_id: str, state: dict, **account_fields) -> bool:
-    """加密保存 Playwright storage_state，其中包括 Cookie 和 localStorage。"""
+    """读取已保存的 Cookie（加密存的，这里解回来），顺手去掉 Playwright 不支持的字段。"""
     uid = str(unique_id or "").strip()
-    cleaned = _clean_storage_state(state)
-    if not uid or not cleaned["cookies"]:
-        return False
-    save_account(uid, cookies=encrypt_text(_storage_state_envelope(cleaned)), **account_fields)
-    invalidate_shot_cache()
-    return True
+    if not uid:
+        return []
+    item = load_accounts().get(uid) or {}
+    blob = str(item.get("cookies") or "")
+    if not blob:
+        return []
+    try:
+        return _cookie_list_from_blob(json.loads(decrypt_text(blob)))
+    except Exception as error:
+        # 以前这里静默返回 []：界面上只看到"未授权"，根本查不出是密钥变了还是 Cookie 坏了
+        _warn_decrypt(uid, error)
+        return []
 
 
 def save_cookies(unique_id: str, cookies: list) -> None:
-    """把导入的 Cookie 转成 storage_state 格式并加密存储。"""
+    """Cookie 加密后存进 accounts.json —— 直接 cat 那个文件看不到 sessionid。"""
+    uid = str(unique_id or "").strip()
+    if not uid:
+        return
     cleaned = _clean_cookie_list(cookies)
-    save_storage_state(unique_id, {"cookies": cleaned, "origins": []})
+    text = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
+    save_account(uid, cookies=encrypt_text(text))
+    invalidate_shot_cache()
 
 
 def save_account_list(tasks: list, old_unique_id: str = "", new_unique_id: str = "") -> None:
@@ -2229,7 +2309,7 @@ def real_check(checks: dict, uid: str):
     item = (checks or {}).get(str(uid))
     if not isinstance(item, dict):
         return None
-    if str(item.get("source") or "") in ("qr", "authorization"):
+    if str(item.get("source") or "") == "qr":
         return None
     return item
 
@@ -2935,15 +3015,12 @@ def delete_user(name: str) -> dict:
 
     update_users(_apply)
 
-    def _remove_email_settings(data):
-        users = data.get("users") if isinstance(data, dict) else {}
-        users = dict(users) if isinstance(users, dict) else {}
-        test_limits = data.get("test_limits") if isinstance(data, dict) else {}
-        test_limits = dict(test_limits) if isinstance(test_limits, dict) else {}
-        users.pop(name, None)
-        return {"users": users, "test_limits": test_limits}
+    def _remove_push_devices(data):
+        subscriptions = _clean_push_subscriptions(data)["users"]
+        subscriptions.pop(name, None)
+        return {"users": subscriptions}
 
-    EMAIL_SETTINGS_STORE.update(_remove_email_settings)
+    WEBPUSH_SUBSCRIPTIONS_STORE.update(_remove_push_devices)
     log_force("删除用户", name)
     return {"ok": True, "message": "已删除用户 %s（它的抖音号配置还在账号区，可以再删掉）" % name}
 
@@ -3335,19 +3412,21 @@ _JS_QR_REFRESH = """() => {
 # 验证码输入框：按 placeholder / aria-label / name 里带"验证码"找
 # 按“文字完全一致”点元素：避开“顺带包含这几个字”的大容器，避免点到整个弹窗
 _JS_CLICK_BY_TEXT = """(texts) => {
-  const want = texts.map(t => String(t).replace(/\\s+/g, ''));
+  const want = texts.map(t => String(t).replace(/\\s+/g, '')).filter(Boolean);
   const hit = [];
   for (const el of document.querySelectorAll('div,span,p,li,a,button,label')) {
     const t = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, '');
-    if (!t || want.indexOf(t) < 0) continue;
+    if (!t || !want.some(w => t === w || t.indexOf(w) >= 0)) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 24 || r.height < 10) continue;
     const st = getComputedStyle(el);
     if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-    hit.push({el: el, area: r.width * r.height});
+    const native = el.tagName === 'BUTTON' || el.tagName === 'A' ||
+      el.getAttribute('role') === 'button' || st.cursor === 'pointer';
+    hit.push({el: el, area: r.width * r.height, native: native});
   }
   if (!hit.length) { return {ok: false}; }
-  hit.sort((a, b) => a.area - b.area);
+  hit.sort((a, b) => (a.native !== b.native) ? (a.native ? -1 : 1) : a.area - b.area);
   // 就点最里层那个字：点击会自己往上冒泡，行上的点击事件照样收得到。
   // 不能往上点父节点：弹窗里只剩这一个按钮时，外层的字一模一样，点了外层等于没点。
   const target = hit[0].el;
@@ -3777,8 +3856,6 @@ class BrowserSession:
         # 这台授权浏览器是谁的（哪个抖音号）；和 unique_id 分开记，
         # 免得别的流程（比如登录检测）推画面时把归属改掉，让别人看到你的画面。
         self.owner = ""
-        self.auto_check_uid = ""
-        self.auto_check_saved_at = ""
         self.forced = False
         self.last_frame_at = 0.0
         # ---- 扫码登录流程的状态 ----
@@ -3786,14 +3863,16 @@ class BrowserSession:
         self.qr_hash = ""            # 二维码指纹：变了说明换新了
         self.qr_at = 0.0             # 这张二维码是什么时候取到的
         self.qr_seen_at = 0.0        # 第一次看到二维码的时刻（"扫过了"要靠它判断）
+        self.phone_login = False     # 这次授权走的是「手机号 + 验证码」而不是扫码
+        self.phone_digits = 0        # 手机号填进去几位（只存长度，不存号码）
         self.verify_qr = False       # 抖音弹了二级验证，而且屏幕上有二维码可扫
         self.verify_hint = ""        # 二级验证时给用户看的那句话
         # 「手动模式」：进了二级验证就把**可操作画面**交给用户 ——
         # 主界面那块画面会自动摊开并写明"可以直接点"，通用输入框就在它下面。
-        # 验证方式选择页按手机号、原设备、人脸的顺序尝试；二维码页只展示、不点击。
+        # 自动那套（自动点「用原设备扫码」+ 抓二维码摆出来）**并列保留**，两边不冲突。
         self.verify_manual = False
         self._verify_pick_at = 0.0
-        self._verify_pick_method = ""  # device / face / manual；用于等页面变化并避免重复点击
+        self._verify_pick_method = ""  # phone / device / face / manual
         self._verify_face_hint_shown = False
         self.qr_gone_at = 0.0        # 二维码消失的时刻
         self.phase = "idle"          # idle/opening/qr/scanned/sms/manual/done
@@ -3937,8 +4016,6 @@ class BrowserSession:
                     return False, "授权浏览器已经在运行了"
                 self.unique_id = str(unique_id or "").strip()
                 self.owner = self.unique_id
-                self.auto_check_uid = ""
-                self.auto_check_saved_at = ""
                 self.username = str(username or "").strip() or "账号1"
                 self.error = ""
                 self.saved = ""
@@ -3962,6 +4039,8 @@ class BrowserSession:
                 self.sms_proof = None
                 self.sms_proof_at = 0.0
                 self.phase = "opening"
+                self.phone_login = False
+                self.phone_digits = 0
                 self.page_hint = ""
                 self.sms_hint = ""
                 self.sms_kind = "code"
@@ -4000,8 +4079,6 @@ class BrowserSession:
 
     def _run(self) -> None:
         playwright = browser = context = page = None
-        auto_check_uid = ""
-        auto_check_saved_at = ""
         try:
             from playwright.sync_api import sync_playwright
 
@@ -4057,8 +4134,13 @@ class BrowserSession:
                             page.keyboard.press(str(command.get("key", "Enter")))
                         elif name == "goto":
                             page.goto(str(command.get("url", CHAT_URL)), wait_until="domcontentloaded", timeout=120000)
+                        elif name == "phone":
+                            self._submit_phone(page, str(command.get("phone") or ""))
                         elif name == "sms":
-                            self._submit_sms(page, str(command.get("code") or ""))
+                            if self.phone_login:
+                                self._submit_phone_code(page, str(command.get("code") or ""))
+                            else:
+                                self._submit_sms(page, str(command.get("code") or ""))
                         elif name == "pwd":
                             # 二级验证弹密码框：走独立通道，不跟"手机号登录"那条岔路混
                             # （那条是给验证码用的，会去填 input#button-input）
@@ -4132,9 +4214,6 @@ class BrowserSession:
                 except Exception:
                     pass
             with self.lock:
-                if self.state == "authorized":
-                    auto_check_uid = self.auto_check_uid
-                    auto_check_saved_at = self.auto_check_saved_at
                 # 检测结束后把画面交还出去：不然实时画面窗一直挂着别人的最后一张图
                 self.png = None
                 self.last_frame_at = 0.0
@@ -4160,13 +4239,6 @@ class BrowserSession:
                 self.owner = ""
                 self.unique_id = ""
                 self.thread = None
-            if auto_check_uid and auto_check_saved_at:
-                threading.Thread(
-                    target=_check_after_authorization_safely,
-                    args=(auto_check_uid, auto_check_saved_at),
-                    name="auth-auto-check",
-                    daemon=True,
-                ).start()
 
     @staticmethod
     def _capture(cdp) -> bytes:
@@ -4188,59 +4260,53 @@ class BrowserSession:
         if not (self.owner or self.unique_id):
             self._set(
                 state="need_id",
-                message="已检测到抖音登录，但还没有可绑定的抖音号。请先在上方填写并保存抖音号，再重新开始授权。",
+                message="已检测到登录成功，但还没填「抖音号」。请在上方填写并保存配置，再点「导出 Cookies」",
             )
             return False
-        return self._store(context.storage_state())
+        self._store(douyin)
+        return True
 
-    def _store(self, storage_state: dict) -> bool:
-        cleaned_state = _clean_storage_state(storage_state)
-        cleaned = cleaned_state["cookies"]
-        if not self._logged_in(cleaned):
-            self._set(message="没有取得完整的抖音浏览器状态，请重新扫码授权")
-            return False
+    def _store(self, cookies: list) -> None:
+        cleaned = []
+        for cookie in cookies:
+            item = {k: v for k, v in cookie.items() if k != "sameSite" and v is not None}
+            cleaned.append(item)
         # 存到哪个账号以 owner 为准：unique_id 会被「保存配置」顺手改，owner 不会
         uid = str(self.owner or self.unique_id or "").strip()
         if not uid:
             self._set(message="还没给这台浏览器指定抖音号，先在上面的配置里填好再试")
-            return False
+            return
         key = cookie_key(uid)
 
         existing = load_accounts().get(uid)
-        account_fields = {} if isinstance(existing, dict) else {
-            "username": self.username or uid,
-            "targets": [],
-        }
-        if not save_storage_state(uid, cleaned_state, **account_fields):
-            self._set(message="浏览器状态没保存成功，请重新扫码授权")
-            return False
+        if isinstance(existing, dict):
+            save_cookies(uid, cleaned)
+        else:
+            save_account(
+                uid,
+                username=self.username or uid,
+                targets=[],
+                cookies=encrypt_text(
+                    json.dumps(_clean_cookie_list(cleaned), ensure_ascii=False, separators=(",", ":"))
+                ),
+            )
         try:
             RELOGIN_PATH.unlink()
         except Exception:
             pass
         now = now_text()
-        # 授权成功只代表登录状态已保存，不等于检测通过。用独立来源标记清掉旧检测结果，
-        # 然后自动排队检测；这个标记不会被 real_check 当成检测成功。
-        with _AUTH_AUTO_CHECK_LOCK:
-            save_state({
-                "saved_at": {uid: now},
-                "checks": {uid: {"source": "authorization", "at": now}},
-                "auth_auto_check": {uid: {
-                    "state": "pending",
-                    "saved_at": now,
-                    "message": "登录状态已保存，正在准备自动检测（不会发送消息）",
-                }},
-            })
-        with self.lock:
-            self.auto_check_uid = uid
-            self.auto_check_saved_at = now
+        # 只记「这个号什么时候授权的」，**不要**往 checks 里写。
+        # checks 是「登录检测」的结果，授权成功 != 检测通过：授权只说明 Cookie 存下来了，
+        # 这个号还能不能发消息得等检测跑一遍。以前在这里写一条 ok=True，
+        # 界面上刚授权的号立刻变成绿色的「登录正常」，看着全绿，真去发才发现早掉线了。
+        # 想让新授权的号显示正常？点「检测所有账号」跑一遍。
+        save_state({"saved_at": {uid: now}})
         self._set(
             state="authorized",
             saved=key,
             phase="done",
-            message="登录成功，登录状态已加密保存；正在准备自动检测（不会发送消息）",
+            message="登录成功，已保存 %d 个 Cookie 项到 %s" % (len(cleaned), key),
         )
-        return True
 
     # ------------------------------------------------------------------
     # 扫码登录流程
@@ -4508,6 +4574,47 @@ class BrowserSession:
             pass
 
 
+    # ---- 手机号登录：面板的主路径（扫码退到备用）--------------------------------
+    def _fill_input(self, page, selector: str, value: str) -> str:
+        """把值写进抖音的输入框，返回框里实际剩下的内容。
+
+        先用 Playwright 的 fill（它发出的 input 事件 React 认），不行再用
+        原生 setter 兜一次 —— 抖音的输入框是受控组件，直接改 value 会被抹掉。
+        """
+        try:
+            page.fill(selector, "", timeout=4000)
+            page.fill(selector, value, timeout=4000)
+            return str(page.input_value(selector, timeout=2000) or "")
+        except Exception:
+            pass
+        try:
+            got = page.evaluate(_JS_FILL_REACT_INPUT, {"selector": selector, "value": value})
+        except Exception:
+            return ""
+        return str(got.get("value") or "") if isinstance(got, dict) else ""
+
+    def _click_text_mouse(self, page, texts) -> str:
+        """按文字找到元素，用真鼠标点它，返回点到的文字。
+
+        抖音的发验证码/登录按钮用页内合成 click 点不动（试过，接口根本不发），
+        所以这里只算坐标，点击交给 page.mouse。
+        """
+        try:
+            hit = page.evaluate(_JS_FIND_TEXT_CENTER, list(texts))
+        except Exception:
+            return ""
+        if not (isinstance(hit, dict) and hit.get("ok")):
+            return ""
+        x = float(hit.get("x") or 0)
+        y = float(hit.get("y") or 0)
+        try:
+            page.mouse.move(x, y)
+            page.wait_for_timeout(60)
+            page.mouse.click(x, y)
+        except Exception:
+            return ""
+        return str(hit.get("text") or "")
+
     def _click_text_any(self, page, texts):
         """主页面和各个 iframe 依次找那个字去点，点到就返回点到的那个元素信息。
 
@@ -4524,6 +4631,143 @@ class BrowserSession:
                 return got
         return None
 
+    def _submit_phone(self, page, phone: str) -> None:
+        """手机号登录第一步：切到「验证码登录」-> 填手机号 -> 点「获取验证码」。"""
+        digits = re.sub(r"\D", "", phone or "")
+        if not re.fullmatch(r"1\d{10}", digits):
+            self._set(message="手机号要填 11 位数字，检查一下")
+            return
+
+        with self.lock:
+            self.phone_login = True
+        self._snap_now()
+
+        # 1) 登录弹窗没开就先点开
+        if not self._has_words(page, MODAL_WORDS):
+            try:
+                page.evaluate(_JS_CLICK_LOGIN, LOGIN_ENTRY_TEXTS)
+            except Exception:
+                pass
+            page.wait_for_timeout(1800)
+
+        # 2) 切到「验证码登录」：弹窗默认停在扫码，不切进去就没有手机号那个框
+        picked = self._click_text_mouse(page, PHONE_TAB_TEXTS)
+        if picked:
+            self._set(message="已切到「%s」" % picked)
+            page.wait_for_timeout(1500)
+
+        # 3) 填手机号（只回长度，手机号本身不写日志）
+        got = re.sub(r"\D", "", self._fill_input(page, "input#normal-input", digits))
+        with self.lock:
+            self.phone_digits = len(got)
+        if not got:
+            self._set(
+                message="没找到抖音的手机号输入框。请在下面截图里点一下手机号那一栏，"
+                        "再用上面那行「输入并发送」把号码填进去。",
+                page_hint="请手动点手机号输入框",
+            )
+            return
+        if got != digits:
+            self._set(message="手机号只填进去 %d 位，请检查一下（也可以手动补全）" % len(got))
+            return
+        page.wait_for_timeout(900)
+
+        # 4) 点「获取验证码」，同时看一眼抖音接口的返回 —— 光看页面文字看不出成败
+        clicked = ""
+        verdict = ""
+        detail = ""
+        try:
+            with page.expect_response(
+                lambda r: "/passport/web/" in r.url
+                and not re.search(
+                    r"challenge|qrcode|qrconnect|ticket_guard|login_guiding|ttwid",
+                    r.url,
+                    re.I,
+                ),
+                timeout=9000,
+            ) as caught:
+                clicked = self._click_text_mouse(page, SMS_SEND_TEXTS)
+            try:
+                raw = caught.value.text()[:400]
+            except Exception:
+                raw = ""
+            verdict, detail = judge_send_response(raw)
+        except Exception:
+            clicked = clicked or ""
+            page.wait_for_timeout(300)
+
+        with self.lock:
+            self.phase = "sms"
+
+        if clicked and verdict != "bad":
+            self._sms_send_at = time.time()
+            self._set(
+                message="手机号已经填进抖音并点了「%s」，短信到了就把验证码填在下面。" % clicked,
+                sms_hint="验证码已经发到你手机上：填在下面，我替你填进抖音并点「登录」。",
+                sms_result={"ok": True, "at": now_text(), "message": "已请求发送短信验证码"},
+            )
+            return
+        if verdict == "bad":
+            self._set(
+                message="抖音没接受这次发送（接口返回：%s）。检查一下号码，"
+                        "或者到下面截图里手动试一次。想自己操作画面就切到上面的「手动授权」页签。" % (detail or "未说明原因"),
+                sms_hint="抖音拒绝了这次验证码发送，看上面的提示。",
+                sms_result={"ok": False, "at": now_text(), "message": detail or "抖音拒绝了这次发送"},
+            )
+            return
+        self._set(
+            message="手机号填好了，但没能确认抖音发出验证码。请在下面截图里手动点一次「获取验证码」。",
+            page_hint="请手动点「获取验证码」",
+        )
+
+    def _submit_phone_code(self, page, code: str) -> None:
+        """手机号登录第二步：把验证码填进抖音的框，再用真鼠标点「登录」。"""
+        digits = re.sub(r"\D", "", code or "")
+        if not digits:
+            return
+        got = re.sub(r"\D", "", self._fill_input(page, "input#button-input", digits))
+        with self.lock:
+            self.sms_box_len = len(got)
+            self.sms_box_at = time.time()
+        if not got:
+            self._set(
+                phase="sms",
+                sms_result={"ok": False, "at": now_text(),
+                            "message": "验证码没写进抖音的框里，请在截图里点一下那个框再填一次"},
+            )
+            return
+        if got != digits:
+            self._set(
+                phase="sms",
+                sms_result={"ok": False, "at": now_text(),
+                            "message": "验证码只进去 %d 位，再填一次" % len(got)},
+            )
+            return
+
+        # 抖音认到码之后「登录」才会亮，等一会儿再点
+        page.wait_for_timeout(int(SMS_BEFORE_SUBMIT_WAIT * 1000))
+        clicked = ""
+        for _ in range(3):
+            clicked = self._click_text_mouse(page, PHONE_SUBMIT_TEXTS)
+            if clicked:
+                break
+            page.wait_for_timeout(1500)
+        with self.lock:
+            self._sms_submitted_at = time.time()
+        if clicked:
+            self._set(
+                phase="scanned",
+                sms_result={"ok": True, "at": now_text(),
+                            "message": "验证码已经填进抖音并点了「%s」，等结果…" % clicked},
+            )
+        else:
+            self._set(
+                phase="sms",
+                sms_result={"ok": False, "at": now_text(),
+                            "message": "验证码填好了，但没找到抖音的「登录」按钮，"
+                                       "请在截图里手动点一下登录"},
+            )
+
     def _click_verify_method(self, page, methods):
         """按调用方给出的优先顺序，在主页面和 iframe 中尝试验证入口。"""
         text_by_method = {
@@ -4538,13 +4782,20 @@ class BrowserSession:
         return "", None
 
     def _is_verify_choice_page(self, page) -> bool:
-        """只把明确的方式选择页当作选择页；单独的人脸/扫码验证说明不触发点选。"""
+        """只把明确的方式选择页当作选择页；单独的人脸/扫码页不触发点选。"""
         prompt = self._has_words_any(page, VERIFY_CHOICE_PROMPT_WORDS)
         phone = self._has_words_any(page, VERIFY_PHONE_WORDS)
         device = self._has_words_any(page, VERIFY_DEVICE_WORDS)
         face = self._has_words_any(page, VERIFY_FACE_WORDS)
         options = sum(bool(x) for x in (phone, device, face))
-        return bool((prompt and options) or options >= 2)
+        # 某些抖音版本只显示“身份验证”和按钮文字，不显示“选择验证方式”提示。
+        # 直接命中三类可选入口也视为选择页，避免把旧登录二维码继续当二级二维码。
+        direct_words = (
+            "接收短信验证码", "通过短信验证", "使用短信验证", "手机短信验证",
+            "手机号验证", "手机号码验证", "发送短信验证", "发送短信验证码",
+        ) + VERIFY_DEVICE_PICK_TEXTS + VERIFY_FACE_PICK_TEXTS
+        direct_option = self._has_words_any(page, direct_words)
+        return bool((prompt and options >= 1) or options >= 2 or direct_option)
 
     def _login_step(self, page, context, cdp) -> bool:
         """授权流程的大脑：自动点开登录 -> 扒二维码 -> 扫完进二级验证。
@@ -4572,8 +4823,7 @@ class BrowserSession:
         if not self.verify_manual:
             if (self.verify_qr
                     or self._sms_submitted_at
-                    or (self.qr_seen_at and not self._sms_box(page)
-                        and self._is_verify_choice_page(page))
+                    or (self.qr_seen_at and self._is_verify_choice_page(page))
                     or self._has_words_any(page, VERIFY_STAGE_WORDS)):
                 with self.lock:
                     self.verify_manual = True
@@ -4605,6 +4855,35 @@ class BrowserSession:
 
         qr = self._find_qr(page)
 
+        # 方式选择页没有二级二维码时，不能沿用登录阶段缓存的旧二维码。
+        # 抖音有时会把登录二维码节点留在 DOM 里，用户已经进入身份验证
+        # 选择页后仍会被误判成二级二维码；此时清掉旧图，只处理选择按钮。
+        sms_box_now = self._sms_box(page)
+        choice_page_now = self._is_verify_choice_page(page)
+        if not choice_page_now and not sms_box_now:
+            identity_hint = self._has_words_any(
+                page, ("身份验证", "安全验证", "双重验证", "登录双重验证")
+            )
+            option_hint = self._has_words_any(
+                page, (
+                    "接收短信验证码", "通过短信验证", "使用短信验证",
+                    "手机短信验证", "手机号验证", "手机号码验证",
+                    "发送短信验证", "发送短信验证码",
+                ) + VERIFY_DEVICE_PICK_TEXTS + VERIFY_FACE_PICK_TEXTS
+            )
+            choice_page_now = bool(identity_hint and option_hint)
+        # 方式选择页优先于任何残留的二维码节点；这里的二维码一定是旧登录码，
+        # 只有没有方式选择页时才允许二维码进入二级验证展示。
+        if choice_page_now:
+            with self.lock:
+                self.verify_manual = True
+                self.qr_png = None
+                self.qr_hash = ""
+                self.qr_at = 0.0
+                self.verify_qr = False
+                self.verify_hint = ""
+            qr = None
+
         # 已选择手机号验证、但页面还需要再点一次「获取验证码」时，补点一次。
         # 二维码已直接出现时不碰页面上的任何验证选项，只负责把二维码展示出来。
         if (
@@ -4628,7 +4907,9 @@ class BrowserSession:
         # ---- 1c) 只有出现验证选项时才按手机号 -> 原设备 -> 人脸选择 ----
         # 直接出现二维码时绝不点任何选项，只把码展示出来；直接进入人脸验证页也不当作选择页。
         sms_box = self._sms_box(page)
-        choice_page = bool(not sms_box and self._is_verify_choice_page(page))
+        # 选择页可能还留着登录弹窗的隐藏验证码输入框；不能因此跳过方式选择。
+        # 只有明确出现二级验证标题/提示和验证入口时才会进入这里。
+        choice_page = bool(choice_page_now or self._is_verify_choice_page(page))
         if not choice_page and self._verify_pick_method:
             # 上一项已离开选择页，视为抖音已经切换到下一步；后续若再弹新选择页重新优先扫码。
             self._verify_pick_method = ""
@@ -4686,7 +4967,8 @@ class BrowserSession:
                     )
                 return False
 
-            if method == "phone" and now - self._verify_pick_at >= VERIFY_PHONE_FALLBACK_AFTER:
+            # 手机号方式已经出现验证码输入框时，保持手机号流程，不回退到手动操作。
+            if method == "phone" and not sms_box and now - self._verify_pick_at >= VERIFY_PHONE_FALLBACK_AFTER:
                 next_method, picked = self._click_verify_method(page, ("device", "face"))
                 self._sms_choice_at = 0.0
                 self._sms_send_at = 0.0
@@ -4781,7 +5063,7 @@ class BrowserSession:
                 digest = hashlib.sha256(raw).hexdigest()[:16]
                 # 页面上写着「用已登录的设备扫码」这类字 = 这是二级验证的码，不是登录码
                 verify_words = self._has_words_any(page, VERIFY_QR_WORDS)
-                is_verify_qr = bool(verify_words or self.verify_manual)
+                is_verify_qr = bool(verify_words or (self.verify_manual and not choice_page_now))
                 with self.lock:
                     fresh = digest != self.qr_hash
                     self.qr_png = raw
@@ -4898,8 +5180,8 @@ class BrowserSession:
             except Exception:
                 raw = None
             if isinstance(raw, dict):
-                msg = ("现在检测到的是普通登录验证码输入框，"
-                       "请继续使用抖音 App 扫码确认，或在手动授权画面里操作")
+                msg = ("现在页面上那个是「手机号登录」用的验证码框，"
+                       "还没到二级验证这一步")
             else:
                 msg = ("抖音页面上没找到验证码输入框（可能已经验证过了，"
                        "或者这一步不需要验证码）。状态没有变化")
@@ -5247,8 +5529,6 @@ class LoginChecker:
         self.forced = False
         self.started_at = 0.0
         self.ok = None
-        self.auto_check = False
-        self.auto_check_saved_at = ""
         # ---- 批量检测（管理页「检测所有账号」）----
         # 一台机器同时只能跑一个检测：检测要开 Chromium，内存只够一个（_ENGINE_LOCK 也是这个意思）。
         # 所以「批量」不是并发，而是排一个队、拿一个后台线程挨个跑完。
@@ -5342,25 +5622,23 @@ class LoginChecker:
             return "内存不够了（只剩 %d MB，检测要 %d MB），等%s结束再检测" % (left, need, who)
         return ""
 
-    def _begin(self, unique_id: str, message: str = "", auto_check: bool = False, auth_saved_at: str = ""):
+    def _begin(self, unique_id: str, message: str = ""):
         """真正开一轮检测：落状态 + 起线程，返回那个线程（批量检测要靠它 join）。"""
         with self.lock:
             self.unique_id = unique_id
             self.state = "running"
-            self.message = message or "正在检查已保存的登录状态…"
+            self.message = message or "正在用已保存的 Cookie 打开抖音聊天页…"
             self.png = None
             self.last_frame_at = 0.0
             self.forced = False
             self.ok = None
             self.started_at = time.time()
-            self.auto_check = bool(auto_check)
-            self.auto_check_saved_at = str(auth_saved_at or "")
         thread = threading.Thread(target=self._run, args=(unique_id,), daemon=True)
         self.thread = thread
         thread.start()
         return thread
 
-    def start(self, unique_id: str, auto_check: bool = False):
+    def start(self, unique_id: str):
         unique_id = str(unique_id or "").strip()
         # 和授权浏览器共用一把引擎锁：同时点只会有一个真的跑起来
         with _ENGINE_LOCK:
@@ -5373,18 +5651,8 @@ class LoginChecker:
             blocked = self._blocked_reason()
             if blocked:
                 return False, blocked
-            auth_saved_at = ""
-            if auto_check:
-                with _AUTH_AUTO_CHECK_LOCK:
-                    marker = (load_state().get("auth_auto_check") or {}).get(unique_id) or {}
-                    auth_saved_at = str(marker.get("saved_at") or "") if isinstance(marker, dict) else ""
-                if not auth_saved_at:
-                    return False, "授权状态已更新，自动检测任务已取消"
-            else:
-                with _AUTH_AUTO_CHECK_LOCK:
-                    save_state({"auth_auto_check": {unique_id: None}})
-            self._begin(unique_id, auto_check=auto_check, auth_saved_at=auth_saved_at)
-            return True, "登录检测已开始，不会发送消息" if auto_check else "开始检测，请稍候（大约 20-60 秒）"
+            self._begin(unique_id)
+            return True, "开始检测，请稍候（大约 20-60 秒）"
 
     # ------------------------------------------------------------------
     # 一键检测所有账号
@@ -5560,22 +5828,10 @@ class LoginChecker:
             record.update(extra)
         if not keep_old:
             save_state({"checks": {unique_id: record}})
-        auto_saved_at = ""
         with self.lock:
-            if self.auto_check:
-                auto_saved_at = self.auto_check_saved_at
-            self.auto_check = False
-            self.auto_check_saved_at = ""
             self.state = "done"
             self.ok = bool(ok)
             self.message = message
-        if auto_saved_at:
-            _auth_auto_check_update(
-                unique_id,
-                auto_saved_at,
-                "done" if ok else "failed",
-                message,
-            )
 
     def _targets_of(self, unique_id: str) -> list:
         for task in load_tasks():
@@ -5589,10 +5845,9 @@ class LoginChecker:
         stop_watchdog = threading.Event()
         deadline = time.time() + CHECK_TIMEOUT
         try:
-            storage_state = load_storage_state(unique_id)
-            cookies = storage_state.get("cookies", [])
+            cookies = load_cookies(unique_id)
             if not cookies:
-                self._finish(unique_id, False, "还没有保存登录状态，请先授权登录", {"reason": "no_cookie"})
+                self._finish(unique_id, False, "还没有保存 Cookie，请先授权登录", {"reason": "no_cookie"})
                 return
             has_session = any(
                 c.get("name") in ("sessionid", "sessionid_ss") and c.get("value") for c in cookies
@@ -5608,12 +5863,8 @@ class LoginChecker:
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-            context = instance.new_context(
-                viewport=VIEWPORT,
-                locale="zh-CN",
-                user_agent=USER_AGENT,
-                storage_state=storage_state,
-            )
+            context = instance.new_context(viewport=VIEWPORT, locale="zh-CN", user_agent=USER_AGENT)
+            context.add_cookies(cookies)
             page = context.new_page()
             cdp = context.new_cdp_session(page)
 
@@ -5668,7 +5919,7 @@ class LoginChecker:
                 if conversations:
                     break
                 with self.lock:
-                    self.message = "正在打开抖音聊天页核对登录状态…"
+                    self.message = "正在等待聊天页加载（如果弹了登录框，说明 Cookie 已失效）…"
 
             if conversations:
                 # 往下翻几屏，尽量把好友列表看全
@@ -5689,12 +5940,12 @@ class LoginChecker:
                 return
 
             if not conversations:
-                reason = "页面要求重新登录" if info.get("loginDialog") else "聊天列表没有加载出来"
-                hint = "登录状态可能已过期，请重新授权" if has_session else "请先完成抖音授权"
+                reason = "页面被登录弹窗挡住了" if info.get("loginDialog") else "页面里没有出现好友列表"
+                hint = "，Cookie 可能已过期，请重新授权登录" if has_session else "，请点「开始授权」用手机号登录"
                 self._finish(
                     unique_id,
                     False,
-                    "登录检测未通过：" + reason + "；" + hint + "后再试。",
+                    "未登录：" + reason + hint,
                     {"conversations": 0, "has_session": has_session, "titles": titles[:40]},
                 )
                 return
@@ -5745,13 +5996,10 @@ class TaskRunner:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.process = None
+        self._task_env_path = ""
         self.started_at = None
         self.handle = None
         self._lock_handle = None
-        self._timeout_timer = None
-        self.timed_out = False
-        self.timed_out_at = ""
-        self.run_id = ""
         self.only = ""   # 这次只跑哪个抖音号（空 = 全部）
 
     def _take_shared_lock(self) -> bool:
@@ -5794,158 +6042,129 @@ class TaskRunner:
         """发送任务退出后释放共享锁，供下一次手动运行使用。"""
         process = self.process
         if process is not None and process.poll() is not None:
-            if self._timeout_timer is not None:
-                self._timeout_timer.cancel()
-                self._timeout_timer = None
             self._release_shared_lock()
-            if self.handle is not None:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
+            self._cleanup_task_env_file()
 
-    def _terminate_process_tree(self, process) -> None:
-        """Stop the task and browser children spawned by main.py."""
-        if process is None or process.poll() is not None:
-            return
-        try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=10, check=False,
-                )
-            else:
-                # Account workers use their own session so one account can be
-                # timed out without ending the supervisor. When the whole run is
-                # force-stopped, also kill descendants across those sessions.
-                descendants = []
-                pending = [process.pid]
-                seen = set()
-                while pending:
-                    parent_pid = pending.pop()
-                    if parent_pid in seen:
-                        continue
-                    seen.add(parent_pid)
-                    children_path = Path("/proc/%d/task/%d/children" % (parent_pid, parent_pid))
-                    try:
-                        children = [int(pid) for pid in children_path.read_text().split()]
-                    except Exception:
-                        children = []
-                    descendants.extend(children)
-                    pending.extend(children)
-                for pid in reversed(descendants):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                os.killpg(process.pid, signal.SIGKILL)
-        except Exception:
+    def _cleanup_task_env_file(self) -> None:
+        path = self._task_env_path
+        self._task_env_path = ""
+        if path:
             try:
-                process.kill()
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 pass
-        try:
-            process.wait(timeout=5)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
-            try:
-                process.wait(timeout=2)
-            except Exception:
-                pass
-
-    def _record_aborted_results(self, run_id: str) -> None:
-        """Keep a manually force-stopped run from remaining marked as running forever."""
-        if not run_id:
-            return
-        try:
-            if not SEND_LOG.exists():
-                return
-            data = json.loads(SEND_LOG.read_text(encoding="utf-8"))
-            runs = data.get("runs") if isinstance(data, dict) else None
-            if not isinstance(runs, list):
-                return
-            changed = False
-            for run in runs:
-                if (not isinstance(run, dict)
-                        or str(run.get("runner_id") or "") != run_id
-                        or str(run.get("status") or "") != "running"):
-                    continue
-                run.update({
-                    "status": "failed",
-                    "reason": "aborted",
-                    "detail": "发送任务被强制停止，本账号本次运行未完成。",
-                    "finished_at": now_text(),
-                })
-                changed = True
-            if changed:
-                atomic_write(SEND_LOG, json.dumps(data, ensure_ascii=False, indent=1))
-        except Exception as error:
-            log_force("记录发送停止结果失败", type(error).__name__)
 
     def start(self, only: str = "", source: str = "手动"):
         """only 传抖音号时，只跑这一个账号（账号级登录的用户只能跑自己的）。"""
         # 同样共用引擎锁：不会出现"检测刚起来，发送任务也起来了"
         with _ENGINE_LOCK:
-            with self.lock:
-                self._reap()
-                if browser.running():
-                    return False, "授权浏览器还开着，请先点「停止」再运行，避免内存不够"
-                if checker.running():
-                    return False, "正在检测登录状态，请稍候"
-                if self.process is not None and self.process.poll() is None:
-                    return False, "已经有一个任务在运行了"
-                if not self._take_shared_lock():
-                    return False, "已有发送任务正在运行，等它结束后再试，避免同一个账号重复发送"
-                environment = os.environ.copy()
-                environment.update({k: v for k, v in parse_env().items() if v is not None})
-                environment.update(accounts_env())
-                self.run_id = uuid4().hex
-                environment["PANEL_RUN_ID"] = self.run_id
-                environment["PANEL_ACCOUNT_TIMEOUT_SECONDS"] = str(RUN_MAX_DURATION)
-                self.timed_out = False
-                self.timed_out_at = ""
-                if only:
-                    environment["RUN_ONLY_ACCOUNTS"] = str(only)
+            if browser.running():
+                return False, "授权浏览器还开着，请先点「停止」再运行，避免内存不够"
+            if checker.running():
+                return False, "正在检测登录状态，请稍候"
+            if self.process is not None and self.process.poll() is None:
+                return False, "已经有一个任务在运行了"
+            if not self._take_shared_lock():
+                return False, "已有发送任务正在运行，等它结束后再试，避免同一个账号重复发送"
+            environment = os.environ.copy()
+            for key in tuple(environment):
+                if key.upper() == "TASKS" or key.upper().startswith("COOKIES_"):
+                    environment.pop(key, None)
+            # Linux 对单个 execve 环境项有 128 KiB 上限。较大的抖音 Cookie
+            # 会让 Popen 直接报 E2BIG，worker 连启动都做不到。把 TASKS / COOKIES
+            # 单独通过匿名文件描述符传给 worker，普通配置仍留在环境变量里。
+            task_values = {}
+            for key, value in parse_env().items():
+                if value is None:
+                    continue
+                if key.upper() == "TASKS" or key.upper().startswith("COOKIES_"):
+                    task_values[key] = value
                 else:
-                    environment.pop("RUN_ONLY_ACCOUNTS", None)
-                self.only = str(only or "")
-                LOG_DIR.mkdir(parents=True, exist_ok=True)
-                self.handle = os.fdopen(
-                    os.open(RUN_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8"
-                )
-                self.handle.write(
-                    "\n===== %s %s运行（%s）=====\n" % (now_text(), source, only or "全部账号")
-                )
-                self.handle.flush()
-                process_options = {}
-                if os.name == "nt":
-                    process_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                else:
-                    process_options["start_new_session"] = True
+                    environment[key] = value
+            # 账号数据现在存在 accounts.json；它覆盖同名旧格式变量。
+            task_values.update(accounts_env())
+            task_env_bytes = json.dumps(
+                task_values, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            task_env_fd = None
+            task_env_path = ""
+            task_env_pass_fds = ()
+            if hasattr(os, "memfd_create"):
+                task_env_fd = os.memfd_create("douyinsparkflow-task-env")
                 try:
-                    self.process = subprocess.Popen(
-                        [sys.executable, "main.py"],
-                        cwd=str(BASE_DIR),
-                        env=environment,
-                        stdout=self.handle,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        **process_options,
-                    )
+                    view = memoryview(task_env_bytes)
+                    while view:
+                        written = os.write(task_env_fd, view)
+                        if written <= 0:
+                            raise OSError("写入发送配置失败")
+                        view = view[written:]
+                    os.lseek(task_env_fd, 0, os.SEEK_SET)
                 except Exception:
-                    self._release_shared_lock()
-                    if self.handle is not None:
-                        self.handle.close()
-                        self.handle = None
+                    os.close(task_env_fd)
                     raise
-                self.started_at = time.time()
-                self.timed_out = False
-                return True, "任务已启动；每个抖音号最多运行 10 分钟，超时后继续下一个账号"
+                environment["TASK_ENV_FD"] = str(task_env_fd)
+                task_env_pass_fds = (task_env_fd,)
+            else:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                task_env_fd, task_env_path = tempfile.mkstemp(
+                    prefix=".send-task-env-", suffix=".json", dir=str(LOG_DIR)
+                )
+                try:
+                    os.fchmod(task_env_fd, 0o600)
+                    with os.fdopen(task_env_fd, "wb") as handle:
+                        handle.write(task_env_bytes)
+                    task_env_fd = None
+                except Exception:
+                    if task_env_fd is not None:
+                        os.close(task_env_fd)
+                    try:
+                        os.unlink(task_env_path)
+                    except Exception:
+                        pass
+                    raise
+                environment["TASK_ENV_FILE"] = task_env_path
+            if only:
+                environment["RUN_ONLY_ACCOUNTS"] = str(only)
+            else:
+                environment.pop("RUN_ONLY_ACCOUNTS", None)
+            self.only = str(only or "")
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self.handle = os.fdopen(
+                os.open(RUN_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8"
+            )
+            self.handle.write(
+                "\n===== %s %s运行（%s）=====\n" % (now_text(), source, only or "全部账号")
+            )
+            self.handle.flush()
+            try:
+                self.process = subprocess.Popen(
+                    [sys.executable, "main.py"],
+                    cwd=str(BASE_DIR),
+                    env=environment,
+                    stdout=self.handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    **({"pass_fds": task_env_pass_fds} if task_env_pass_fds else {}),
+                )
+            except Exception:
+                self._release_shared_lock()
+                if task_env_path:
+                    try:
+                        os.unlink(task_env_path)
+                    except Exception:
+                        pass
+                raise
+            finally:
+                if task_env_fd is not None:
+                    try:
+                        os.close(task_env_fd)
+                    except Exception:
+                        pass
+            self._task_env_path = task_env_path
+            self.started_at = time.time()
+            return True, "任务已启动"
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -5963,30 +6182,20 @@ class TaskRunner:
                 "started_at": self.started_at,
                 "stale": stale,
                 "stuck": bool(running and stale is not None and stale > RUN_STUCK_AFTER),
-                "timed_out": bool(self.timed_out),
-                "timed_out_at": self.timed_out_at,
                 "only": self.only,
             }
 
     def kill(self) -> bool:
         """强杀面板里正在跑的发送任务（连同它的浏览器进程）。"""
         with self.lock:
+            self._release_shared_lock()
             process = self.process
             if process is None or process.poll() is not None:
-                self._reap()
                 return False
-            if self._timeout_timer is not None:
-                self._timeout_timer.cancel()
-                self._timeout_timer = None
-            self._terminate_process_tree(process)
-            self._record_aborted_results(self.run_id)
-            self._release_shared_lock()
-            if self.handle is not None:
-                try:
-                    self.handle.close()
-                except Exception:
-                    pass
-                self.handle = None
+            try:
+                process.kill()
+            except Exception:
+                pass
             self.started_at = None
             return True
 
@@ -6005,6 +6214,307 @@ def tail(path: Path, limit: int = 15000) -> str:
         return "读取日志失败：" + str(error)
 
 
+# 好友列表收集用的选择器：刻意与 core/tasks.py 里发送时用的那套保持一致，
+# 这样"这里列出来的名字"就是"发送时列表里找得到的名字"，两边不会打架。
+_FRIEND_CHAT_URL = "https://www.douyin.com/chat"
+_FRIEND_ITEM_SELECTOR = ".conversationConversationItemwrapper"
+_FRIEND_TITLE_SELECTOR = ".conversationConversationItemtitle"
+_FRIEND_LIST_SELECTOR = ".conversationConversationListwrapper"
+# 抖音的会话列表是**虚拟列表**（同时只有十来个节点），而且刚渲染那一瞬间，
+# 个人会话的标题位置放的是数字 uid，几秒后才换成昵称。
+# 数字标题是临时占位，绝不能当成好友名收进去 —— 否则列表里会混进
+# 3933396975227929 这类长数字，而且一旦记进 seen，同一行的真名就再也收不到。
+_FRIEND_PLACEHOLDER_TITLE = re.compile(r"^\d{5,}$")
+# 一次拉取的总时限。抖音偶尔会让导航/列表卡很久（实测出现过卡在 goto 好几分钟），
+# 没有总时限的话这个后台线程会一直占着"正在拉取"，后面谁都拉不了、界面一直转圈。
+_FRIEND_SCAN_MAX_SECONDS = 300
+
+
+class FriendScanner:
+    """把某个抖音号的好友列表拉下来（后台线程跑，前端轮询进度）。
+
+    只读：打开这个号自己的聊天页，把左边会话列表翻到底，收集标题。
+    不发送任何消息，也不改动账号配置 —— 勾选结果由前端写进「目标好友」后
+    走原有的保存配置流程落地。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.unique_id = ""
+        self.thread = None
+        self.error = ""
+        self.friends = []
+        self.targets = []
+        self.progress = ""
+        self.started_at = 0.0
+        self.finished_at = 0.0
+
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def snapshot(self) -> dict:
+        return {
+            "unique_id": self.unique_id,
+            "running": self.running(),
+            "error": self.error,
+            "friends": list(self.friends),
+            "targets": list(self.targets),
+            "progress": self.progress,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
+    def start(self, unique_id: str) -> tuple:
+        uid = str(unique_id or "").strip()
+        if not uid:
+            return False, "先填好抖音号再来拉好友"
+        if self.running():
+            if self.unique_id == uid:
+                return True, "正在拉取，稍等"
+            # 浏览器卡住时线程会一直挂在同步调用里，位子不能让永远占着 ——
+            # 超过总时限还有余量就作废旧任务，放行新的一次。
+            if time.time() - float(self.started_at or 0) > _FRIEND_SCAN_MAX_SECONDS + 120:
+                log_force("好友列表", "上一次拉取（%s）超时未结束，作废后重新开始" % self.unique_id)
+                self.error = "上一次拉取超时了，已作废"
+                self.finished_at = time.time()
+                self.thread = None
+            else:
+                return False, "已经有一个号在拉好友了，等它跑完再来"
+        busy = False
+        try:
+            busy = bool(runner.running())
+        except Exception:
+            busy = False
+        if busy:
+            # 2G 内存的小机器上两个 Chromium 会互相拖，别跟发送任务抢
+            return False, "发送任务正在跑，等它结束再拉好友"
+        storage = load_storage_state(uid)
+        if not storage:
+            return False, "这个号还没保存过可用的登录凭据，先扫码登录成功再拉"
+        with self._lock:
+            self.unique_id = uid
+            self.error = ""
+            self.friends = []
+            self.targets = []
+            self.progress = "正在打开抖音…"
+            self.started_at = time.time()
+            self.finished_at = 0.0
+        self.thread = threading.Thread(target=self._work, args=(uid, storage), daemon=True)
+        self.thread.start()
+        return True, "已开始拉取好友列表"
+
+    def _work(self, uid: str, storage: dict) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as error:
+            self.error = "拉取组件不可用：%s" % error
+            self.finished_at = time.time()
+            return
+        pw = None
+        browser = None
+        context = None
+        try:
+            pw = sync_playwright().start()
+            # 必须和发送/登录检测用同一套启动参数：容器里跑的是 root，
+            # 不带 --no-sandbox 时 Chromium 会直接拒绝启动（"Running as root
+            # without --no-sandbox is not supported"），功能当场失效。
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = browser.new_context(storage_state=storage)
+            context.set_default_navigation_timeout(120000)
+            context.set_default_timeout(120000)
+            page = context.new_page()
+            # goto 本身最多要等 120 秒，这段时间界面上只显示"正在打开抖音…"
+            # 太含糊，这里把话说清楚。
+            self.progress = "正在打开抖音聊天页…"
+            page.goto(_FRIEND_CHAT_URL, wait_until="domcontentloaded")
+
+            deadline = min(time.time() + 120, float(self.started_at or time.time()) + _FRIEND_SCAN_MAX_SECONDS)
+            ready = False
+            while time.time() < deadline:
+                try:
+                    if page.locator(_FRIEND_ITEM_SELECTOR).count() > 0:
+                        ready = True
+                        break
+                except Exception:
+                    pass
+                self.progress = "正在等待聊天页加载…"
+                time.sleep(1.0)
+            if not ready:
+                self.error = "聊天页 2 分钟内没渲染出会话列表，确认这个号还能正常登录"
+                return
+
+            names = self._collect(page, uid, deadline=float(self.started_at or time.time()) + _FRIEND_SCAN_MAX_SECONDS)
+            self.friends = names
+            account = load_accounts().get(uid) or {}
+            self.targets = [str(x) for x in (account.get("targets") or [])]
+            if names:
+                save_account(uid, friend_list=list(names), friend_list_at=now_text())
+            self.progress = ""
+        except Exception as error:
+            self.error = "拉取好友列表失败：%s" % error
+            try:
+                log_force(
+                    "好友列表",
+                    "账号 %s 拉取失败：%s\n%s" % (uid, error, traceback.format_exc()),
+                )
+            except Exception:
+                pass
+        finally:
+            self.finished_at = time.time()
+            for closer in (context, browser):
+                try:
+                    if closer is not None:
+                        closer.close()
+                except Exception:
+                    pass
+            try:
+                if pw is not None:
+                    pw.stop()
+            except Exception:
+                pass
+
+    def _collect(self, page, uid: str, deadline: float = 0.0) -> list:
+        names = []
+        seen = set()
+
+        def out_of_time():
+            """超过总时限就收工，别让界面无限转圈。"""
+            return bool(deadline) and time.time() > deadline
+
+        def titles_now():
+            """当前可见项的标题。抖音的会话列表是虚拟列表，同时只有十来个节点。"""
+            out = []
+            try:
+                rows = page.locator(_FRIEND_ITEM_SELECTOR).all()
+            except Exception:
+                return out
+            for row in rows:
+                try:
+                    title = row.locator(_FRIEND_TITLE_SELECTOR).inner_text().strip()
+                except Exception:
+                    continue
+                if title:
+                    out.append(title)
+            return out
+
+        def unfinished(titles):
+            """这一屏里还有没有"数字占位" —— 有就说明名字还没渲染完。"""
+            return any(_FRIEND_PLACEHOLDER_TITLE.match(t) for t in titles)
+
+        def settle_and_harvest(rounds=3, pause=0.6):
+            """等这一屏把昵称渲染出来再收；等不到也只收已经渲染好的部分。
+
+            数字占位一律跳过：它是抖音给个人会话用的临时 uid。
+            实测（ddy）：直接开滚会把 uid 当成好友名收进来，结果 49 条里混着
+            十几条 3933396975227929 这样的数字；先等名字渲染好再滚，
+            拿到的是干净的昵称、0 个数字。
+            """
+            titles = titles_now()
+            for _ in range(rounds):
+                if titles and not unfinished(titles):
+                    break
+                time.sleep(pause)
+                titles = titles_now()
+            for title in titles:
+                if _FRIEND_PLACEHOLDER_TITLE.match(title) or title in seen:
+                    continue
+                seen.add(title)
+                names.append(title)
+
+        def metrics():
+            """列表容器的 [scrollTop, scrollHeight, clientHeight]；取不到返回 None。"""
+            try:
+                return page.evaluate(
+                    """(sel) => {
+                        const box = document.querySelector(sel);
+                        if (!box) return null;
+                        return [box.scrollTop, box.scrollHeight, box.clientHeight];
+                    }""",
+                    _FRIEND_LIST_SELECTOR,
+                )
+            except Exception:
+                return None
+
+        def scroll_step():
+            """往下滚一屏，返回"这次是不是真的滚动了"。"""
+            try:
+                return bool(
+                    page.evaluate(
+                        """(sel) => {
+                            const box = document.querySelector(sel);
+                            if (!box) return false;
+                            const before = box.scrollTop;
+                            box.scrollTop = before + Math.max(200, box.clientHeight * 0.85);
+                            return box.scrollTop > before;
+                        }""",
+                        _FRIEND_LIST_SELECTOR,
+                    )
+                )
+            except Exception:
+                return False
+
+        # 先等第一屏把昵称渲染出来再开始滚，否则滚太快会把整屏 uid 收走
+        first_deadline = time.time() + 20
+        while time.time() < first_deadline and not out_of_time():
+            titles = titles_now()
+            if titles and not unfinished(titles):
+                break
+            self.progress = "正在等会话列表显示名字…"
+            time.sleep(0.6)
+
+        settle_and_harvest()
+        last = len(names)
+        stable = 0
+        for _ in range(300):
+            if out_of_time():
+                self.error = "拉取超时（抖音响应太慢），下面是已经拿到的 %d 个，可稍后重试" % len(names)
+                break
+            moved = scroll_step()
+            time.sleep(0.9)
+            settle_and_harvest()
+            self.progress = "已找到 %d 个好友…" % len(names)
+            if len(names) == last:
+                stable += 1
+            else:
+                stable = 0
+                last = len(names)
+            if stable < 3 or moved:
+                continue
+            # 看起来到底了。抖音是"滚到接近底部才继续加载/追加"，实测同一个号
+            # 有时拿到 45 个、有时 57 个 —— 少的那次就是在追加内容之前收工了。
+            # 所以这里不立刻结束，而是再盯一段时间：只要"名字变多"或者
+            # "列表整体变长"就继续滚，两边都没动静才算真的到底。
+            grew = False
+            for _ in range(15):
+                if out_of_time():
+                    break
+                time.sleep(1.0)
+                before_len = len(names)
+                before_metrics = metrics()
+                settle_and_harvest()
+                after_metrics = metrics()
+                longer = bool(
+                    before_metrics
+                    and after_metrics
+                    and len(after_metrics) == 3
+                    and len(before_metrics) == 3
+                    and after_metrics[1] > before_metrics[1]
+                )
+                if len(names) > before_len or longer:
+                    grew = True
+                    break
+            if not grew:
+                break
+            stable = 0
+            last = len(names)
+        return names
 class BrowserPool:
     """授权浏览器会话池：最多同时开 MAX_AUTH_SESSIONS 个，每个号一个独立会话。
 
@@ -6256,118 +6766,7 @@ def memory_available_mb():
 browser = BrowserPool(MAX_AUTH_SESSIONS)
 runner = TaskRunner()
 checker = LoginChecker()
-
-
-def _auth_auto_check_update(unique_id: str, saved_at: str, status: str, message: str) -> bool:
-    """只更新与这次授权相符的自动检测状态，避免旧线程覆盖新授权。"""
-    with _AUTH_AUTO_CHECK_LOCK:
-        state = load_state()
-        entries = state.get("auth_auto_check")
-        entries = entries if isinstance(entries, dict) else {}
-        current = entries.get(unique_id)
-        if not isinstance(current, dict) or str(current.get("saved_at") or "") != str(saved_at):
-            return False
-        current_status = str(current.get("state") or "pending")
-        rank = {"pending": 0, "running": 1, "needs_manual": 2, "done": 2, "failed": 2}
-        if current_status in ("needs_manual", "done", "failed") and status != current_status:
-            return False
-        if rank.get(current_status, 0) > rank.get(status, 0):
-            return False
-        updated = dict(current)
-        updated.update({"state": status, "message": str(message or ""), "updated_at": now_text()})
-        save_state({"auth_auto_check": {unique_id: updated}})
-        return True
-
-
-def _check_after_authorization(unique_id: str, saved_at: str) -> None:
-    """等授权浏览器释放资源后检测新会话；只读检查，不发送消息。"""
-    deadline = time.monotonic() + AUTH_AUTO_CHECK_WAIT_SECONDS
-    while time.monotonic() < deadline:
-        state = load_state()
-        entries = state.get("auth_auto_check")
-        entries = entries if isinstance(entries, dict) else {}
-        marker = entries.get(unique_id)
-        if not isinstance(marker, dict) or str(marker.get("saved_at") or "") != str(saved_at):
-            return
-        if str((state.get("saved_at") or {}).get(unique_id) or "") != str(saved_at):
-            return
-        if unique_id not in load_accounts():
-            return
-
-        previous = real_check(state.get("checks") or {}, unique_id)
-        if isinstance(previous, dict) and str(previous.get("at") or "") >= str(saved_at):
-            _auth_auto_check_update(
-                unique_id,
-                saved_at,
-                "done" if previous.get("ok") else "failed",
-                str(previous.get("message") or "登录检测已完成"),
-            )
-            return
-
-        check_state = checker.snapshot()
-        if check_state.get("running"):
-            if str(check_state.get("unique_id") or "") == unique_id:
-                _auth_auto_check_update(
-                    unique_id, saved_at, "running", "正在检查登录状态（不会发送消息）"
-                )
-            else:
-                _auth_auto_check_update(
-                    unique_id, saved_at, "pending", "另一项登录检测正在运行，完成后会自动检查此账号"
-                )
-            time.sleep(2)
-            continue
-
-        if browser.running():
-            _auth_auto_check_update(
-                unique_id, saved_at, "pending", "授权已保存，等其他授权窗口结束后自动检查"
-            )
-            time.sleep(2)
-            continue
-
-        ok, message = checker.start(unique_id, auto_check=True)
-        if ok:
-            _auth_auto_check_update(
-                unique_id, saved_at, "running", "正在检查登录状态（不会发送消息）"
-            )
-            return
-        if checker.running():
-            time.sleep(2)
-            continue
-        if "内存不够" in message or "正在检测" in message or "授权浏览器" in message:
-            _auth_auto_check_update(
-                unique_id, saved_at, "pending", "自动检测排队中：" + str(message)
-            )
-            time.sleep(2)
-            continue
-        _auth_auto_check_update(
-            unique_id,
-            saved_at,
-            "needs_manual",
-            "登录状态已保存，但自动检测未能启动：%s。可点「检测登录状态」重试；不会发送消息。"
-            % str(message),
-        )
-        return
-
-    _auth_auto_check_update(
-        unique_id,
-        saved_at,
-        "needs_manual",
-        "自动检测排队超过 5 分钟。登录状态已保存，请点「检测登录状态」重试；不会发送消息。",
-    )
-
-
-def _check_after_authorization_safely(unique_id: str, saved_at: str) -> None:
-    try:
-        _check_after_authorization(unique_id, saved_at)
-    except Exception as error:
-        log_force("授权后自动检测", "账号 %s：%s" % (unique_id, error))
-        _auth_auto_check_update(
-            unique_id,
-            saved_at,
-            "needs_manual",
-            "自动检测遇到问题：%s。登录状态已保存，请手动点「检测登录状态」重试；不会发送消息。"
-            % str(error),
-        )
+friend_scanner = FriendScanner()
 
 # 面板的 HTTP 服务器对象（优雅重启时要用它来 shutdown）
 SERVER = None
@@ -6403,28 +6802,7 @@ def accounts_env() -> dict:
         if not blob:
             continue
         try:
-            payload = json.loads(decrypt_text(blob))
-            if isinstance(payload, list):
-                payload = {
-                    "version": 2,
-                    "storage_state": _clean_storage_state({"cookies": payload, "origins": []}),
-                }
-            elif isinstance(payload, dict) and payload.get("version") == 2:
-                payload = {
-                    "version": 2,
-                    "storage_state": _clean_storage_state(payload.get("storage_state")),
-                }
-            elif isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
-                payload = {"version": 2, "storage_state": _clean_storage_state(payload)}
-            else:
-                continue
-            if not payload["storage_state"]["cookies"]:
-                continue
-            # utils.config currently applies unicode_escape to this legacy env
-            # value. Emit ASCII JSON and double its backslashes so that roundtrip
-            # preserves both non-ASCII localStorage values and escaped strings.
-            serialized = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-            cookies[cookie_key(uid)] = serialized.replace("\\", "\\\\")
+            cookies[cookie_key(uid)] = decrypt_text(blob)
         except Exception:
             continue
     env = {"TASKS": json.dumps(tasks, ensure_ascii=False, separators=(",", ":"))}
@@ -6721,8 +7099,6 @@ section.panel.on{display:block}
 @media(max-width:560px){.auth-rec-badge{font-size:8.5px;padding:1px 4px}.auth-recommend,.manual-screen-tip{padding:11px 12px;gap:8px}}
 .auth-download{display:inline-flex;align-items:center;justify-content:center;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink2);font-size:13px;text-decoration:none}
 .auth-download:hover{border-color:var(--brand-line);background:var(--brand-soft);color:var(--brand)}
-.auth-advanced{margin-top:10px;border-top:1px solid var(--line);padding-top:9px}
-.auth-advanced summary{color:var(--muted);font-size:13px;cursor:pointer}
 @media(max-width:900px){
   .app{grid-template-columns:1fr}
   .side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px}
@@ -6820,9 +7196,6 @@ section.panel.on{display:block}
 #guide li.done{background:var(--ok-bg);border-color:var(--ok-line)}
 #guide li.done .gdot{background:var(--ok);color:#fff;border-color:var(--ok)}
 #guide li.done .gtxt b{color:var(--ok)}
-#guide li.failed{background:var(--bad-bg);border-color:var(--bad-line)}
-#guide li.failed .gdot{background:var(--bad);color:#fff;border-color:var(--bad)}
-#guide li.failed .gtxt b{color:var(--bad)}
 #guide li.cur{background:var(--brand-soft);border-color:var(--brand-line);box-shadow:0 0 0 1px var(--brand-line) inset}
 #guide li.cur .gdot{background:linear-gradient(160deg,#ff8a2b,#ff3d2e);color:#fff;border-color:transparent}
 #guide li.cur .gtxt b{color:var(--brand-dark)}
@@ -6988,16 +7361,6 @@ html[data-theme] #themebtn{gap:5px;border-color:var(--line);color:var(--ink2);ba
 html[data-theme] #themebtn:hover{border-color:var(--brand-line);color:var(--brand)}
 @media(max-width:900px){html[data-theme] .side{box-shadow:0 -8px 26px rgba(30,8,12,.18)}html[data-theme] .top{background:var(--bg);border-bottom-color:var(--line);z-index:180}}
 @media(max-width:560px){.account-panel{width:min(270px,calc(100vw - 22px))}}
-.overview-heading{margin:4px 0 14px}.overview-heading h2{margin:0 0 4px}.overview-heading p{margin:0;color:var(--muted);font-size:13px}
-.overview-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0 0 15px}
-.overview-stat{min-width:0;padding:16px;border:1px solid var(--line);border-radius:14px;background:var(--card)}
-.overview-stat span{display:block;color:var(--muted);font-size:12px}.overview-stat b{display:block;margin-top:4px;font-size:24px;line-height:1.2}
-.overview-layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(240px,.8fr);gap:14px}
-.overview-run{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
-.overview-run:first-child{border-top:0}.overview-run-main{min-width:0}.overview-run-main b,.overview-run-main span{display:block;overflow-wrap:anywhere}.overview-run-main span{color:var(--muted);font-size:12px;margin-top:2px}
-.overview-shortcut{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 0;border-top:1px solid var(--line)}
-.overview-shortcut:first-of-type{border-top:0}.overview-shortcut span{color:var(--muted);font-size:13px}
-@media(max-width:720px){.overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-layout{grid-template-columns:1fr}}
 
 /* DouYinSparkFlow visual refresh: a calm operations desk with the spark red reserved for action. */
 html[data-theme="dark"]{
@@ -7094,92 +7457,84 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 @media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;height:auto;min-height:62px;width:100%;padding:4px 8px calc(5px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid var(--line);box-shadow:none}html[data-theme] nav{height:54px;gap:4px}html[data-theme] .nav{min-height:50px;border-radius:8px}html[data-theme] main.main{padding:12px 18px calc(92px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 17px;padding:9px 18px}}
 @media(max-width:720px){html[data-theme] .overview-layout{grid-template-columns:1fr}}
 @media(max-width:560px){html[data-theme] main.main{padding-right:12px;padding-left:12px}html[data-theme] .top{margin-right:-12px;margin-left:-12px;padding-right:12px;padding-left:12px;gap:7px}html[data-theme] .overview-heading h2{font-size:21px}html[data-theme] .overview-stats{padding:7px 0}html[data-theme] .overview-stat{padding:7px 12px}html[data-theme] .overview-stat:nth-child(2){border-right:0}html[data-theme] .overview-stat:nth-child(n+3){border-top:1px solid var(--line)}html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{padding:15px 14px}html[data-theme] .today-status{align-items:flex-start;padding:14px}html[data-theme] .opensource-promo{align-items:flex-start}html[data-theme] .opensource-promo a{margin-left:44px}}
-
-/* 2026-10 clean white console: restrained type, neutral navigation and clearly separated pages. */
-html[data-theme]{color-scheme:light;--brand:#171717;--brand-dark:#333;--brand-soft:#f5f5f5;--brand-line:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--line2:#f7f7f7;--bg:#fff;--card:#fff;--side:#fff;--side2:#f4f4f4;--sideink:#404040;--ok:#167344;--ok-bg:#eef7f1;--ok-line:#c7e6d1;--warn:#805700;--warn-bg:#fbf5e8;--warn-line:#ead6a8;--bad:#b4232f;--bad-bg:#fff1f1;--bad-line:#f0c4c7;--neu:#525252;--neu-bg:#f4f4f4;--neu-line:#e5e5e5}
-html[data-theme] body{background:#fff;color:#171717;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
-html[data-theme] .app{grid-template-columns:238px minmax(0,1fr);min-height:100vh;background:#fff}
-html[data-theme] .side{gap:18px;padding:22px 15px;background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}
-html[data-theme] .brand{gap:10px;padding:3px 8px 17px;border-bottom:1px solid #ededed}
-html[data-theme] .brand .logo{width:30px;height:30px;border-radius:9px;box-shadow:none;background-color:#171717}
-html[data-theme] .brand b{color:#171717;font-size:14px}
-html[data-theme] .brand i{color:#737373}
-html[data-theme] nav{gap:4px}
-html[data-theme] .nav{min-height:42px;padding:9px 11px;border:0;border-radius:8px;color:#525252;font-size:13px;font-weight:500}
-html[data-theme] .nav:hover:not(:disabled){background:#f7f7f7;color:#171717}
-html[data-theme] .nav.on{background:#f1f1f1;color:#171717;box-shadow:none;font-weight:700}
-html[data-theme] .nav.on .ni{background:#171717}
-html[data-theme] .side-foot{gap:8px;padding:14px 8px 0;border-top:1px solid #ededed}
-html[data-theme] .side-foot .who{color:#737373;font-weight:500}
-html[data-theme] .side-foot a{color:#525252;padding:5px 0;text-decoration:none}
-html[data-theme] .side-foot a:hover{color:#111;text-decoration:underline}
-html[data-theme] main.main{width:100%;max-width:1480px;margin:0 auto;padding:26px clamp(20px,4vw,56px) 56px}
-html[data-theme] .top{position:sticky;top:0;z-index:120;min-height:56px;margin:-26px calc(-1 * clamp(20px,4vw,56px)) 26px;padding:10px clamp(20px,4vw,56px);background:#fff;border-bottom:1px solid #ededed}
-html[data-theme] .top h1{font-size:21px;letter-spacing:-.45px}
+/* A calm, monochrome workspace with clear page separation. */
+html[data-theme]{color-scheme:light;--brand:#171717;--brand-dark:#333;--brand-soft:#f5f5f5;--brand-line:#dedede;--brand2:#333;--soft:#f5f5f5;--softline:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--line2:#f7f7f7;--bg:#fff;--card:#fff;--side:#fff;--side2:#f5f5f5;--sideink:#404040;--ok:#167344;--ok-bg:#eef7f1;--okbg:#eef7f1;--ok-line:#c7e6d1;--okline:#c7e6d1;--warn:#805700;--warn-bg:#fbf5e8;--warnbg:#fbf5e8;--warn-line:#ead6a8;--warnline:#ead6a8;--bad:#b4232f;--bad-bg:#fff1f1;--badbg:#fff1f1;--bad-line:#f0c4c7;--badline:#f0c4c7;--neu:#525252;--neu-bg:#f4f4f4;--neu-line:#e5e5e5}
+html{scroll-padding-top:78px;scroll-behavior:smooth}
+html[data-theme] body{background:#fff;color:#171717;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.55;-webkit-text-size-adjust:100%;font-variant-numeric:tabular-nums}
+html[data-theme] .app{grid-template-columns:244px minmax(0,1fr);min-height:100vh;background:#fff}
+html[data-theme] .side{position:sticky;top:0;display:flex;flex-direction:column;gap:18px;height:100vh;min-height:100vh;padding:24px 16px;background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}
+html[data-theme] .brand{gap:11px;padding:2px 9px 19px;border-bottom:1px solid #ededed}
+html[data-theme] .brand .logo{width:34px;height:34px;border-radius:10px;filter:grayscale(1);box-shadow:none}
+html[data-theme] .brand b{color:#171717;font-size:14px;letter-spacing:.1px}html[data-theme] .brand i{margin-top:2px;color:#737373;font-size:11px}
+html[data-theme] nav{display:flex;flex-direction:column;gap:5px}
+html[data-theme] .nav{display:flex;align-items:center;gap:10px;min-height:43px;padding:9px 11px;border:1px solid transparent;border-radius:8px;background:transparent;color:#525252;font-size:13px;text-align:left;transition:background-color .16s,border-color .16s,color .16s}
+html[data-theme] .nav:hover:not(:disabled){background:#f7f7f7;color:#171717}html[data-theme] .nav.on{background:#f1f1f1;border-color:#e5e5e5;color:#171717;box-shadow:none;font-weight:700}html[data-theme] .nav.on .ni{background:#171717}
+html[data-theme] .side-foot{display:flex;flex-direction:column;align-items:flex-start;gap:7px;margin-top:auto;padding:14px 9px 0;border-top:1px solid #ededed}
+html[data-theme] .side-foot .who{max-width:100%;color:#171717;font-size:12px;font-weight:600;overflow-wrap:anywhere}
+html[data-theme] .side-foot a{padding:3px 0;color:#737373;font-size:12px;text-decoration:none}html[data-theme] .side-foot a:hover{color:#171717;text-decoration:underline}
+html[data-theme] main.main{width:100%;max-width:1500px;margin:0 auto;padding:26px clamp(22px,4vw,58px) 60px}
+html[data-theme] .top{position:sticky;top:0;z-index:120;display:flex;align-items:center;min-height:60px;gap:12px;margin:-26px calc(-1 * clamp(22px,4vw,58px)) 26px;padding:10px clamp(22px,4vw,58px);background:#fff;border:0;border-bottom:1px solid #ededed;backdrop-filter:none}
+html[data-theme] .top h1{margin:0;font-size:20px;letter-spacing:-.35px;text-wrap:balance}html[data-theme] .head-mid{color:#737373;font-size:12px}html[data-theme] .head-mid b{color:#171717}
+html[data-theme] #main-content{scroll-margin-top:72px}
 html[data-theme] .panel{margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
-html[data-theme] .panel>section,html[data-theme] .panel .col>section,html[data-theme] .overview-layout>section{margin:0 0 15px;padding:20px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:none}
-html[data-theme] .panel>section h2,html[data-theme] .panel .col>section h2,html[data-theme] .overview-layout>section h2{font-size:15px;letter-spacing:-.15px}
-html[data-theme] .step{display:none}
-html[data-theme] #p-accounts .account-stack>section{margin:0 0 15px;padding:20px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:none}
-html[data-theme] .overview-heading{margin:0 0 17px}
-html[data-theme] .overview-heading h2{font-size:23px;letter-spacing:-.6px}
-html[data-theme] .overview-heading p{color:#737373}
-html[data-theme] .today-status{margin-bottom:14px;padding:17px 19px;border:1px solid #e5e5e5;border-left:3px solid #171717;border-radius:11px;background:#fff;box-shadow:none}
-html[data-theme] .today-mark{background:#171717;color:#fff}
-html[data-theme] .today-copy b{color:#171717}
-html[data-theme] .today-state{color:#262626}
-html[data-theme] .overview-stats{border:1px solid #e5e5e5;border-radius:11px;background:#fff}
-html[data-theme] .overview-stat{background:transparent}
-html[data-theme] .overview-stat b{color:#171717}
-html[data-theme] #todaySuccessCount{color:#167344}
-html[data-theme] .overview-layout{grid-template-columns:minmax(0,1.55fr) minmax(260px,.8fr);gap:15px}
-html[data-theme] .overview-layout>section{margin:0;padding:19px 20px}
-html[data-theme] .overview-layout>section:last-child{background:#fff}
-html[data-theme] .overview-run{border-top-color:#ededed}
-html[data-theme] .overview-run-main b{color:#171717}
-html[data-theme] .overview-run-main span,html[data-theme] .overview-shortcut span{color:#737373}
-html[data-theme] button{min-height:39px;border-radius:8px;background:#171717;color:#fff;font-weight:600;box-shadow:none}
-html[data-theme] button:hover:not(:disabled){background:#333}
-html[data-theme] button.sm{min-height:33px}
-html[data-theme] button.ghost,html[data-theme] button.sec{border:1px solid #dedede;background:#fff;color:#262626}
-html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){border-color:#bdbdbd;background:#f7f7f7;color:#111}
-html[data-theme] button.authtab{border:1px solid transparent;background:transparent;color:#404040;font-weight:500}
-html[data-theme] button.authtab.on{border-color:#171717;background:#171717;color:#fff;font-weight:700}
-html[data-theme] .authtabs{border-color:#e5e5e5;background:#f7f7f7}
-html[data-theme] .auth-recommend,html[data-theme] .manual-screen-tip{border-color:#e5e5e5;border-radius:10px;background:#fafafa}
-html[data-theme] input,html[data-theme] textarea,html[data-theme] select{border-color:#dedede;border-radius:8px;background:#fff;color:#171717}
-html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline:3px solid #e8e8e8;border-color:#999}
-html[data-theme] .badge{border-radius:7px}
-html[data-theme] .facts>div{background:#fafafa;border:1px solid #f0f0f0}
-html[data-theme] #guide,html[data-theme] #themebtn,html[data-theme] #hbstart,html[data-theme] .head-mid,html[data-theme] #accountMenu,html[data-theme] #adminlink,html[data-theme] #mobileapp,html[data-theme] #accountswitch{display:none!important}
-html[data-theme] details.adv,html[data-theme] .auth-advanced{display:none!important}
-html[data-theme] #statusbox .facts>div:not(:last-child),html[data-theme] #checkbar,html[data-theme] #checktime,html[data-theme] #checkresult{display:none!important}
-html[data-theme] #acctabs,html[data-theme] #task-acctabs{display:flex;flex-wrap:wrap;gap:8px}
-html[data-theme] #acctabs button,html[data-theme] #task-acctabs button{max-width:100%;border:1px solid #e5e5e5;border-radius:8px;background:#fff;color:#262626}
-html[data-theme] #acctabs button.on,html[data-theme] #task-acctabs button.on{border-color:#171717;background:#f4f4f4;color:#171717}
-html[data-theme] #acctabs button.on .dot,html[data-theme] #task-acctabs button.on .dot{background:#171717}
-html[data-theme] #task-account-card{padding:15px 18px}
-html[data-theme] .task-intro{margin:0 0 15px;padding:0 2px}
-html[data-theme] .task-intro h2{margin:0;font-size:23px}
-html[data-theme] .task-intro p{margin:5px 0 0;color:#737373;font-size:13px}
-html[data-theme] #cfgbox textarea{min-height:90px}
-html[data-theme] #runbox .row{margin-top:0}
-html[data-theme] #runbox button{min-width:150px}
-html[data-theme] .opensource-promo{display:none!important}
-html[data-theme] a{color:#262626}
-html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
-@media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;display:flex;flex-direction:column;align-items:stretch;gap:0;height:auto;min-height:0;width:100%;padding:4px 8px calc(6px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid #e8e8e8;box-shadow:0 -5px 18px rgba(0,0,0,.04)}html[data-theme] .brand{display:none}html[data-theme] nav{height:53px;gap:3px;overflow-x:auto;flex-wrap:nowrap}html[data-theme] .nav{flex:1 0 64px;min-width:64px;min-height:49px;padding:4px 3px;display:flex;flex-direction:column;justify-content:center;gap:3px;text-align:center;font-size:10.5px;white-space:nowrap}html[data-theme] .side-foot{display:flex;justify-content:space-between;align-items:center;height:28px;gap:10px;margin:0;border:0;padding:0 9px}html[data-theme] .side-foot .who{display:none}html[data-theme] main.main{padding:12px 18px calc(114px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 18px;padding:9px 18px}html[data-theme] .overview-layout{grid-template-columns:1fr}}
-@media(max-width:560px){html[data-theme] main.main{padding-right:13px;padding-left:13px}html[data-theme] .top{margin-right:-13px;margin-left:-13px;padding-right:13px;padding-left:13px}html[data-theme] .overview-stats{grid-template-columns:repeat(2,minmax(0,1fr))}html[data-theme] .overview-stat:nth-child(2){border-right:0}html[data-theme] .overview-stat:nth-child(n+3){border-top:1px solid var(--line)}html[data-theme] .panel>section,html[data-theme] .overview-layout>section{padding:15px 14px}html[data-theme] #task-account-card{padding:13px}}
-
+html[data-theme] .panel>section,html[data-theme] .panel .col>section{margin:0 0 14px;padding:20px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:none}
+html[data-theme] .panel h2{margin-top:0;color:#171717;font-size:15px;letter-spacing:-.15px;text-wrap:balance}
+html[data-theme] .view-heading,.overview-heading{margin:0 0 17px}.view-heading h2,.overview-heading h2{margin:0;font-size:24px;letter-spacing:-.65px}.view-heading p,.overview-heading p{margin:5px 0 0;color:#737373;font-size:13px}.view-heading .eyebrow,.overview-heading .eyebrow{margin:0 0 5px;color:#737373;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.task-view-heading{display:none}#p-accounts.task-mode .account-view-heading{display:none}#p-accounts.task-mode .task-view-heading{display:block}
+html[data-theme] .today-status{display:flex;align-items:center;gap:14px;min-height:86px;margin:0 0 17px;padding:18px 20px;border:1px solid #e5e5e5;border-left:3px solid #171717;border-radius:11px;background:#fff;box-shadow:none}
+html[data-theme] .today-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:#171717;color:#fff;font-size:17px;flex:none}
+html[data-theme] .today-copy{display:flex;min-width:0;flex:1;flex-direction:column;gap:3px}.today-copy b{color:#171717;font-size:16px;text-wrap:balance}.today-copy span{color:#737373;font-size:12px;overflow-wrap:anywhere}
+html[data-theme] .overview-shortcuts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+html[data-theme] .overview-shortcuts button{display:grid;grid-template-columns:34px minmax(0,1fr) 16px;align-items:center;gap:11px;min-height:100px;padding:16px;border:1px solid #e5e5e5;border-radius:11px;background:#fff;color:#171717;text-align:left;transition:background-color .16s,border-color .16s,transform .16s}
+html[data-theme] .overview-shortcuts button:hover{transform:translateY(-1px);border-color:#bdbdbd;background:#fafafa}
+html[data-theme] .shortcut-icon{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;background:#f1f1f1;color:#404040;font-size:11px;font-weight:700}
+html[data-theme] .overview-shortcuts button>span:nth-child(2){display:flex;min-width:0;flex-direction:column;gap:4px}.overview-shortcuts b{font-size:13px}.overview-shortcuts small{color:#737373;font-size:11.5px;font-weight:400;line-height:1.45}
+html[data-theme] #p-accounts:not(.task-mode) .cols{display:block}html[data-theme] #p-accounts:not(.task-mode) .cols>.col:first-child{display:flex;flex-direction:column;gap:14px}html[data-theme] #p-accounts:not(.task-mode) .cols>.col:last-child{display:none}
+html[data-theme] #p-accounts.task-mode .cols{display:block}html[data-theme] #p-accounts.task-mode .cols>.col{display:contents}html[data-theme] #p-accounts.task-mode #authbox,html[data-theme] #p-accounts.task-mode #statusbox{display:none}html[data-theme] #p-accounts.task-mode #acctbox{margin-bottom:14px;padding:11px 15px}html[data-theme] #p-accounts.task-mode #acctbox h2,html[data-theme] #p-accounts.task-mode #acctbox .row.space,html[data-theme] #p-accounts.task-mode #acctbox .grid{display:none}
+html[data-theme] #guide,html[data-theme] #themebtn,html[data-theme] #mobileapp,html[data-theme] #opensource-promo{display:none!important}html[data-theme] details.adv{display:none!important}
+html[data-theme] #statusbox .facts>div:not(:last-child){display:none}html[data-theme] #statusbox .row:has(#bcopycookie){display:none}
+html[data-theme] .frp{margin:9px 0 6px;padding:12px;border:1px solid #e5e5e5;border-radius:11px;background:#fafafa}
+html[data-theme] .frp button{min-height:34px;padding:7px 13px;background:#fff;color:#171717;border:1px solid #d4d4d4}
+html[data-theme] .frp button:hover:not(:disabled){background:#f1f1f1;border-color:#bdbdbd}
+html[data-theme] .frp .cnt{display:inline-block;margin:0 0 0 10px;vertical-align:middle}
+html[data-theme] .frp .cnt.frp-err{color:#b3261e}
+html[data-theme] .frp-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:6px;margin-top:11px;max-height:264px;overflow:auto}
+html[data-theme] .frp-item{display:flex;align-items:center;gap:8px;padding:7px 9px;border:1px solid #ececec;border-radius:8px;background:#fff;font-size:12.5px;color:#171717;cursor:pointer}
+html[data-theme] .frp-item:hover{border-color:#bdbdbd}
+html[data-theme] .frp-item.on{background:#f1f1f1;border-color:#cfcfcf}
+html[data-theme] .frp-item span{min-width:0;overflow-wrap:anywhere}
+html[data-theme] .frp-item input[type=checkbox]{flex:none;width:16px;height:16px;min-height:0;margin:0;padding:0;border:1px solid #cfcfcf;border-radius:4px;background:#fff;accent-color:#171717}
+html[data-theme] .authtabs{gap:5px;padding:5px;border:1px solid #e5e5e5;border-radius:9px;background:#f7f7f7}
+html[data-theme] button{min-height:40px;border:1px solid #171717;border-radius:8px;background:#171717;color:#fff;font:inherit;font-weight:600;box-shadow:none;touch-action:manipulation;transition:background-color .16s,border-color .16s,color .16s,transform .16s}
+html[data-theme] button:hover:not(:disabled){background:#333;border-color:#333}html[data-theme] button:active:not(:disabled){transform:translateY(1px)}html[data-theme] button.sm{min-height:34px;padding:7px 11px}
+html[data-theme] button.ghost,html[data-theme] button.sec{border-color:#dedede;background:#fff;color:#262626}html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){border-color:#bdbdbd;background:#f7f7f7;color:#111}
+html[data-theme] button.danger,html[data-theme] button.danger-ghost,html[data-theme] button.dghost{border-color:#b4232f;background:#fff;color:#a82034}html[data-theme] button.danger:hover:not(:disabled),html[data-theme] button.danger-ghost:hover:not(:disabled),html[data-theme] button.dghost:hover:not(:disabled){background:#fff1f1}
+html[data-theme] button.authtab{min-height:36px;border:1px solid transparent;background:transparent;color:#404040}html[data-theme] button.authtab.on{border-color:#171717;background:#171717;color:#fff}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{min-height:40px;border:1px solid #dedede;border-radius:8px;background:#fff;color:#171717;font:inherit;touch-action:manipulation}html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline:3px solid #e8e8e8;outline-offset:1px;border-color:#888}html[data-theme] select{color-scheme:light}
+html[data-theme] label{color:#404040}html[data-theme] .muted,html[data-theme] .hint,html[data-theme] .sub{color:#737373}
+html[data-theme] .badge,html[data-theme] .chip{border-radius:7px;font-variant-numeric:tabular-nums}
+html[data-theme] .facts>div{min-width:0;border-color:#ededed;background:#fafafa}html[data-theme] .kv,.account-menu,.overview-shortcuts{min-width:0}html[data-theme] .kv,html[data-theme] td,html[data-theme] pre{overflow-wrap:anywhere;word-break:break-word}
+html[data-theme] .tblwrap,html[data-theme] .reclist{max-width:100%;overscroll-behavior:contain}html[data-theme] #shotview,html[data-theme] #authwiz{overscroll-behavior:contain}html[data-theme] #shot{width:100%;height:auto;object-fit:contain}
+html[data-theme] .account-menu>summary{min-height:38px;border:1px solid #dedede;border-radius:8px;background:#fff;color:#404040}html[data-theme] .account-menu>summary:hover,html[data-theme] .account-menu[open]>summary{background:#f7f7f7;color:#171717}
+html[data-theme] .account-panel{border-color:#e5e5e5;border-radius:10px;background:#fff;box-shadow:0 14px 36px rgba(0,0,0,.12)}html[data-theme] .account-panel a{min-height:40px;color:#404040}html[data-theme] .account-panel a:hover{background:#f5f5f5;color:#171717}
+html[data-theme] #flash{z-index:200}html[data-theme] #flash .flash{border-radius:9px;box-shadow:0 8px 24px rgba(0,0,0,.1)}
+html[data-theme] a{color:#262626}html[data-theme] a:hover{color:#000}html[data-theme] :focus-visible{outline:3px solid #777!important;outline-offset:3px!important}
+html[data-theme] h1,html[data-theme] h2,html[data-theme] h3{scroll-margin-top:76px}
+.skip-link{position:fixed;top:8px;left:8px;z-index:500;transform:translateY(-160%);padding:9px 12px;border-radius:7px;background:#171717;color:#fff}.skip-link:focus{transform:translateY(0)}
+@media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;z-index:150;display:flex;flex-direction:column;gap:4px;width:100%;height:auto;min-height:0;padding:5px 8px calc(7px + env(safe-area-inset-bottom));border:0;border-top:1px solid #e8e8e8;background:#fff;box-shadow:0 -5px 18px rgba(0,0,0,.04)}html[data-theme] .brand{display:none}html[data-theme] nav{height:54px;flex-direction:row;gap:3px;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none}html[data-theme] nav::-webkit-scrollbar{display:none}html[data-theme] .nav{display:flex;flex:1 0 62px;flex-direction:column;justify-content:center;gap:3px;min-width:62px;min-height:49px;padding:4px 3px;border-radius:7px;font-size:10px;line-height:1.1;text-align:center;white-space:nowrap}html[data-theme] .side-foot{display:flex;flex-direction:row;justify-content:center;gap:20px;margin:0;padding:3px 0 0;border:0}html[data-theme] .side-foot .who{display:none}html[data-theme] .side-foot a{padding:3px 8px;font-size:11px}html[data-theme] main.main{padding:12px 18px calc(130px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 18px;padding:9px 18px}}
+@media(max-width:640px){html[data-theme] .overview-shortcuts{grid-template-columns:1fr}html[data-theme] .overview-shortcuts button{min-height:72px;padding:13px}html[data-theme] .overview-heading h2,html[data-theme] .view-heading h2{font-size:22px}html[data-theme] .today-status{align-items:flex-start;flex-wrap:wrap;padding:14px}html[data-theme] .today-status>button{margin-left:48px}html[data-theme] .panel>section,html[data-theme] .panel .col>section{padding:15px 14px}html[data-theme] .top{gap:8px}html[data-theme] .head-mid{display:none}html[data-theme] input,html[data-theme] textarea,html[data-theme] select{font-size:16px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 </style></head><body>
+<a class="skip-link" href="#main-content">跳到主要内容</a>
 <div class="app">
 <aside class="side">
 <div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>续火花控制台</i></div></div>
 <nav id="nav" aria-label="主菜单">
-<button class="nav on" type="button" data-go="overview"><i class="ni ni-overview"></i>概览</button>
-<button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音账户配置</button>
-<button class="nav" type="button" data-go="tasks"><i class="ni ni-records"></i>任务配置</button>
-<button class="nav" type="button" data-go="records"><i class="ni ni-records"></i>发送记录</button>
+<button class="nav on" type="button" data-go="overview"><i class="ni ni-overview" aria-hidden="true"></i>概览</button>
+<button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts" aria-hidden="true"></i>抖音账户</button>
+<button class="nav" type="button" data-go="tasks"><i class="ni ni-system" aria-hidden="true"></i>任务配置</button>
+<button class="nav" type="button" data-go="records"><i class="ni ni-records" aria-hidden="true"></i>发送记录</button>
+<button class="nav" type="button" data-go="me"><i class="ni ni-me" aria-hidden="true"></i>我的账号</button>
+<button class="nav" type="button" data-go="admin" id="navadmin" hidden><i class="ni ni-admin" aria-hidden="true"></i>管理</button>
 </nav>
 <div class="side-foot">
 <span class="who" id="whoami">—</span>
@@ -7187,11 +7542,11 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <a href="/logout">切换账号</a>
 </div>
 </aside>
-<main class="main">
+<main class="main" id="main-content" tabindex="-1">
 <div class="top">
 <h1 id="pageTitle">概览</h1>
 <span class="sp"></span>
-<span class="head-mid"><b id="headacct">—</b><span id="headbadge" class="badge n">读取中</span></span>
+<span class="head-mid"><b id="headacct">—</b><span id="headbadge" class="badge n" role="status" aria-live="polite">读取中…</span></span>
 <button id="hbstart" class="sm" type="button" aria-label="开始授权登录">开始授权</button>
 <button id="themebtn" class="ghost sm" type="button" aria-label="切换主题"><i class="ni ni-flame"></i><span class="theme-label"></span></button>
 <details class="account-menu" id="accountMenu">
@@ -7213,39 +7568,32 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <div id="msgs" hidden></div>
 <div id="relogin"></div>
 
-<!-- ===== 个人概览 ===== -->
-<section class="panel on" id="p-overview">
-<div class="overview-heading"><h2>今日概览</h2><p>查看今天的发送结果、账号数量和剩余服务时长。</p></div>
+<!-- ===== 概览 ===== -->
+<section class="panel on" id="p-overview" aria-labelledby="overview-title">
+<div class="overview-heading"><p class="eyebrow">今日状态</p><h2 id="overview-title">今天的发送情况</h2><p>查看任务结果，或直接进入账号与发送配置。</p></div>
 <section class="today-status" aria-live="polite" aria-label="今天的发送状态">
   <span class="today-mark" aria-hidden="true">✦</span>
-  <div class="today-copy"><b id="todaySendState">正在读取今天的发送状态</b><span id="todaySendMeta">发送结果会自动更新</span></div>
-  <button class="ghost sm" type="button" onclick="showPanel('records')">查看记录</button>
+  <div class="today-copy"><b id="todaySendState">正在读取今天的发送状态…</b><span id="todaySendMeta">发送结果会自动更新</span></div>
+  <button class="ghost sm" type="button" data-go="records">查看发送记录</button>
 </section>
-<div class="overview-stats" aria-label="今日任务统计">
-  <div class="overview-stat"><span>今日任务</span><b id="todayTaskCount">—</b></div>
-  <div class="overview-stat"><span>发送成功</span><b id="todaySuccessCount">—</b></div>
-  <div class="overview-stat"><span>部分成功</span><b id="todayPartialCount">—</b></div>
-  <div class="overview-stat"><span>未成功 / 进行中</span><b id="todayOtherCount">—</b></div>
+<div class="overview-shortcuts" aria-label="常用操作">
+  <button type="button" data-go="accounts"><span class="shortcut-icon" aria-hidden="true">01</span><span><b>抖音账户配置</b><small>授权登录并查看登录状态</small></span><span aria-hidden="true">→</span></button>
+  <button type="button" data-go="tasks"><span class="shortcut-icon" aria-hidden="true">02</span><span><b>任务配置</b><small>设置好友、发送时间与消息</small></span><span aria-hidden="true">→</span></button>
+  <button type="button" data-go="records"><span class="shortcut-icon" aria-hidden="true">03</span><span><b>发送记录</b><small>查看最近任务结果</small></span><span aria-hidden="true">→</span></button>
 </div>
-<div class="overview-layout">
-  <section><h2>今日发送结果</h2><div id="todayRunList" class="muted">读取中…</div></section>
-  <section><h2>账户概况</h2>
-    <div class="overview-shortcut"><div><b>抖音账号</b><br><span id="overviewAccountsMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('accounts')">账号设置</button></div>
-    <div class="overview-shortcut"><div><b>服务时长</b><br><span id="overviewSubscriptionMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('me')">管理时长</button></div>
-    <div class="overview-shortcut"><div><b>邮件通知</b><br><span id="overviewEmailMeta">读取中…</span></div><button class="ghost sm" type="button" onclick="showPanel('me')">通知设置</button></div>
-  </section>
-</div>
-</section><!-- /p-overview -->
+</section>
 
 <!-- ===== 抖音账户 ===== -->
 <section class="panel" id="p-accounts">
+<div class="view-heading account-view-heading"><p class="eyebrow">账号</p><h2>抖音账户配置</h2><p>管理账号授权与登录状态。</p></div>
+<div class="view-heading task-view-heading"><p class="eyebrow">任务</p><h2>任务配置</h2><p>选择抖音号，设置目标好友和发送时间。</p></div>
 <section id="guide" aria-label="新手引导">
 <div class="g-head"><b>新手引导</b>
 <span class="sp"></span><button id="gtoggle" class="ghost sm" type="button" aria-label="收起或展开新手引导">收起</button></div>
 <ol id="glist">
 <li id="g1" data-goto="acctbox"><span class="gdot">1</span><span class="gtxt"><b>建一个账号</b><span>只填一个「抖音号」当名字（例如 myspark），别的都能先空着</span></span><button class="sm gact" id="gact1" type="button">去填写</button></li>
-<li id="g2" data-goto="authbox"><span class="gdot">2</span><span class="gtxt"><b>授权登录</b><span>扫码或直接操作抖音登录页，成功后自动保存</span></span><button class="sm gact" id="gact2" type="button">去授权</button></li>
-<li id="g3" data-goto="statusbox"><span class="gdot">3</span><span class="gtxt"><b>确认登录状态</b><span>授权后自动检测；检测只查看状态，不会发送消息</span></span><button class="sm gact" id="gact3" type="button">查看状态</button></li>
+<li id="g2" data-goto="authbox"><span class="gdot">2</span><span class="gtxt"><b>授权登录</b><span>选择一种方式完成登录</span></span><button class="sm gact" id="gact2" type="button">去授权</button></li>
+<li id="g3" data-goto="statusbox"><span class="gdot">3</span><span class="gtxt"><b>确认登录成功</b><span>点「检测登录状态」，确认 Cookie 还能看到好友列表</span></span><button class="sm gact" id="gact3" type="button">去检测</button></li>
 <li id="g4" data-goto="cfgbox"><span class="gdot">4</span><span class="gtxt"><b>填目标好友</b><span>每行一个好友昵称；每行填写一个好友，运行时发送</span></span><button class="sm gact" id="gact4" type="button">去填写</button></li>
 <li id="g5" data-goto="runbox"><span class="gdot">5</span><span class="gtxt"><b>跑一次看看</b><span>点击运行开始发送，并查看本次结果</span></span><button class="sm gact" id="gact5" type="button">去运行</button></li>
 </ol>
@@ -7290,10 +7638,6 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <p id="authstate" class="muted">尚未启动</p>
 <p class="muted" id="qrowner" hidden><span id="qrownertext"></span><button class="sm sec" id="bswitchwho" type="button" hidden>切到这个账号</button></p>
 <p class="muted" id="qrdiag" role="status"></p>
-<div id="qrloginbox" class="auth-recommend" role="note">
-<span class="ar-icon" aria-hidden="true">✓</span>
-<div><strong>推荐使用二维码登录</strong><p>点「开始授权」后，等待二维码出现，再用抖音 App 扫描并确认。二级验证若提供手机号，先尝试手机号；没有或无法继续时再尝试原设备，最后才尝试人脸。若抖音直接显示验证二维码，会直接展示给你扫码，不会替你切换验证方式。</p></div>
-</div>
 <div id="qrarea" hidden style="margin-top:14px">
 <div class="row" style="align-items:flex-start">
 <img id="qrimg" alt="抖音登录二维码：用手机抖音 App 扫一扫" width="220" height="220" style="border:1px solid #e5e7eb;border-radius:10px;background:#fff;flex:0 0 auto">
@@ -7304,7 +7648,7 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <img id="verifyqrimg" alt="抖音二级验证二维码：用已登录的抖音 App 扫一扫" width="220" height="220" style="background:#fff;border:1px solid #e5e7eb;border-radius:10px">
 </div>
 <div id="shotwrap" hidden>
-<div id="manualscreentip" class="manual-screen-tip" role="note"><span class="tapmark" aria-hidden="true">👆</span><p><strong>下方画面可以直接点击</strong><span>点画面里的输入框、登录或验证按钮，就能直接操作抖音页面。</span></p></div>
+<div id="manualscreentip" class="manual-screen-tip" role="note" hidden><span class="tapmark" aria-hidden="true">👆</span><p><strong>下方画面可以直接点击</strong><span>点画面里的输入框、登录或验证按钮，就能直接操作抖音页面。</span></p></div>
 <div class="row"><div id="shotframe"><img id="shot" alt="点击这里操作抖音页面" hidden><span class="livetag" id="livetag" hidden></span></div></div>
 <p class="muted" id="shotempty" hidden>当前没有正在运行的浏览器画面：点「开始授权」或「检测登录状态」后，这里会实时显示。</p>
 <div id="anybox">
@@ -7343,10 +7687,10 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <div><div class="muted">账号</div><div class="kv" id="st_account">—</div></div>
 <div><div class="muted">抖音号</div><div class="kv" id="st_uid">—</div></div>
 <div><div class="muted">目标好友</div><div class="kv" id="st_targets">—</div></div>
-<div><div class="muted">登录状态</div><div class="kv" id="st_cookie">—</div></div>
+<div><div class="muted">Cookie</div><div class="kv" id="st_cookie">—</div></div>
 <div><div class="muted">登录成功时间</div><div class="kv" id="st_saved">—</div></div>
 </div>
-<details class="auth-advanced"><summary>高级选项：复制登录 Cookie</summary><p class="muted">仅在排查问题时使用。Cookie 等同登录凭证，请勿分享或发送给他人。</p><div class="row"><button class="sm" id="bcopycookie" type="button">复制该抖音号 Cookie</button><span class="muted" id="copystate" role="status"></span></div></details>
+<div class="row"><button class="sm" id="bcopycookie" type="button">复制该抖音号 Cookie</button><span class="muted" id="copystate" role="status"></span></div>
 <div class="row"><button id="bcheck" type="button">检测登录状态</button><span class="muted" id="checkstate" role="status"></span></div>
 <div class="progress" id="checkbar" hidden><i id="checkfill"></i></div>
 <p class="muted" id="checktime" role="status" hidden></p>
@@ -7362,6 +7706,11 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <label for="f_targets">目标好友 <span class="hint">每行一个，支持备注 / 昵称 / 抖音号；可以先空着，登录成功后再填</span></label>
 <textarea id="f_targets" name="targets" placeholder="每行写一个好友，例如：小明、老王" autocomplete="off"></textarea>
 <p class="cnt" id="cnt_targets">已填 0 个好友</p>
+<div class="frp" id="frpBox">
+<button type="button" class="sm" id="frpLoad">拉取好友</button>
+<span class="cnt" id="frpState" role="status">点「拉取好友」获取这个号的好友，勾选后自动填入上方</span>
+<div class="frp-list" id="frpList" hidden></div>
+</div>
 <label for="f_times">每天发送时间 <span class="hint">每行一个：09:00 固定；09:00-11:00 随机；09:00±30 前后随机</span></label>
 <textarea id="f_times" name="schedule_times" placeholder="09:00" style="min-height:64px" autocomplete="off"></textarea>
 <div class="facts" style="margin-top:8px">
@@ -7404,12 +7753,6 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 </div><!-- /cols -->
 </section><!-- /p-accounts -->
 
-<!-- ===== 任务配置 ===== -->
-<section class="panel" id="p-tasks">
-<div class="task-intro"><div><h2>任务配置</h2><p>选择要配置的抖音账号，设置目标好友和每日发送时间。</p></div></div>
-<section id="task-account-card"><h2>当前抖音账号</h2><div id="task-acctabs"></div></section>
-</section><!-- /p-tasks -->
-
 <!-- ===== 发送记录 ===== -->
 <section class="panel" id="p-records">
 <section id="sendsbox"><h2>发送记录 <span class="muted" id="sendssum"></span></h2>
@@ -7429,39 +7772,23 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 <div><div class="muted">名下的抖音号</div><div class="kv" id="me_ids">—</div></div>
 <div><div class="muted">登录状态</div><div class="kv" id="me_badge">—</div></div>
 </div>
-<p class="muted">绑定新抖音号：去「抖音账户」页点「＋ 新增账号」，填一个自己起的标识（例如 myspark），再用抖音 App 扫码授权。</p>
 </section>
 
 <section id="subscriptionbox">
 <h2>时长服务</h2>
-<p class="muted">新注册账号含 3 天试用期。兑换成功后，账户时长会延长；你可以随时手动运行发送任务。</p>
+<p class="muted">查看账户剩余时长，或兑换时长码。</p>
 <div class="facts" style="margin-top:12px">
 <div><div class="muted">当前状态</div><div class="kv" id="sub_status">读取中…</div></div>
 <div><div class="muted">剩余时长</div><div class="kv" id="sub_remaining">—</div></div>
 <div><div class="muted">到期时间</div><div class="kv" id="sub_expires">—</div></div>
-</div>
+ </div>
 <div class="row" style="margin-top:14px">
-<input id="sub_code" maxlength="19" autocomplete="off" placeholder="输入 DSF-XXXX-XXXX-XXXX 兑换码" aria-label="兑换码">
+<input id="sub_code" maxlength="19" autocomplete="off" placeholder="例如 DSF-XXXX-XXXX-XXXX…" aria-label="兑换码" inputmode="text" spellcheck="false">
 <button id="sub_redeem" type="button">兑换时长</button>
-</div>
-<p class="muted" id="sub_result" role="status"></p>
+ </div>
+<p class="muted" id="sub_result" role="status" aria-live="polite"></p>
 </section>
 
-<section id="email-notification-settings">
-<h2>邮件通知</h2>
-<p class="muted">SMTP 由站点管理员配置。填写自己的收件邮箱后，可先发送测试邮件；开启后，只会收到自己名下账号的发送结果。</p>
-<label for="email_address">收件邮箱</label>
-<input id="email_address" type="email" maxlength="254" autocomplete="email" inputmode="email" placeholder="name@example.com">
-<div class="row" style="margin-top:10px">
-<label class="row" for="email_enabled" style="margin:0"><input id="email_enabled" type="checkbox" style="width:auto">接收发送结果邮件</label>
-</div>
-<div class="row" style="margin-top:10px">
-<button id="email_save" type="button">保存邮件设置</button>
-<button id="email_test" class="ghost" type="button">发送测试邮件</button>
-<span class="muted" id="email_state" role="status" aria-live="polite">读取邮件通知设置…</span>
-</div>
-<p class="muted">邮件服务器未配置时，地址仍可保存，但不会发送通知。测试邮件发送成功只代表 SMTP 已接收，请同时检查垃圾邮件文件夹。</p>
-</section>
 
 <section id="mebox" hidden>
 <h2>修改登录密码</h2>
@@ -7476,7 +7803,7 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 </section><!-- /p-me -->
 
 <!-- ===== 管理（仅管理员可见）===== -->
-<section class="panel" id="p-admin" hidden>
+<section class="panel" id="p-admin">
 <section id="adminbox" hidden>
 <h2>用户管理</h2>
 <p class="muted">所有注册用户、绑定的抖音号、登录状态和剩余时长；可以改密码、分配抖音号、删用户。</p>
@@ -7544,29 +7871,6 @@ html[data-theme] :focus-visible{outline:3px solid #b8b8b8;outline-offset:2px}
 </div>
 <script>
 var $ = function(id){ return document.getElementById(id); };
-(function splitAccountAndTaskPages(){
-  var accountsPage = $('p-accounts'), tasksPage = $('p-tasks');
-  if(!accountsPage || !tasksPage){ return; }
-  var oldColumns = accountsPage.querySelector('.cols');
-  if(oldColumns){
-    var accountStack = document.createElement('div');
-    accountStack.className = 'account-stack';
-    accountsPage.insertBefore(accountStack, oldColumns);
-    ['acctbox','authbox','statusbox'].forEach(function(id){
-      var item = $(id); if(item){ accountStack.appendChild(item); }
-    });
-  }
-  // Move the task form before deleting its old two-column wrapper. Removing
-  // the wrapper first also removes cfgbox/runbox from the document, which
-  // caused the next event binding to throw and left every navigation button inert.
-  ['cfgbox','runbox'].forEach(function(id){
-    var item = $(id); if(item){ tasksPage.appendChild(item); }
-  });
-  if(oldColumns){ oldColumns.remove(); }
-  ['mobileapp','accountswitch'].forEach(function(id){
-    var item = $(id); if(item){ item.remove(); }
-  });
-})();
 // 每个普通用户最多能绑几个抖音号（由服务端注入，改后端常量这里跟着变）
 var MAX_PER_USER = __MAX_ACCOUNTS__;
 // 「还要等多久」说成人话（授权位被占满时用）
@@ -7577,7 +7881,6 @@ function fmtWait(sec){
   return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
 }
 var FLASH_SEQ = 0, FLASH_MAX = 3;
-var EMAIL_SAVED_ADDRESS = '';
 function closeFlash(id){
   var el = $(id);
   if(el && el.parentNode && el.parentNode.removeChild){ el.parentNode.removeChild(el); }
@@ -7734,7 +8037,6 @@ function renderAcctTabs(){
     var head = (nm && nm !== a.unique_id) ? (nm + '（' + a.unique_id + '）') : a.unique_id;
     var label = head + ' · ' + info.t;
     b.type = 'button';
-    b.setAttribute('data-account-uid', a.unique_id);
     if(!ADDING && CUR_ACCT && a.unique_id === CUR_ACCT.unique_id){ b.className = 'on'; }
     // 名字太长就省略号收尾，别把整行撑破；完整内容放在悬停提示和无障碍标签里
     b.innerHTML = '<span class="dot ' + info.c + '"></span><span class="nm">' + esc(label) + '</span>';
@@ -7744,19 +8046,6 @@ function renderAcctTabs(){
     box.appendChild(b);
   });
 }
-function mirrorTaskAccountTabs(){
-  var source = $('acctabs'), target = $('task-acctabs');
-  if(!source || !target){ return; }
-  target.innerHTML = source.innerHTML;
-  Array.prototype.forEach.call(target.querySelectorAll('button'), function(button){
-    var uid = button.getAttribute('data-account-uid');
-    button.onclick = uid ? function(){ selectAccount(uid); } : function(){ showPanel('accounts'); };
-  });
-}
-if(typeof MutationObserver !== 'undefined' && $('acctabs')){
-  new MutationObserver(mirrorTaskAccountTabs).observe($('acctabs'), {childList:true, subtree:true});
-}
-mirrorTaskAccountTabs();
 function fillForm(a){
   a = a || {};
   var f = $('cfg');
@@ -7770,16 +8059,16 @@ function fillForm(a){
   // 这三项跟着抖音号走：这个号自己设过就用它自己的，没设过就显示全局默认值
   var st = a.settings || {};
   f.message_template.value = (st.template !== undefined) ? st.template : (GLOBALCFG.message_template || '');
-  f.delay_min.value = '0';
-  f.delay_max.value = '0';
+  f.delay_min.value = (st.delay_min !== undefined) ? st.delay_min : (GLOBALCFG.delay_min === undefined ? '0' : GLOBALCFG.delay_min);
+  f.delay_max.value = (st.delay_max !== undefined) ? st.delay_max : (GLOBALCFG.delay_max === undefined ? '0' : GLOBALCFG.delay_max);
   f.hitokoto_types.value = (st.hitokoto_types !== undefined) ? st.hitokoto_types : (GLOBALCFG.hitokoto_types || '');
   f.tz.value = GLOBALCFG.tz || 'Asia/Shanghai';
   f.log_level.value = GLOBALCFG.log_level || 'INFO';
   // 「顺便设为新账号默认值」每次切号都复位，免得手一抖把默认值也改了
   if(f.save_global){ f.save_global.checked = false; }
   $('cfgstate').textContent = a.has_cookie
-    ? ('登录状态已保存' + (a.saved_at ? '（' + a.saved_at + '）' : ''))
-    : '这个账号还没有登录状态，点「开始授权」完成登录后会自动保存';
+    ? ('已保存 ' + a.cookie_count + ' 个 Cookie 项' + (a.saved_at ? '（' + a.saved_at + '）' : ''))
+    : '这个账号还没有 Cookie，用下面的「开始授权」登录后会自动写入';
   updateCounts();
   scheduleCheckLater();
 }
@@ -7830,8 +8119,9 @@ function applyRole(s){
     if(el){ el.disabled = !admin; el.title = admin ? '' : '所有账号共用的设置，只有管理员能改'; }
   });
   if($('gglobalwrap')){ $('gglobalwrap').hidden = !admin; }
-  // 独立管理员控制台保留在 /admin；主控制台不再提供内嵌管理页签
+  // 管理员才看得到进「管理控制台」的入口
   if($('adminlink')){ $('adminlink').hidden = !admin; }
+  if($('navadmin')){ $('navadmin').hidden = !admin; }
   if(!admin && typeof showPanel === 'function' && $('p-admin') && $('p-admin').className.indexOf('on') >= 0){
     // 换了个人登录 / 权限被收回：别把人晾在一个自己看不见的「管理」页上
     showPanel('accounts');
@@ -7872,20 +8162,6 @@ function applyRole(s){
     mbd.textContent = s.has_cookie ? '已授权（Cookie 可用）' : '未授权';
     mbd.style.color = s.has_cookie ? 'var(--ok)' : 'var(--muted)';
   }
-  var mail = s.email_notifications || {};
-  EMAIL_SAVED_ADDRESS = String(mail.address || '');
-  if($('email_address') && document.activeElement !== $('email_address')){
-    $('email_address').value = EMAIL_SAVED_ADDRESS;
-  }
-  if($('email_enabled') && document.activeElement !== $('email_enabled')){
-    $('email_enabled').checked = !!mail.enabled;
-  }
-  if($('email_state')){
-    $('email_state').textContent = !mail.smtp_configured
-      ? '邮件服务尚未配置，请联系站点管理员'
-      : (mail.enabled ? '已开启：发送结果将发到 ' + (mail.address || '')
-        : (mail.address ? '邮件通知已关闭' : '请填写并保存邮箱地址'));
-  }
   var mine = (s.my_ids || []).length;
   // 普通用户只能有 1 个抖音号：已经有一个了就别再让他点「新增账号」
   var addBtn = $('baddacct');
@@ -7898,7 +8174,7 @@ function applyRole(s){
     ? '这里改的是你自己的面板登录密码。要改别人的密码、分配抖音号，去左边「管理」页。'
     : (mine
       ? ('你名下的抖音号：' + (s.my_ids || []).join('、') + '（每个普通用户只能绑 1 个，想换号就先删掉再建新的）。')
-      : '还没绑定抖音号：去「抖音账户」点「＋ 新增账号」，只填一个自己起的标识（例如 myspark），再用抖音 App 扫码授权。');
+      : '还没绑定抖音号：去「抖音账户」点「＋ 新增账号」，只填一个自己起的标识（例如 myspark），再用手机号授权登录。');
   var f = $('cfg');
   f.username.readOnly = false;
   f.unique_id.readOnly = false;
@@ -8113,40 +8389,6 @@ $('mp_save').onclick = function(){
     if(r.ok){ $('mp_old').value = ''; $('mp_new').value = ''; $('mp_new2').value = ''; }
   });
 };
-if($('email_save')){
-  $('email_save').onclick = function(){
-    var address = ($('email_address').value || '').trim();
-    var enabled = !!$('email_enabled').checked;
-    $('email_save').disabled = true;
-    post('api/email/settings', {address: address, enabled: enabled}).then(function(r){
-      $('email_state').textContent = r.message || r.error || '';
-      $('email_state').style.color = r.ok ? 'var(--ok)' : 'var(--bad)';
-      flash(r.message || r.error || '', !!r.ok);
-      if(r.ok){
-        EMAIL_SAVED_ADDRESS = String((r.settings || {}).address || '');
-        $('email_address').value = EMAIL_SAVED_ADDRESS;
-        $('email_enabled').checked = !!((r.settings || {}).enabled);
-        refresh();
-      }
-    }).finally(function(){ $('email_save').disabled = false; });
-  };
-}
-if($('email_test')){
-  $('email_test').onclick = function(){
-    if(($('email_address').value || '').trim() !== EMAIL_SAVED_ADDRESS){
-      $('email_state').textContent = '请先保存当前邮箱，再发送测试邮件';
-      $('email_state').style.color = 'var(--warn)';
-      return;
-    }
-    $('email_test').disabled = true;
-    $('email_state').textContent = '正在发送测试邮件…';
-    post('api/email/test', {}).then(function(r){
-      $('email_state').textContent = r.message || r.error || '';
-      $('email_state').style.color = r.ok ? 'var(--ok)' : 'var(--bad)';
-      flash(r.message || r.error || '', !!r.ok);
-    }).finally(function(){ $('email_test').disabled = false; });
-  };
-}
 var SCHEDULE_CONFLICTS = [], scheduleCheckTimer = null, scheduleCheckAt = 0, scheduleCheckSignature = '', SCHEDULE_AUTOFILL = false;
 function scheduleCheckNow(force){
   var f = $('cfg');
@@ -8190,8 +8432,7 @@ function scheduleCheckLater(){
 }
 ['f_times','f_targets','f_dmax'].forEach(function(id){ var el = $(id); if(el){ el.addEventListener('input', function(){ if(id === 'f_times'){ SCHEDULE_AUTOFILL = false; } scheduleCheckLater(); }); } });
 
-var cfgForm = $('cfg');
-if(cfgForm){ cfgForm.addEventListener('submit', function(e){
+$('cfg').addEventListener('submit', function(e){
   e.preventDefault();
   var f = e.target, data = {};
   var sb = $('bsubmit');
@@ -8221,7 +8462,7 @@ if(cfgForm){ cfgForm.addEventListener('submit', function(e){
     } else { flash(r.error || '保存失败', false); }
     done();
   }).catch(function(){ flash('保存失败：网络断了或后端没响应，稍后再试', false); done(); });
-}); }
+});
 $('baddacct').onclick = function(){
   var f = $('cfg');
   var draft = (f.unique_id.value || '').trim();
@@ -8525,7 +8766,7 @@ function copyCookie(){
     })
     .catch(function(){ fail('复制出错了，稍后再试'); });
 }
-// ---- 二级验证短信只有一个入口：授权弹窗里的 wzcode 框（见 wzSubmit） ----
+// ---- 手机验证码只有一个入口：授权弹窗里的 wzcode 框（见 wzSubmit） ----
 var lastQrHash = '', lastWantSms = false, qrFailedHash = '';
 var wantManual = false, wantQr = true;
 function setAuthMethod(method){
@@ -8541,9 +8782,8 @@ function setAuthMethod(method){
   });
   if($('browserauthpane')){ $('browserauthpane').hidden = method === 'cookie'; }
   if($('cookieauthpane')){ $('cookieauthpane').hidden = method !== 'cookie'; }
-  if($('qrloginbox')){ $('qrloginbox').hidden = method !== 'qr'; }
   if($('manualauthnotice')){ $('manualauthnotice').hidden = !wantManual; }
-  if($('manualscreentip')){ $('manualscreentip').hidden = !wantManual; }
+  if($('manualscreentip')){ $('manualscreentip').hidden = true; }
   if(wantManual){
     shotManual = false;
     setShot(true);
@@ -8663,7 +8903,7 @@ function renderRelogin(info){
     + '<b>抖音登录已失效</b>（' + esc(info.at || '') + '，账号 ' + esc(info.account || '') + '）<br>'
     + esc(info.detail || '') + '<br>'
     + '<button id="breauth" type="button" style="margin-top:8px">重新授权登录</button>'
-    + '<span class="muted" style="margin-left:8px">点它打开抖音登录页，再用抖音 App 扫描二维码确认（也可以切「手动授权」直接操作画面）；3 分钟没人操作会自动关掉浏览器</span>'
+    + '<span class="muted" style="margin-left:8px">点它打开抖音登录页，用手机号收验证码登录即可（也可以切「手动授权」自己在画面里操作）；3 分钟没人操作会自动关掉浏览器</span>'
     + '</div>';
   var btn = $('breauth');
   if(btn){
@@ -8681,7 +8921,7 @@ function renderRelogin(info){
       if(!uid){ flash('先在「1 账号」里选好要授权的账号，再点「开始授权」', false); return; }
       if(hit){ selectAccount(hit.unique_id); }
       post('api/browser/start', {unique_id: uid, username: hit ? hit.username : ''}).then(function(r){
-        flash(r.ok ? ('已给「' + uid + '」启动授权，往下滚到第 2 步用抖音 App 扫码') : (r.error || '启动失败'), !!r.ok);
+        flash(r.ok ? ('已给「' + uid + '」启动授权，往下滚到第 2 步填手机号') : (r.error || '启动失败'), !!r.ok);
         if(r.ok){ $('authbox').scrollIntoView({behavior:'smooth', block:'start'}); }
       });
     };
@@ -8716,8 +8956,6 @@ function renderStatus(s){
     cur = CUR_ACCT || s;
   }
   var chk = realCheck(cur.check), ck = s.checker || {}, au = s.auth || {};
-  var autoCheck = (cur.auth_check && typeof cur.auth_check === 'object') ? cur.auth_check : {};
-  var autoCheckState = String(autoCheck.state || '');
   // 二级验证：抖音要求用已登录的设备扫码时，把抓到的二维码直接摆出来
   var vq = !!au.verify_qr, vqh = String(au.qr_hash || "");
   var vqBox = $("verifyqr");
@@ -8739,27 +8977,25 @@ function renderStatus(s){
   $('st_account').textContent = cur.username || '—';
   $('st_uid').textContent = cur.unique_id || '—';
   $('st_targets').textContent = (cur.targets && cur.targets.length) ? cur.targets.join('、') : '未填写';
-  $('st_cookie').textContent = cur.has_cookie ? '已保存' : '尚未授权';
+  $('st_cookie').textContent = cur.has_cookie
+    ? ('已保存 ' + cur.cookie_count + ' 项' + (cur.saved_at ? '（' + cur.saved_at + '）' : ''))
+    : '未保存';
   if($('st_saved')){ $('st_saved').textContent = cur.saved_at || '—'; }
   if($('savedat')){
     $('savedat').textContent = cur.saved_at ? ('登录成功时间：' + cur.saved_at) : '';
   }
 
 
-  if(cur._new){ badge('新账号：先填「抖音号」，再点「开始授权」扫码或手机号登录', 'n'); }
+  if(cur._new){ badge('新账号：填个「抖音号」，点下面「开始授权」就能用手机号登录', 'n'); }
   else if(runningThis){ badge('正在检测登录状态…', 'y'); }
-  else if(autoCheckState === 'pending'){ badge('登录已保存，正在排队检测…', 'y'); }
-  else if(autoCheckState === 'needs_manual'){ badge('登录已保存，需要手动检测', 'y'); }
   else if(chk && chk.ok && !ready){ badge('已登录（还没填「目标好友」，填完点「保存配置」后可以手动运行）', 'y'); }
   else if(chk && chk.ok){ badge('已登录 - ' + chk.at, 'g'); }
-  else if(chk && !chk.ok){ badge('登录检测未通过 - ' + chk.at, 'r'); }
-  else if(cur.has_cookie){ badge('登录状态已保存，等待检测', 'n'); }
+  else if(chk && !chk.ok){ badge('未登录 / Cookie 失效 - ' + chk.at, 'r'); }
+  else if(cur.has_cookie){ badge('已保存 Cookie，建议点下面「检测登录状态」确认一下', 'n'); }
   else { badge('尚未授权（还没有登录过）', 'n'); }
   // 顶部常驻的一句话状态：不滚屏也能看到当前账号登录没登录
   var hs = '未授权', hc = 'n';
   if(runningThis){ hs = '检测中'; hc = 'y'; }
-  else if(autoCheckState === 'pending'){ hs = '检测排队中'; hc = 'y'; }
-  else if(autoCheckState === 'needs_manual'){ hs = '待检测'; hc = 'y'; }
   else if(chk && chk.ok){ hs = ready ? '已登录' : '已登录 · 待填好友'; hc = ready ? 'g' : 'y'; }
   else if(chk && !chk.ok){ hs = '未登录'; hc = 'r'; }
   else if(cur.has_cookie){ hs = '待检测'; }
@@ -8771,10 +9007,6 @@ function renderStatus(s){
   else if(!runningThis && checkWasRunning){ checkWasRunning = false; finishCheck(); }
   if(runningThis && ck.stuck){
     $('checkstate').textContent = (ck.message || '') + '　超过 ' + Math.round((ck.frame_age||0)) + ' 秒没有新画面，可能卡住了，可以点下面「强制停止」';
-  } else if(autoCheckState === 'pending'){
-    $('checkstate').textContent = autoCheck.message || '授权已保存，正在等待自动检测…';
-  } else if(autoCheckState === 'needs_manual'){
-    $('checkstate').textContent = autoCheck.message || '自动检测没有启动，请手动重试。';
   } else {
     $('checkstate').textContent = runningThis ? ck.message : '';
   }
@@ -8783,8 +9015,7 @@ function renderStatus(s){
   if(au.running){ ckWhy = '授权浏览器开着，先点「停止」再检测'; }
   else if(ck.running && !runningThis){ ckWhy = '另一个账号正在检测，等它跑完'; }
   setBtn('bcheck', !!ckWhy, ckWhy ? ('暂时点不了：' + ckWhy) : '');
-  $('bcheck').textContent = runningThis ? '停止检测'
-    : (autoCheckState === 'pending' ? '立即检测' : '检测登录状态');
+  $('bcheck').textContent = runningThis ? '停止检测' : '检测登录状态';
   var noAccount = !s.is_admin && !(s.my_ids && s.my_ids.length);
   var runWhy = '';
   if(s.runner.running){ runWhy = '正在执行发送任务，等它跑完'; }
@@ -8805,15 +9036,11 @@ function renderStatus(s){
     if(chk.missing && chk.missing.length){
       html += '<div style="color:#b91c1c">没在前几屏看到的目标好友：' + chk.missing.map(esc).join('、') + '（可能需要手动往上/下翻一下）</div>';
     }
-  } else if(cur.has_cookie && autoCheckState === 'pending'){
-    html += '<div class="muted">' + esc(autoCheck.message || '登录状态已保存，正在等待自动检测。')
-         + ' 检测只会打开聊天页确认登录状态，不会发送消息。</div>';
-  } else if(cur.has_cookie && autoCheckState === 'needs_manual'){
-    html += '<div class="bad">' + esc(autoCheck.message || '自动检测未启动，请点上面的「检测登录状态」重试。') + '</div>';
   } else if(cur.has_cookie){
     // 有 Cookie、但从没真检测过：这是常态（扫码授权不等于是验过），
     // 说清楚 + 指个按钮，别让人以为号坏了
-    html += '<div class="muted">这个账号还没检测过。点上面的「检测登录状态」检查能否正常打开聊天页（约 20-60 秒，不会发送消息）。</div>';
+    html += '<div class="muted">这个号还没检测过。点上面的「检测登录状态」跑一遍，'
+         + '确认保存的 Cookie 现在还能不能发消息（大约 20-60 秒）。</div>';
   }
   $('checkresult').innerHTML = html;
   renderGuide(s, cur);
@@ -8830,75 +9057,30 @@ function renderSubscription(s){
 function renderTodaySend(s){
   var state = $('todaySendState'), meta = $('todaySendMeta');
   if(!state || !meta){ return; }
+  if(s && s.is_admin){
+    state.textContent = '今天的全站发送状态';
+    meta.textContent = '请在管理控制台的发送记录中查看';
+    return;
+  }
   var summary = s && s.today_send || {}, run = summary.record || null;
-  var runs = summary.runs || (run ? [run] : []);
   var date = String(summary.date || '今天');
-  var success = runs.filter(function(item){ return item.status === 'ok'; }).length;
-  var partial = runs.filter(function(item){ return item.status === 'partial'; }).length;
-  var other = Math.max(0, runs.length - success - partial);
-  if($('todayTaskCount')){ $('todayTaskCount').textContent = String(runs.length); }
-  if($('todaySuccessCount')){ $('todaySuccessCount').textContent = String(success); }
-  if($('todayPartialCount')){ $('todayPartialCount').textContent = String(partial); }
-  if($('todayOtherCount')){ $('todayOtherCount').textContent = String(other); }
-  var accounts = (s && s.accounts) || [];
-  if($('overviewAccountsMeta')){
-    $('overviewAccountsMeta').textContent = s && s.is_admin
-      ? ('管理员可见全站 ' + accounts.length + ' 个账号')
-      : ('你名下 ' + accounts.length + ' 个账号');
-  }
-  var sub = (s && s.subscription) || {};
-  if($('overviewSubscriptionMeta')){
-    $('overviewSubscriptionMeta').textContent = sub.unlimited ? '永久有效'
-      : (sub.remaining_text || (sub.status === 'trial' ? '试用期' : '暂无有效时长'));
-  }
-  var mail = (s && s.email_notifications) || {};
-  if($('overviewEmailMeta')){
-    $('overviewEmailMeta').textContent = !mail.smtp_configured ? '邮件服务尚未配置'
-      : (mail.enabled ? ('已开启 · ' + (mail.address || '未填写邮箱')) : '尚未开启');
-  }
-  var runner = (s && s.runner) || {};
   state.className = 'today-state';
-  if(runner.running){
-    state.textContent = '发送任务进行中';
-    state.classList.add('pending');
-    meta.textContent = '每个抖音号最多运行 10 分钟；超时只停止该号，随后继续其他账号';
-  } else if(!run){
-    state.textContent = s && s.is_admin ? '今天还没有全站发送记录' : '今天还没有发送记录';
+  if(!run){
+    state.textContent = '今天还没有发送记录';
     meta.textContent = date + ' · 手动运行发送任务后会更新';
-  } else {
-    var labels = {
-      ok:['今天发送成功','success'], partial:['今天部分发送成功','partial'],
-      failed:['今天发送失败','failed'], no_login:['今天未发送：登录已失效','failed'],
-      error:['今天任务出错','failed'], queued:['发送任务排队中','pending'],
-      queue_timeout:['发送排队超时','failed'], skipped:['今天的发送已跳过','pending'],
-      running:['发送任务进行中','pending'], no_friend:['未找到目标好友','failed'],
-      timed_out:['此抖音号超过 10 分钟，已停止','failed']
-    };
-    var result = labels[run.status] || ['今天任务状态：' + (run.status || '未知'),'pending'];
-    state.textContent = result[0];
-    state.classList.add(result[1]);
-    meta.textContent = [run.account, run.at, run.detail].filter(Boolean).join(' · ');
+    return;
   }
-  var list = $('todayRunList');
-  if(list){
-    if(!runs.length){
-      list.innerHTML = runner.running ? '<div class="muted">本次任务正在执行，完成后会显示结果。</div>'
-        : '<div class="muted">' + esc(s && s.is_admin ? '今天还没有全站发送记录' : '今天还没有发送记录') + '</div>';
-    } else {
-      var labels = {
-        ok:['发送成功','g'], partial:['部分成功','y'], failed:['发送失败','r'],
-        no_login:['登录失效','r'], error:['任务出错','r'], no_friend:['未找到好友','r'],
-        queued:['排队中','y'], queue_timeout:['排队超时','r'], skipped:['已跳过','n'], running:['进行中','y'],
-        timed_out:['此账号超时（其他账号继续）','r']
-      };
-      list.innerHTML = runs.slice(0, 8).map(function(item){
-        var info = labels[item.status] || [item.status || '未知','n'];
-        return '<div class="overview-run"><div class="overview-run-main"><b>' + esc(item.account || '抖音账号')
-          + '</b><span>' + esc([item.at, item.detail].filter(Boolean).join(' · '))
-          + '</span></div>' + tagHtml(info[0], info[1]) + '</div>';
-      }).join('');
-    }
-  }
+  var labels = {
+    ok:['今天发送成功','success'], partial:['今天部分发送成功','partial'],
+    failed:['今天发送失败','failed'], no_login:['今天未发送：登录已失效','failed'],
+    error:['今天任务出错','failed'], queued:['发送任务排队中','pending'],
+    queue_timeout:['发送排队超时','failed'], skipped:['今天的发送已跳过','pending'],
+    running:['发送任务进行中','pending'], no_friend:['未找到目标好友','failed']
+  };
+  var result = labels[run.status] || ['今天任务状态：' + (run.status || '未知'),'pending'];
+  state.textContent = result[0];
+  state.classList.add(result[1]);
+  meta.textContent = [run.account, run.at, run.detail].filter(Boolean).join(' · ');
 }
 if($('sub_redeem')){
   $('sub_redeem').onclick = function(){
@@ -8926,29 +9108,43 @@ function guideSetOpen(open){
   try { window.localStorage.setItem(GUIDE_OPEN_KEY, open ? '1' : '0'); } catch(e){}
 }
 // ---- 左侧导航：切换内容面板 ----
-var PANELS = {overview:'概览', accounts:'抖音账户配置', tasks:'任务配置', records:'发送记录', me:'我的账号'};
-var PANEL_ORDER = ['overview', 'accounts', 'tasks', 'records', 'me'];
+var PANELS = {overview:'概览', accounts:'抖音账户配置', tasks:'任务配置', records:'发送记录', me:'我的账号', admin:'管理'};
+var PANEL_ORDER = ['overview', 'accounts', 'records', 'me', 'admin'];
 function showPanel(go){
+  if(go === 'logs'){ go = 'records'; }
+  if(go === 'subscription'){ go = 'me'; }
   if(PANELS[go] === undefined){ go = 'overview'; }
+  var panelName = go === 'tasks' ? 'accounts' : go;
   PANEL_ORDER.forEach(function(k){
     var p = $('p-' + k);
-    if(p){ if(k === go){ p.classList.add('on'); } else { p.classList.remove('on'); } }
+    if(p){ if(k === panelName){ p.classList.add('on'); } else { p.classList.remove('on'); } }
   });
+  var accountPanel = $('p-accounts');
+  if(accountPanel){ accountPanel.classList.toggle('task-mode', go === 'tasks'); }
   Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b){
     if(b.getAttribute('data-go') === go){ b.classList.add('on'); } else { b.classList.remove('on'); }
   });
   var t = $('pageTitle');
   if(t){ t.textContent = PANELS[go]; }
   try { window.localStorage.setItem('panel:go', go); } catch(e){}
+  // 切到「日志」页时直接翻到最下面（默认就要看到最新几行）
+  if(go === 'logs' && typeof refreshLogs === 'function'){ refreshLogs(true); }
+  // 切到「管理」页时立刻拉一次用户列表（原先是展开折叠块触发的）
+  if(go === 'admin' && LAST_STATUS){
+    USERS_FORCE = true;
+    if(typeof renderUsers === 'function'){ renderUsers(LAST_STATUS); }
+  }
 }
 function initNav(){
-  Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b){
-    b.onclick = function(){ showPanel(b.getAttribute('data-go')); };
+  Array.prototype.forEach.call(document.querySelectorAll('[data-go]'), function(b){
+    b.addEventListener('click', function(){ showPanel(b.getAttribute('data-go')); });
   });
   var saved = '';
   try { saved = window.localStorage.getItem('panel:go') || ''; } catch(e){}
-  // 兼容旧版菜单状态；「我的账号」从概览入口打开，不放在主导航。
-  if(saved === 'admin' || saved === 'me' || ['overview','accounts','tasks','records'].indexOf(saved) < 0){ saved = ''; }
+  if(saved === 'logs'){ saved = 'records'; }
+  if(saved === 'subscription'){ saved = 'me'; }
+  // 「管理」对普通用户是隐藏的：上次退出时停在那一页的话，回落到抖音账户
+  if(saved === 'admin' && $('navadmin') && $('navadmin').hidden){ saved = 'overview'; }
   showPanel(saved || 'overview');
 }
 function guideScrollTo(id){
@@ -8981,32 +9177,20 @@ function renderGuide(s, cur){
   var authed = hasUid && !!cur.has_cookie && (!chk || chk.ok !== false);
   var checked = !!(chk && chk.ok);
   var ready = !!(cur.ready || (cur.targets && cur.targets.length));
-  var exitCode = s && s.runner ? s.runner.returncode : null;
-  var hasRun = exitCode !== null && exitCode !== undefined;
-  var runSucceeded = hasRun && Number(exitCode) === 0;
-  var runFailed = hasRun && !runSucceeded;
-  var done = [hasUid, authed, checked, ready, runSucceeded];
+  var ran = !!(s && s.runner && s.runner.returncode !== null && s.runner.returncode !== undefined);
+  var done = [hasUid, authed, checked, ready, ran];
   var current = -1;
   for(var i = 0; i < done.length; i++){ if(!done[i]){ current = i; break; } }
   for(var k = 0; k < done.length; k++){
     var li = $('g' + (k + 1));
     if(li){
-      var failed = k === 4 && runFailed;
-      li.className = done[k] ? 'done' : (failed ? 'failed' : (k === current ? 'cur' : ''));
+      li.className = done[k] ? 'done' : (k === current ? 'cur' : '');
       var dot = li.querySelector ? li.querySelector('.gdot') : null;
-      if(dot){ dot.textContent = done[k] ? '✓' : (failed ? '!' : String(k + 1)); }
+      if(dot){ dot.textContent = done[k] ? '✓' : String(k + 1); }
     }
     var act = $('gact' + (k + 1));
     if(act){ act.hidden = (k !== current); }
   }
-  var g3act = $('gact3');
-  if(g3act && current === 2){
-    var autoState = String((cur.auth_check && cur.auth_check.state) || '');
-    g3act.textContent = (autoState === 'pending' || autoState === 'running')
-      ? '查看状态' : (cur.has_cookie && !checked ? '手动检测' : '查看状态');
-  }
-  var g5act = $('gact5');
-  if(g5act){ g5act.textContent = runFailed ? '查看运行错误' : '去运行'; }
 }
 function guideAction(step){
   if(step === 1 || step === 4){
@@ -9016,12 +9200,7 @@ function guideAction(step){
     return;
   }
   if(step === 2){ guideScrollTo('authbox'); if($('bstart') && !$('bstart').disabled){ $('bstart').click(); } return; }
-  if(step === 3){
-    guideScrollTo('statusbox');
-    var autoState = String((CUR_ACCT && CUR_ACCT.auth_check && CUR_ACCT.auth_check.state) || '');
-    if(autoState !== 'pending' && autoState !== 'running' && $('bcheck') && !$('bcheck').disabled){ $('bcheck').click(); }
-    return;
-  }
+  if(step === 3){ guideScrollTo('statusbox'); if($('bcheck') && !$('bcheck').disabled){ $('bcheck').click(); } return; }
   if(step === 5){ guideScrollTo('runbox'); if($('brun') && !$('brun').disabled){ $('brun').click(); } return; }
 }
 (function(){
@@ -9230,7 +9409,7 @@ function renderWizard(au, lv, sr){
   if(WZ.open && WZ.auto && act !== 'sms' && act !== 'done'){ wizardHide(); }
   if(act === 'scan'){
     var stip = $('wzscantip');
-    // 验证入口仅在页面显示方式选择时按手机号、原设备、人脸依次尝试；实际核验由用户完成。
+    // 二级验证这一档是「手动验证」：面板不替你操作，得你自己在那块可点画面里弄。
     // 画面和通用输入框都在主界面上（被这个弹窗盖着看不见），所以这里给说明 + 一个按钮。
     // 手动模式下 #wzmanualtip 已经把话说全了，上面那行状态就别再重复一遍（两段几乎一样的
     // 话叠在一起，用户会以为出了什么事）。
@@ -9246,9 +9425,10 @@ function renderWizard(au, lv, sr){
     if(au.manual){
       var mnt = $('wzmanualtip');
       if(mnt){
-        mnt.textContent = '抖音要求二级验证：若页面提供方式选择，我会依次尝试手机号、原设备、人脸。'
-          + '若直接出现二维码，我只展示二维码，不切换方式。扫码或其他身份核验请按抖音 App 提示亲自完成。'
-          + '下面画面可以直接点击，需要输入时用主界面下方的输入框。登录成功后会自动收起。';
+        mnt.textContent = '抖音要求二级验证，这一步得你自己来：上面那块画面可以直接点 —— '
+          + '点「用原设备扫码」或者人脸都行；要打字就用主界面画面下面那个通用输入框，'
+          + '填完点「提交」。我同时会帮你点「用原设备扫码」、把二维码摆出来；'
+          + '登录成功我会自动把它收起来。';
       }
     }
   }
@@ -9622,7 +9802,8 @@ function refresh(){
       $('qrimg').removeAttribute('src');
     }
     if($('manualscreentip')){
-      $('manualscreentip').hidden = !(wantManual || qrFallback || !!au.manual);
+      // 先隐藏提示，等下面确实拿到一张实时画面后再显示，避免空画面时提前弹出。
+      $('manualscreentip').hidden = true;
       var manualTipTitle = $('manualscreentip').querySelector('strong');
       if(manualTipTitle){
         manualTipTitle.textContent = au.manual
@@ -9689,7 +9870,7 @@ function refresh(){
     }
     var rs = $('runstate');
     rs.textContent = s.runner.running
-      ? ('运行中…每个抖音号上限 10 分钟' + (s.runner.stuck ? '；超过 3 分钟没有新日志，可能卡住了，可点「强制停止」' : ''))
+      ? ('运行中…' + (s.runner.stuck ? '　超过 3 分钟没有新日志，可能卡住了，可以点下面的「强制停止」' : ''))
       : (s.runner.returncode === null ? '尚未运行' : ('上次退出码 ' + s.runner.returncode));
   setBtn('bstart', au.running || !!ck2.running);
   if($('hbstart')){ $('hbstart').disabled = $('bstart').disabled; $('hbstart').title = $('bstart').title; }
@@ -9726,7 +9907,7 @@ function refresh(){
       : '';
     if(lv.has_image || au.has_image){
       // 浏览器一开跑就自动把画面显示出来（用户手动收起的除外）。
-      // 扫码模式先突出二维码；二维码无法识别时由 qrFallback 展开可点击画面。
+      // 手机号模式下不摊开：不然第 2 步会被画面挤下去。
       // 手动授权模式下**一定摊开** —— 那个模式的重点就是这块能点的画面。
       if(!shotAutoDone && !shotManual){
         shotAutoDone = true;
@@ -9747,6 +9928,9 @@ function refresh(){
           var url = URL.createObjectURL(b);
           shot.src = url;
           shot.hidden = false;
+          if($('manualscreentip')){
+            $('manualscreentip').hidden = !(wantManual || qrFallback || !!au.manual);
+          }
           var fresh = lv.live || au.live;
           var age = (lv.frame_age === null || lv.frame_age === undefined) ? au.frame_age : lv.frame_age;
           setShotTag(age, !!fresh);
@@ -9772,7 +9956,6 @@ var SEND_BADGE = {
   no_login:['登录已失效','r'],
   error:['运行出错','r'],
   running:['本次记录未正常结束','y'],
-  timed_out:['此抖音号发送超过 10 分钟，已停止','r'],
   skipped:['上一轮还没跑完，本轮跳过','y'],
   queued:['排队中：等上一轮跑完接着发','y'],
   queue_timeout:['排队超时，本轮没发成','r']
@@ -9868,15 +10051,31 @@ function refreshSends(){
     try { renderSends(JSON.parse(t).runs); } catch(e){}
   }).catch(function(){});
 }
+function refreshLogs(force){
+  var el = $('logs');
+  if(!el){ return; }
+  fetch('api/logs').then(function(r){ return r.text(); }).then(function(t){
+    // 只有用户本来就在底部时才自动跟着滚：人家翻上去看旧日志时别把他拽下来
+    // nearBottom 改成取回内容之后再算：判断的是"此刻"的滚动位置，不会被别的请求插队冲掉
+    var nearBottom = true;
+    if(el.scrollHeight && el.clientHeight !== undefined){
+      nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
+    }
+    el.textContent = t || '暂无日志';
+    // force=true 表示「日志面板刚打开」：不管以前滚到哪儿，默认翻到最下面
+    if((force || nearBottom) && el.scrollHeight){ el.scrollTop = el.scrollHeight; }
+  }).catch(function(){});
+}
 // ---- 轮询：页面切到后台就停，回到前台立刻补一次再继续（手机锁屏时不再空转） ----
 var POLL = { timers: [], on: false };
-function pollOnce(){ refresh(); refreshSends(); }
+function pollOnce(){ refresh(); refreshSends(); refreshLogs(); }
 function startPolling(){
   if(POLL.on){ return; }
   POLL.on = true;
   POLL.timers = [
     setInterval(refresh, 2000),
-    setInterval(refreshSends, 4000)
+    setInterval(refreshSends, 4000),
+    setInterval(refreshLogs, 4000)
   ];
 }
 function stopPolling(){
@@ -9924,21 +10123,116 @@ function bindAnyBox(){
   }
 }
 
-function retireLegacyPush(){
-  if(!navigator.serviceWorker || !navigator.serviceWorker.getRegistrations){ return; }
-  navigator.serviceWorker.getRegistrations().then(function(registrations){
-    return Promise.all(registrations.map(function(registration){
-      var active = registration.active || registration.waiting || registration.installing;
-      var scriptUrl = active && active.scriptURL ? active.scriptURL : '';
-      if(!scriptUrl || new URL(scriptUrl, location.href).pathname !== '/service-worker.js'){ return Promise.resolve(); }
-      var manager = registration.pushManager;
-      var removeSubscription = manager && manager.getSubscription
-        ? manager.getSubscription().then(function(subscription){ return subscription ? subscription.unsubscribe() : undefined; })
-        : Promise.resolve();
-      return removeSubscription.catch(function(){}).then(function(){ return registration.unregister(); });
-    }));
-  }).catch(function(){});
+function initWebPush(){
+  var enable = $('webpush-enable'), disable = $('webpush-disable'), state = $('webpush-state');
+  if(!enable || !disable || !state){ return; }
+  var ua = navigator.userAgent || '';
+  var ios = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var standalone = !!(navigator.standalone || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+  var supported = !!(window.Notification && navigator.serviceWorker && ('PushManager' in window));
+  function say(text){ state.textContent = text; }
+  function setSubscribed(active){
+    enable.hidden = !!active;
+    disable.hidden = !active;
+    if(active){ say('此设备已开启发送结果推送通知。'); }
+  }
+  if(navigator.serviceWorker){
+    navigator.serviceWorker.register('/service-worker.js', {scope:'/'}).catch(function(){
+      if(supported){ say('通知组件暂时无法加载，请刷新页面后重试。'); }
+    });
+  }
+  if(ios && !standalone){
+    enable.disabled = true;
+    enable.textContent = '先添加到主屏幕';
+    say('iPhone / iPad 的系统通知需要 iOS 16.4+：先用 Safari“添加到主屏幕”，再从主屏幕图标打开此页面。');
+    return;
+  }
+  if(!supported){
+    enable.disabled = true;
+    say('当前浏览器不支持网页推送。iPhone / iPad 请更新到 iOS 16.4+ 并从主屏幕图标打开。');
+    return;
+  }
+  if(window.Notification.permission === 'denied'){
+    enable.disabled = true;
+    say('系统已禁止通知，请在设备设置中允许“续火花”发送通知。');
+    return;
+  }
+  navigator.serviceWorker.ready.then(function(registration){
+    return registration.pushManager.getSubscription();
+  }).then(function(subscription){
+    if(!subscription){ setSubscribed(false); say('尚未开启通知；点“开启发送通知”完成设置。'); return null; }
+    return fetch('/api/webpush/status', {
+      method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({endpoint:subscription.endpoint})
+    }).then(function(response){
+      return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error('无法读取这台设备的通知状态。'); } return data; });
+    });
+  }).then(function(data){
+    if(!data){ return; }
+    if(data.active){ setSubscribed(true); }
+    else { setSubscribed(false); say('此设备尚未绑定到当前账号；点“开启发送通知”即可绑定。'); }
+  }).catch(function(){ say('还没有开启通知；点“开启发送通知”完成设置。'); });
+
+  function toApplicationServerKey(value){
+    var base64 = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while(base64.length % 4){ base64 += '='; }
+    var raw = window.atob(base64), result = new Uint8Array(raw.length);
+    for(var i = 0; i < raw.length; i++){ result[i] = raw.charCodeAt(i); }
+    return result;
+  }
+  enable.onclick = function(){
+    if(enable.disabled){ return; }
+    enable.disabled = true;
+    say('正在请求系统通知权限…');
+    var permission;
+    try { permission = window.Notification.requestPermission(); }
+    catch(e){ enable.disabled = false; say('系统没有接受通知授权请求，请重试。'); return; }
+    Promise.resolve(permission).then(function(granted){
+      if(granted !== 'granted'){ throw new Error(granted === 'denied' ? '系统已拒绝通知权限，请到设备设置中开启。' : '你还没有允许通知。'); }
+      say('正在登记这台设备…');
+      return navigator.serviceWorker.ready.then(function(registration){
+        return fetch('/api/webpush/vapid-key', {credentials:'same-origin'}).then(function(response){
+          return response.json().then(function(data){
+            if(!response.ok || !data.ok){ throw new Error(data.error || '服务器暂时无法开启推送。'); }
+            return registration.pushManager.getSubscription().then(function(existing){
+              return existing || registration.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:toApplicationServerKey(data.public_key)});
+            });
+          });
+        });
+      });
+    }).then(function(subscription){
+      return fetch('/api/webpush/subscription', {
+        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(subscription.toJSON())
+      }).then(function(response){
+        return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error(data.error || '设备登记失败。'); } });
+      }).then(function(){ setSubscribed(true); });
+    }).catch(function(error){
+      enable.disabled = false;
+      say(error && error.message ? error.message : '开启通知失败，请检查网络后重试。');
+    });
+  };
+  disable.onclick = function(){
+    disable.disabled = true;
+    navigator.serviceWorker.ready.then(function(registration){ return registration.pushManager.getSubscription(); }).then(function(subscription){
+      if(!subscription){ return null; }
+      return fetch('/api/webpush/unsubscribe', {
+        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({endpoint:subscription.endpoint})
+      }).then(function(response){
+        return response.json().then(function(data){ if(!response.ok || !data.ok){ throw new Error(data.error || '关闭通知失败。'); } return subscription; });
+      });
+    }).then(function(subscription){ return subscription ? subscription.unsubscribe() : true; }).then(function(){
+      disable.disabled = false;
+      setSubscribed(false);
+      say('此设备已关闭发送结果通知。');
+    }).catch(function(error){
+      disable.disabled = false;
+      say(error && error.message ? error.message : '关闭通知失败，请检查网络后重试。');
+    });
+  };
 }
+
 // 顶部提示条要贴在顶栏下面：手机上顶栏会折成两行、高度变高，这里跟着量一次
 function syncHeadHeight(){
   // 顶栏换成了侧边栏布局里的 .main .top：量它的高度，顶部提示条才会正好落在标题栏下面
@@ -9956,7 +10250,7 @@ if(window.addEventListener){ window.addEventListener('resize', syncHeadHeight); 
 function bootChrome(){
   bindAuthWizard();
   bindAnyBox();
-  retireLegacyPush();
+  initWebPush();
   initNav();
 }
 if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', bootChrome); }
@@ -10006,6 +10300,124 @@ startPolling();
   })();
 
 
+/* ===== 好友选择器：拉取抖音好友 -> 勾选 -> 自动写入「目标好友」 ===== */
+(function(){
+  var btn = $('frpLoad'), st = $('frpState'), list = $('frpList');
+  if(!btn || !st || !list){ return; }
+  var timer = null, deadline = 0, POLL = 2000, LIMIT = 330000, lastUid = null;
+
+  function setState(text, isErr){
+    st.textContent = text || '';
+    st.className = isErr ? 'cnt frp-err' : 'cnt';
+  }
+  function reset(){
+    if(timer){ clearInterval(timer); timer = null; }
+    btn.disabled = false;
+    list.innerHTML = '';
+    list.hidden = true;
+  }
+  // 当前选中的抖音号：优先用面板自己的 curUid()（任务配置模式下 #f_uid 是隐藏的）
+  function pickUid(){
+    try{ if(typeof curUid === 'function'){ return String(curUid() || '').trim(); } }catch(e){}
+    var el = $('f_uid');
+    return el ? String(el.value || '').trim() : '';
+  }
+  function syncUid(){
+    var uid = pickUid();
+    if(uid !== lastUid){
+      lastUid = uid;
+      reset();
+      setState(uid ? '点「拉取好友」获取这个号的好友' : '先在上面选一个已登录的抖音号', false);
+    }
+    return uid;
+  }
+  function clean(name){ return String(name == null ? '' : name).replace(/\u00a0/g, ' ').trim(); }
+  function readTargets(){
+    var ta = $('f_targets'), out = [];
+    if(ta){ String(ta.value || '').split('\n').forEach(function(x){ x = x.trim(); if(x){ out.push(x); } }); }
+    return out;
+  }
+  function writeTargets(names){
+    var ta = $('f_targets'); if(!ta){ return; }
+    ta.value = names.join('\n');
+    try{ ta.dispatchEvent(new Event('input', {bubbles:true})); }catch(e){}
+  }
+  function boxes(){ return Array.prototype.slice.call(list.querySelectorAll('input[type=checkbox]')); }
+  function commit(){
+    var known = {};
+    boxes().forEach(function(cb){ known[cb.getAttribute('data-name')] = 1; });
+    var keep = readTargets().filter(function(x){ return !known[x]; });
+    var picked = boxes().filter(function(cb){ return cb.checked; }).map(function(cb){ return cb.getAttribute('data-name'); });
+    writeTargets(picked.concat(keep));
+  }
+  function render(friends){
+    var sel = {};
+    readTargets().forEach(function(x){ sel[x] = 1; });
+    list.innerHTML = '';
+    friends.forEach(function(raw){
+      var name = clean(raw);
+      if(!name){ return; }
+      var lab = document.createElement('label');
+      lab.className = 'frp-item' + (sel[name] ? ' on' : '');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.setAttribute('data-name', name);
+      cb.checked = !!sel[name];
+      cb.addEventListener('change', function(){ lab.classList.toggle('on', cb.checked); commit(); });
+      var sp = document.createElement('span');
+      sp.textContent = name;
+      lab.appendChild(cb);
+      lab.appendChild(sp);
+      list.appendChild(lab);
+    });
+    list.hidden = list.children.length === 0;
+  }
+  function finish(text, isErr){
+    if(timer){ clearInterval(timer); timer = null; }
+    btn.disabled = false;
+    setState(text, isErr);
+  }
+  function poll(uid){
+    fetch('/api/friends?unique_id=' + encodeURIComponent(uid), {credentials:'same-origin'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(!d || !d.ok){ finish((d && d.error) || '拉取失败', true); return; }
+        if(d.running){
+          setState(d.progress || '正在拉取好友，请稍候…', false);
+          if(Date.now() > deadline){ finish('拉取超时了，稍后重试', true); }
+          return;
+        }
+        var names = (d.friends || []).map(clean).filter(function(x){ return x; });
+        render(names);
+        if(names.length){
+          finish('共 ' + names.length + ' 个好友；勾选即填入上方「目标好友」，别忘了保存', false);
+        } else {
+          finish(d.error || '没有拉到好友，稍后重试', true);
+        }
+      })
+      .catch(function(){ /* 网络抖动：等下一轮 */ });
+  }
+  btn.addEventListener('click', function(){
+    var uid = syncUid();
+    if(!uid){ setState('先在上面选一个已登录的抖音号', true); return; }
+    btn.disabled = true;
+    setState('正在开始拉取…', false);
+    post('/api/friends/refresh', {unique_id: uid}).then(function(d){
+      if(!d || !d.ok){ finish((d && d.error) || '开始拉取失败', true); return; }
+      deadline = Date.now() + LIMIT;
+      if(timer){ clearInterval(timer); }
+      timer = setInterval(function(){ poll(uid); }, POLL);
+      poll(uid);
+    });
+  });
+  // 切换账号时清掉上一次的结果，别把 A 号的好友填到 B 号身上
+  try{
+    if(typeof selectAccount === 'function'){
+      var _select = selectAccount;
+      selectAccount = function(uid){ _select(uid); lastUid = null; syncUid(); };
+    }
+  }catch(e){}
+})();
 </script><!-- 授权向导弹窗：只是 api/status 的投影；点「收起」只是藏起来，后台授权照跑 -->
 <div id="authwiz" hidden role="dialog" aria-modal="true" aria-labelledby="wztitle">
 <div id="authwizmask"></div>
@@ -10067,6 +10479,7 @@ startPolling();
 </div>
 <button id="authbubble" type="button" hidden>授权进行中，点这里回到弹窗</button>
 </body></html>
+
 """
 
 ADMIN_HTML = r"""<!doctype html>
@@ -10296,28 +10709,6 @@ html[data-theme="dark"]{--brand:#64cdb8;--brand2:#7fddc9;--soft:#183e39;--softli
 @media(max-width:900px){.app{display:block}.side{position:fixed;inset:auto 0 0;height:auto;width:100%;padding:4px 7px calc(5px + env(safe-area-inset-bottom));z-index:150;box-shadow:0 -8px 26px #0c2b2a2e}.brand,.side-foot{display:none}nav{height:55px;display:flex;flex-direction:row;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;gap:3px}nav::-webkit-scrollbar{display:none}.nav{flex:1 0 62px;min-width:62px;min-height:51px;padding:5px 4px;display:flex;flex-direction:column;justify-content:center;gap:3px;font-size:10.5px;line-height:1.1;text-align:center;white-space:nowrap}.nav .ni{width:18px;height:18px}.nav .pill{display:none}.main{padding:12px 14px calc(92px + env(safe-area-inset-bottom))}.top{position:sticky;top:0;margin:-12px -14px 12px;padding:10px 14px;background:#f2f7f5f2;border-bottom:1px solid var(--line)}.grid2{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.tblwrap{max-width:calc(100vw - 56px);overscroll-behavior-x:contain}}
 @media(max-width:560px){.main{padding-left:11px;padding-right:11px}.top{margin-left:-11px;margin-right:-11px;padding:10px 11px}.card{padding:14px}input,textarea,select{font-size:16px}button{min-height:44px}.kpis{gap:8px}.kpi{padding:12px}.kpi b{font-size:23px}.row>button{flex:1 1 auto}.tblwrap{max-width:calc(100vw - 44px)}}
 
-/* Match the clean white visual system used by the account console. */
-html[data-theme]{color-scheme:light;--brand:#171717;--brand2:#333;--soft:#f5f5f5;--softline:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--bg:#fff;--card:#fff;--ok:#167344;--okbg:#eef7f1;--okline:#c7e6d1;--warn:#805700;--warnbg:#fbf5e8;--warnline:#ead6a8;--bad:#b4232f;--badbg:#fff1f1;--badline:#f0c4c7;--side:#fff;--side2:#f4f4f4;--sideink:#404040}
-html[data-theme] body{background:#fff;color:#171717}
-html[data-theme] .side{background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}
-html[data-theme] .brand{border-bottom-color:#ededed}
-html[data-theme] .brand b,html[data-theme] .side-foot .who{color:#171717}
-html[data-theme] .brand i,html[data-theme] .side-foot a{color:#737373}
-html[data-theme] .nav{color:#525252;border-color:transparent}
-html[data-theme] .nav:hover{background:#f7f7f7;color:#171717}
-html[data-theme] .nav.on{background:#f1f1f1;color:#171717;box-shadow:none}
-html[data-theme] .nav.on .ni{background:#171717}
-html[data-theme] .main{max-width:1600px}
-html[data-theme] .top{background:#fff;border-bottom:1px solid #ededed;backdrop-filter:none}
-html[data-theme] .card,html[data-theme] .kpi{border-color:#e5e5e5;border-radius:12px;box-shadow:none}
-html[data-theme] button{background:#171717;border-radius:8px;box-shadow:none}
-html[data-theme] button:hover:not(:disabled){background:#333}
-html[data-theme] button.ghost,html[data-theme] button.sec{background:#fff;color:#262626;border-color:#dedede}
-html[data-theme] input,html[data-theme] textarea,html[data-theme] select{background:#fff;border-color:#dedede;color:#171717}
-html[data-theme] th{background:#fff;color:#737373}
-html[data-theme] #themebtn{display:none!important}
-@media(max-width:900px){html[data-theme] .side{box-shadow:none;border-top:1px solid #e8e8e8}html[data-theme] .top{background:#fff}}
-
 /* Red and black by default; the theme button switches to white and red. */
 html[data-theme="dark"]{color-scheme:dark;--brand:#f04452;--brand2:#d92e3e;--soft:#311519;--softline:#79333d;--ink:#f5f2f3;--ink2:#ded6d8;--muted:#a49a9d;--line:#393336;--bg:#0b0a0b;--card:#151214;--side:#070607;--side2:#1b1518;--sideink:#d8cfd2;--ok:#5bd59e;--okbg:#12271f;--okline:#2a5841;--warn:#f4c35d;--warnbg:#2b2112;--warnline:#6e5221;--bad:#ff7d85;--badbg:#311519;--badline:#79333d}
 html[data-theme="light"]{color-scheme:light;--brand:#ca2638;--brand2:#a91d2d;--soft:#fff0f2;--softline:#efb5bc;--ink:#241b1d;--ink2:#57474a;--muted:#806f72;--line:#eadcdf;--bg:#fff9f9;--card:#fff;--side:#fff;--side2:#fff0f2;--sideink:#58494c;--ok:#087a50;--okbg:#e7f7ee;--okline:#b3e2c6;--warn:#8a5a00;--warnbg:#fdf5da;--warnline:#eedca2;--bad:#a91d2d;--badbg:#fdebed;--badline:#efb5bc}
@@ -10424,30 +10815,45 @@ html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-of
 @media(max-width:900px){html[data-theme] .app{display:block}html[data-theme] .side{position:fixed;inset:auto 0 0;height:auto;width:100%;padding:4px 8px calc(5px + env(safe-area-inset-bottom));z-index:150;border:0;border-top:1px solid var(--line);box-shadow:none}html[data-theme] nav{height:54px;gap:4px}html[data-theme] .nav{min-height:50px;border-radius:8px}html[data-theme] .main{padding:12px 18px calc(92px + env(safe-area-inset-bottom))}html[data-theme] .top{margin:-12px -18px 17px;padding:9px 18px}}
 @media(max-width:700px){html[data-theme] .kpis{grid-template-columns:repeat(3,minmax(0,1fr))}html[data-theme] .kpi:nth-child(3){border-right:0}html[data-theme] .kpi:nth-child(n+4){border-top:1px solid var(--line)}}
 @media(max-width:560px){html[data-theme] .main{padding-right:12px;padding-left:12px}html[data-theme] .top{margin-right:-12px;margin-left:-12px;padding-right:12px;padding-left:12px}html[data-theme] .card{padding:15px 14px}html[data-theme] .kpi{padding:11px 10px}html[data-theme] .kpi b{font-size:22px}}
+/* 2026-10-07 restore the clean white admin console without changing behavior. */
+html[data-theme]{color-scheme:light;--brand:#171717;--brand2:#333;--soft:#f5f5f5;--softline:#dedede;--ink:#171717;--ink2:#404040;--muted:#737373;--line:#e5e5e5;--bg:#fff;--card:#fff;--side:#fff;--side2:#f4f4f4;--sideink:#404040;--ok:#167344;--okbg:#eef7f1;--okline:#c7e6d1;--warn:#805700;--warnbg:#fbf5e8;--warnline:#ead6a8;--bad:#b4232f;--badbg:#fff1f1;--badline:#f0c4c7}
+html[data-theme] body{background:#fff;color:#171717}html[data-theme] .side{background:#fff;border-right:1px solid #e8e8e8;box-shadow:none}html[data-theme] .brand{border-bottom-color:#ededed}html[data-theme] .brand b,html[data-theme] .side-foot .who{color:#171717}html[data-theme] .brand i,html[data-theme] .side-foot a{color:#737373}
+html[data-theme] .nav{background:transparent;color:#525252;border-color:transparent}html[data-theme] .nav:hover{background:#f7f7f7;color:#171717}html[data-theme] .nav.on{background:#f1f1f1;border-color:#dedede;color:#171717;box-shadow:none}html[data-theme] .nav.on .ni{background:#171717}
+html[data-theme] .top{background:#fff;border-bottom:1px solid #ededed;backdrop-filter:none}html[data-theme] .card,html[data-theme] .kpi{border-color:#e5e5e5;border-radius:12px;background:#fff;box-shadow:none}html[data-theme] .card>p.sub,html[data-theme] .kpi span{color:#737373}
+html[data-theme] button{background:#171717;color:#fff;border-radius:8px;box-shadow:none}html[data-theme] button:hover:not(:disabled){background:#333}html[data-theme] button.ghost,html[data-theme] button.sec{background:#fff;color:#262626;border-color:#dedede}html[data-theme] button.ghost:hover:not(:disabled),html[data-theme] button.sec:hover:not(:disabled){background:#f7f7f7;color:#111;border-color:#bdbdbd}
+html[data-theme] input,html[data-theme] textarea,html[data-theme] select{background:#fff;border-color:#dedede;color:#171717}html[data-theme] input:focus,html[data-theme] textarea:focus,html[data-theme] select:focus{outline-color:#e8e8e8;border-color:#999}html[data-theme] th{background:#fff;color:#737373}html[data-theme] td{border-bottom-color:#e5e5e5;color:#404040}html[data-theme] tbody tr:hover{background:#fafafa}
+html[data-theme] .chip,html[data-theme] .account-menu>summary,html[data-theme] .account-panel{background:#fff;border-color:#e5e5e5;color:#404040}html[data-theme] .account-panel{box-shadow:0 16px 36px rgba(0,0,0,.12)}html[data-theme] #toast .t{background:#fff;border-color:#e5e5e5;color:#171717}html[data-theme] #themebtn{display:none!important}
+@media(max-width:900px){html[data-theme] .side{border-top:1px solid #e8e8e8;box-shadow:0 -5px 18px rgba(0,0,0,.04)}html[data-theme] .top{background:#fff}}
+/* Keyboard access and neutral icon treatment for the refreshed admin UI. */
+html[data-theme] .ni{background:#737373}
+html[data-theme] .nav.on .ni{background:#171717}
+html[data-theme] :focus-visible{outline:3px solid #666!important;outline-offset:3px!important}
+.skip-link{position:fixed;top:8px;left:8px;z-index:500;transform:translateY(-160%);padding:9px 12px;border:1px solid #171717;border-radius:7px;background:#171717;color:#fff;text-decoration:none}
+.skip-link:focus{transform:translateY(0)}
 
 </style></head><body>
 <div id="toast" aria-live="polite"></div>
 <div class="app">
 <aside class="side">
   <div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>管理控制台</i></div></div>
-  <nav id="nav">
-    <button class="nav on" type="button" data-go="overview"><i class="ni ni-overview"></i>概览</button>
-    <button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts"></i>抖音号 <span class="pill" id="nAcc">0</span></button>
-    <button class="nav" type="button" data-go="users"><i class="ni ni-users"></i>用户 <span class="pill" id="nUser">0</span></button>
-    <button class="nav" type="button" data-go="subscription"><i class="ni ni-clock"></i>时长服务</button>
-    <button class="nav" type="button" data-go="records"><i class="ni ni-records"></i>发送记录</button>
-    <button class="nav" type="button" data-go="logs"><i class="ni ni-logs"></i>运行日志</button>
-    <button class="nav" type="button" data-go="system"><i class="ni ni-system"></i>系统 / 应急</button>
+  <nav id="nav" aria-label="&#31649;&#29702;&#33756;&#21333;">
+    <button class="nav on" type="button" data-go="overview"><i class="ni ni-overview" aria-hidden="true"></i>概览</button>
+    <button class="nav" type="button" data-go="accounts"><i class="ni ni-accounts" aria-hidden="true"></i>抖音号 <span class="pill" id="nAcc">0</span></button>
+    <button class="nav" type="button" data-go="users"><i class="ni ni-users" aria-hidden="true"></i>用户 <span class="pill" id="nUser">0</span></button>
+    <button class="nav" type="button" data-go="subscription"><i class="ni ni-clock" aria-hidden="true"></i>时长服务</button>
+    <button class="nav" type="button" data-go="records"><i class="ni ni-records" aria-hidden="true"></i>发送记录</button>
+    <button class="nav" type="button" data-go="logs"><i class="ni ni-logs" aria-hidden="true"></i>运行日志</button>
+    <button class="nav" type="button" data-go="system"><i class="ni ni-system" aria-hidden="true"></i>系统 / 应急</button>
   </nav>
   <div class="side-foot">
     <span class="who" id="whoami">管理员</span>
     <a href="/">我的控制台</a>
-    <a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">GitHub 仓库 ↗</a>
-    <a href="/logout">切换账号</a>
+    <a href="/logout">退出登录</a>
   </div>
 </aside>
 
-<main class="main">
+<a class="skip-link" href="#main-content">&#36339;&#21040;&#20027;&#35201;&#20869;&#23481;</a>
+<main class="main" id="main-content" tabindex="-1">
   <div class="top">
     <h1 id="pageTitle">概览</h1>
     <span class="sp"></span>
@@ -10915,7 +11321,7 @@ window.addEventListener('hashchange', function(){ showPanel((location.hash || ''
 
 // ---- 状态 ----
 var STATUS = null, USERS = null, RUNS = [];
-var SEND_TONE = {ok:'g', partial:'y', failed:'r', no_friend:'n', no_login:'r', error:'r', running:'y', timed_out:'r', skipped:'y', queued:'y', queue_timeout:'r'};
+var SEND_TONE = {ok:'g', partial:'y', failed:'r', no_friend:'n', no_login:'r', error:'r', running:'y', skipped:'y', queued:'y', queue_timeout:'r'};
 var REC_SEL = 0, REC_MAX = 100, REC_STORED = 0, REC_CAP = 2;
 // ---- 公告与管理员联系方式（/admin「系统」页里改）----
 // 用户端每次 /api/status 都会拿到这份内容，所以保存完直接 loadStatus 回读，
@@ -12182,6 +12588,7 @@ startPoll();
 
 </script>
 </body></html>
+
 """
 
 
@@ -12302,7 +12709,6 @@ html[data-theme="light"] form>button:not(.eye){background:#ca2638;box-shadow:0 8
 html[data-theme="light"] form>button:not(.eye):hover{background:#a91d2d}
 html[data-theme="light"] .foot a{color:#a91d2d}
 @media(max-width:480px){.auth-theme{top:calc(10px + env(safe-area-inset-top));right:10px}.box{width:calc(100% - 28px);margin:58px auto 20px}}
-
 /* Auth pages share the same quiet red/black language as the console. */
 html[data-theme="dark"]{color-scheme:dark;--auth-bg:#100d0f;--auth-card:#191416;--auth-ink:#f5edef;--auth-muted:#a58f95;--auth-line:#3b2b30;--auth-red:#e84d5b;--auth-soft:#2d191e}
 html[data-theme="light"]{color-scheme:light;--auth-bg:#fff8f8;--auth-card:#fff;--auth-ink:#2b1a1e;--auth-muted:#806a70;--auth-line:#e8d8db;--auth-red:#bd263c;--auth-soft:#fbe9ec}
@@ -12328,17 +12734,38 @@ html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(-
 html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
 @media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
 @media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
-html[data-theme]{color-scheme:light;--auth-bg:#fff;--auth-card:#fff;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-red:#171717;--auth-soft:#f5f5f5}
-html[data-theme] body{color:#171717;background:#fff}
-html[data-theme] .box{border-color:#e5e5e5;box-shadow:0 12px 36px rgba(0,0,0,.05)}
-html[data-theme] h2,html[data-theme] label{color:#171717}
-html[data-theme] p.tip,html[data-theme] .foot{color:#737373}
-html[data-theme] input{background:#fff;color:#171717;border-color:#dedede}
-html[data-theme] input:focus{outline-color:#e8e8e8;border-color:#999}
-html[data-theme] form>button:not(.eye),html[data-theme] button:not(.eye){background:#171717;box-shadow:none}
-html[data-theme] .foot a{color:#333}
-html[data-theme] .auth-theme{display:none!important}
-@media(max-width:480px){html[data-theme] .box{margin:20px auto}}
+
+/* White, monochrome auth pages to match the redesigned console. */
+html[data-theme]{color-scheme:light;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-surface:#fff;--auth-soft:#f5f5f5}
+html[data-theme="dark"],html[data-theme="light"]{color-scheme:light}
+html[data-theme="dark"] body,html[data-theme="light"] body{min-height:100svh;padding:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) max(20px,env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left));color:#171717;background:#fff}
+html[data-theme="dark"] .box,html[data-theme="light"] .box{width:min(420px,100%);padding:30px 28px 24px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:0 12px 36px rgba(0,0,0,.06)}
+html[data-theme="dark"] .box::before,html[data-theme="light"] .box::before{height:0;background:transparent}
+html[data-theme="dark"] .brand .logo,html[data-theme="light"] .brand .logo{filter:grayscale(1);box-shadow:none}
+html[data-theme="dark"] .brand b,html[data-theme="light"] .brand b,html[data-theme="dark"] h2,html[data-theme="light"] h2{color:#171717}
+html[data-theme="dark"] .brand i,html[data-theme="light"] .brand i,html[data-theme="dark"] p.tip,html[data-theme="light"] p.tip,html[data-theme="dark"] .foot,html[data-theme="light"] .foot{color:#737373}
+html[data-theme="dark"] label,html[data-theme="light"] label{color:#404040}
+html[data-theme="dark"] input,html[data-theme="light"] input{min-height:44px;background:#fff;color:#171717;border-color:#dedede}
+html[data-theme="dark"] input:focus,html[data-theme="light"] input:focus{outline:3px solid #e8e8e8;outline-offset:1px;border-color:#888;box-shadow:none}
+html[data-theme="dark"] form>button:not(.eye),html[data-theme="light"] form>button:not(.eye){min-height:46px;border:1px solid #171717;border-radius:8px;background:#171717;color:#fff;box-shadow:none}
+html[data-theme="dark"] form>button:not(.eye):hover,html[data-theme="light"] form>button:not(.eye):hover{background:#333;border-color:#333}
+html[data-theme="dark"] .foot,html[data-theme="light"] .foot{border-top-color:#ededed}
+html[data-theme="dark"] .foot a,html[data-theme="light"] .foot a{color:#262626}
+html[data-theme="dark"] .badge,html[data-theme="light"] .badge{border-color:#e5e5e5;border-radius:7px;background:#f7f7f7;color:#404040}
+html[data-theme="dark"] .error,html[data-theme="light"] .error{border-color:#f0c4c7;border-radius:8px}
+html[data-theme="dark"] .auth-theme,html[data-theme="light"] .auth-theme{display:none!important}
+html[data-theme="dark"] :focus-visible,html[data-theme="light"] :focus-visible{outline:3px solid #777;outline-offset:3px}
+@media(max-width:480px){html[data-theme="dark"] .box,html[data-theme="light"] .box{width:100%;padding:26px 21px 21px}}
+@media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
+html[data-theme="dark"] h1,html[data-theme="light"] h1{margin:0 0 7px;color:#171717;font-size:24px;letter-spacing:-.6px;text-wrap:balance}
+.skip-link{position:fixed;top:8px;left:8px;z-index:500;transform:translateY(-160%);padding:9px 12px;border:1px solid #171717;border-radius:7px;background:#171717;color:#fff;text-decoration:none}
+.skip-link:focus{transform:translateY(0)}
+
+html[data-theme="dark"] .pw .eye,html[data-theme="light"] .pw .eye{color:#525252}
+html[data-theme="dark"] .pw .eye:hover,html[data-theme="light"] .pw .eye:hover{background:#f5f5f5;color:#171717}
+
+
 """
 
 ADMIN_LOGIN_CSS = """
@@ -12421,7 +12848,6 @@ html[data-theme="light"] .foot{border-top-color:#eadcdf}
 html[data-theme="light"] .foot a{color:#a91d2d}
 html[data-theme="light"] .auth-theme{background:#fff;color:#a91d2d;border-color:#efb5bc}
 @media(max-width:480px){.auth-theme{top:calc(10px + env(safe-area-inset-top));right:10px}.box{width:calc(100% - 28px);margin:58px auto 20px}}
-
 /* Admin sign-in uses the same red/black identity as the rest of the console. */
 html[data-theme="dark"]{color-scheme:dark;--auth-bg:#100d0f;--auth-card:#191416;--auth-ink:#f5edef;--auth-muted:#a58f95;--auth-line:#3b2b30;--auth-red:#e84d5b;--auth-soft:#2d191e}
 html[data-theme="light"]{color-scheme:light;--auth-bg:#fff8f8;--auth-card:#fff;--auth-ink:#2b1a1e;--auth-muted:#806a70;--auth-line:#e8d8db;--auth-red:#bd263c;--auth-soft:#fbe9ec}
@@ -12448,29 +12874,51 @@ html[data-theme] .auth-theme:hover{border-color:var(--auth-red);background:var(-
 html[data-theme] :focus-visible{outline:3px solid rgba(232,77,91,.48);outline-offset:2px}
 @media(max-width:480px){html[data-theme] .box{width:calc(100% - 28px);margin:58px auto 20px;padding:28px 21px 21px}}
 @media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;transition:none!important}}
-html[data-theme]{color-scheme:light;--auth-bg:#fff;--auth-card:#fff;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-red:#171717;--auth-soft:#f5f5f5}
-html[data-theme] body{color:#171717;background:#fff}
-html[data-theme] .box{border-color:#e5e5e5;box-shadow:0 12px 36px rgba(0,0,0,.05)}
-html[data-theme] h2,html[data-theme] label{color:#171717}
-html[data-theme] p.tip,html[data-theme] .foot{color:#737373}
-html[data-theme] input{background:#fff;color:#171717;border-color:#dedede}
-html[data-theme] input:focus{outline-color:#e8e8e8;border-color:#999}
-html[data-theme] form>button:not(.eye),html[data-theme] button:not(.eye){background:#171717;box-shadow:none}
-html[data-theme] .foot a{color:#333}
-html[data-theme] .auth-theme{display:none!important}
-@media(max-width:480px){html[data-theme] .box{margin:20px auto}}
+
+/* Match the public login page and the white admin workspace. */
+html[data-theme]{color-scheme:light;--auth-ink:#171717;--auth-muted:#737373;--auth-line:#e5e5e5;--auth-surface:#fff;--auth-soft:#f5f5f5}
+html[data-theme="dark"],html[data-theme="light"]{color-scheme:light}
+html[data-theme="dark"] body,html[data-theme="light"] body{min-height:100svh;padding:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) max(20px,env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left));color:#171717;background:#fff}
+html[data-theme="dark"] .box,html[data-theme="light"] .box{width:min(420px,100%);padding:30px 28px 24px;border:1px solid #e5e5e5;border-radius:12px;background:#fff;box-shadow:0 12px 36px rgba(0,0,0,.06)}
+html[data-theme="dark"] .brand .logo,html[data-theme="light"] .brand .logo{filter:grayscale(1);box-shadow:none}
+html[data-theme="dark"] .box::before,html[data-theme="light"] .box::before{display:none;height:0;background:transparent}
+html[data-theme] .ni{background:#737373}
+html[data-theme="dark"] .brand b,html[data-theme="light"] .brand b,html[data-theme="dark"] h2,html[data-theme="light"] h2{color:#171717}
+html[data-theme="dark"] .brand i,html[data-theme="light"] .brand i,html[data-theme="dark"] p.tip,html[data-theme="light"] p.tip,html[data-theme="dark"] .foot,html[data-theme="light"] .foot{color:#737373}
+html[data-theme="dark"] label,html[data-theme="light"] label{color:#404040}
+html[data-theme="dark"] .badge,html[data-theme="light"] .badge{border-color:#e5e5e5;border-radius:7px;background:#f7f7f7;color:#404040}
+html[data-theme="dark"] input,html[data-theme="light"] input{min-height:44px;background:#fff;color:#171717;border-color:#dedede}
+html[data-theme="dark"] input:focus,html[data-theme="light"] input:focus{outline:3px solid #e8e8e8;outline-offset:1px;border-color:#888}
+html[data-theme="dark"] form>button:not(.eye),html[data-theme="light"] form>button:not(.eye){min-height:46px;border:1px solid #171717;border-radius:8px;background:#171717;color:#fff;box-shadow:none}
+html[data-theme="dark"] form>button:not(.eye):hover,html[data-theme="light"] form>button:not(.eye):hover{background:#333;border-color:#333;filter:none}
+html[data-theme="dark"] .foot,html[data-theme="light"] .foot{border-top-color:#ededed}
+html[data-theme="dark"] .foot a,html[data-theme="light"] .foot a{color:#262626}
+html[data-theme="dark"] .auth-theme,html[data-theme="light"] .auth-theme{display:none!important}
+html[data-theme="dark"] :focus-visible,html[data-theme="light"] :focus-visible{outline:3px solid #777;outline-offset:3px}
+@media(max-width:480px){html[data-theme="dark"] .box,html[data-theme="light"] .box{width:100%;padding:26px 21px 21px}}
+@media(prefers-reduced-motion:reduce){html[data-theme] *,html[data-theme] *::before,html[data-theme] *::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+
+html[data-theme="dark"] h1,html[data-theme="light"] h1{margin:0 0 7px;color:#171717;font-size:24px;letter-spacing:-.6px;text-wrap:balance}
+.skip-link{position:fixed;top:8px;left:8px;z-index:500;transform:translateY(-160%);padding:9px 12px;border:1px solid #171717;border-radius:7px;background:#171717;color:#fff;text-decoration:none}
+.skip-link:focus{transform:translateY(0)}
+
+html[data-theme="dark"] .pw .eye,html[data-theme="light"] .pw .eye{color:#525252}
+html[data-theme="dark"] .pw .eye:hover,html[data-theme="light"] .pw .eye:hover{background:#f5f5f5;color:#171717}
+
+
 """
 
 ADMIN_LOGIN_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
 <title>管理员登录 · DouYinSparkFlow</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script>(function(){var t="dark";try{var saved=localStorage.getItem("dsh-theme");if(saved==="dark"||saved==="light")t=saved;}catch(e){}document.documentElement.setAttribute("data-theme",t);})();</script>
-<style>__CSS__</style></head><body><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><div class="box">
-<div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>ADMIN CONSOLE</i></div></div>
-<span class="badge"><i class="ni ni-flame"></i>管理员入口</span>
-<h2>管理员登录</h2>
+<style>__CSS__</style></head><body><a class="skip-link" href="#auth-main">&#36339;&#21040;&#20027;&#35201;&#20869;&#23481;</a><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><main class="box" id="auth-main" tabindex="-1">
+<div class="brand"><span class="logo" aria-hidden="true"></span><div><b>DouYinSparkFlow</b><i>ADMIN CONSOLE</i></div></div>
+<span class="badge"><i class="ni ni-flame" aria-hidden="true"></i>管理员入口</span>
+<h1>管理员登录</h1>
 <p class="tip">这里只给管理员用：用管理员账号密码进来，管理所有用户的抖音号、发送记录和系统开关。</p>
 <form method="post" action="/login">
 <input type="hidden" name="next" value="__NEXT__">
@@ -12479,11 +12927,11 @@ ADMIN_LOGIN_HTML = """<!doctype html>
   autocapitalize="off" autocorrect="off" spellcheck="false" required>
 <label for="ad-pass">密码</label>
 <span class="pw"><input id="ad-pass" name="password" type="password" autocomplete="current-password" required>
-<button type="button" class="eye" id="ad-eye" aria-label="显示密码" aria-pressed="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
+<button type="button" class="eye" id="ad-eye" aria-label="显示密码" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
 <button id="ad-go">进入管理控制台</button></form>
 __ERROR__
 <p class="foot">不是管理员？<a href="/login">返回普通登录</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
-</div>
+</main>
 <script>
 (function(){
   var box=document.getElementById("ad-user"), pw=document.getElementById("ad-pass");
@@ -12497,18 +12945,20 @@ __ERROR__
     if(go){ go.disabled=true; go.textContent="正在验证…"; } }); }
 })();
 </script>
-<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",dark?"#0b0a0b":"#fff9f9");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content","#ffffff");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+
 """
 
 LOGIN_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
 <title>登录 · DouYinSparkFlow</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script>(function(){var t="dark";try{var saved=localStorage.getItem("dsh-theme");if(saved==="dark"||saved==="light")t=saved;}catch(e){}document.documentElement.setAttribute("data-theme",t);})();</script>
-<style>__CSS__</style></head><body><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><div class="box">
-<div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>抖音火花助手 · 控制台</i></div></div>
-<h2>登录控制台</h2>
+<style>__CSS__</style></head><body><a class="skip-link" href="#auth-main">&#36339;&#21040;&#20027;&#35201;&#20869;&#23481;</a><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><main class="box" id="auth-main" tabindex="-1">
+<div class="brand"><span class="logo" aria-hidden="true"></span><div><b>DouYinSparkFlow</b><i>抖音火花助手 · 控制台</i></div></div>
+<h1>登录控制台</h1>
 <p class="tip">用你的控制台账号登录，管理自己的抖音号、目标好友和手动发送配置。</p>
 <form method="post" action="/login">
 <input type="hidden" name="next" value="__NEXT__">
@@ -12518,12 +12968,12 @@ LOGIN_HTML = """<!doctype html>
   placeholder="你的控制台登录名" required>
 <label for="lg-pass">密码</label>
 <span class="pw"><input id="lg-pass" name="password" type="password" autocomplete="current-password" enterkeyhint="go" required>
-<button type="button" class="eye" id="lg-eye" aria-label="显示密码" aria-pressed="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
+<button type="button" class="eye" id="lg-eye" aria-label="显示密码" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
 <label class="keep" for="lg-keep"><input type="checkbox" id="lg-keep"> 记住账号（下次自动填好）</label>
 <button id="lg-go">登录</button></form>
 __ERROR__
 <p class="foot">__REGOFFER__<br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a><br><span style="color:#a3aab8">忘了密码？找管理员重置 · </span><a href="/login?next=/admin" style="font-weight:400;color:#a3aab8">管理员入口</a></p>
-</div>
+</main>
 <script>
 (function(){
   var form=document.querySelector("form[action='/login']");
@@ -12546,19 +12996,21 @@ __ERROR__
   }); }
 })();
 </script>
-<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",dark?"#0b0a0b":"#fff9f9");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content","#ffffff");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+
 """
 
 REGISTER_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
 <title>注册 · DouYinSparkFlow</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <script>(function(){var t="dark";try{var saved=localStorage.getItem("dsh-theme");if(saved==="dark"||saved==="light")t=saved;}catch(e){}document.documentElement.setAttribute("data-theme",t);})();</script>
-<style>__CSS__</style></head><body><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><div class="box">
-<div class="brand"><span class="logo"></span><div><b>DouYinSparkFlow</b><i>抖音火花助手 · 控制台</i></div></div>
-<h2>注册一个账号</h2>
-<p class="tip">注册后登录控制台，绑定你自己的抖音号并用抖音 App 扫码授权，就能自己设目标好友和发送配置。别人的账号互相看不到。</p>
+<style>__CSS__</style></head><body><a class="skip-link" href="#auth-main">&#36339;&#21040;&#20027;&#35201;&#20869;&#23481;</a><button class="auth-theme" id="auth-theme" type="button" aria-label="切换到白红主题">白红</button><main class="box" id="auth-main" tabindex="-1">
+<div class="brand"><span class="logo" aria-hidden="true"></span><div><b>DouYinSparkFlow</b><i>抖音火花助手 · 控制台</i></div></div>
+<h1>注册一个账号</h1>
+<p class="tip">注册后登录控制台，绑定你自己的抖音号（手机号登录或扫码授权），就能自己设目标好友和发送配置。别人的账号互相看不到。</p>
 <form method="post" action="/register">
 <label for="rg-user">登录名（2-32 位字母、数字或 _ . @ -）</label>
 <input id="rg-user" name="username" maxlength="32" autocomplete="username"
@@ -12569,14 +13021,14 @@ REGISTER_HTML = """<!doctype html>
   placeholder="13812345678">
 <label for="rg-pass">密码（至少 6 位）</label>
 <span class="pw"><input id="rg-pass" name="password" type="password" autocomplete="new-password" minlength="6" enterkeyhint="next" required>
-<button type="button" class="eye" id="rg-eye" aria-label="显示密码" aria-pressed="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
+<button type="button" class="eye" id="rg-eye" aria-label="显示密码" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
 <label for="rg-pass2">再输一次密码</label>
 <input id="rg-pass2" name="password2" type="password" autocomplete="new-password" minlength="6" enterkeyhint="go" required>
 <p class="hint bad" id="rg-hint" role="alert" hidden></p>
 <button id="rg-go">注册并登录</button></form>
 __ERROR__
 <p class="foot">已经有账号了？<a href="/login">去登录</a><br><a href="https://github.com/BARONCMH/DouYinSparkFlow-OpenSource" target="_blank" rel="noopener noreferrer">项目已开源 · 查看 GitHub</a></p>
-</div>
+</main>
 <script>
 (function(){
   var form=document.querySelector("form[action='/register']");
@@ -12607,7 +13059,8 @@ __ERROR__
   }); }
 })();
 </script>
-<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",dark?"#0b0a0b":"#fff9f9");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+<script>(function(){var b=document.getElementById("auth-theme");function paint(){var dark=document.documentElement.getAttribute("data-theme")==="dark";var label=dark?"白红":"红黑";var action=dark?"切换到白红主题":"切换到红黑主题";if(b){b.textContent=label;b.title=action;b.setAttribute("aria-label",action);}var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content","#ffffff");}if(b)b.onclick=function(){var next=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next);try{localStorage.setItem("dsh-theme",next);}catch(e){}paint();};paint();})();</script></body></html>
+
 """
 
 
@@ -12676,21 +13129,35 @@ DOWNLOAD_MANIFEST = json.dumps(
     separators=(",", ":"),
 )
 
-LEGACY_PUSH_CLEANUP_SW_JS = r"""'use strict';
-self.addEventListener('install', function(event){ event.waitUntil(self.skipWaiting()); });
-self.addEventListener('activate', function(event){
-  event.waitUntil((function(){
-    var manager = self.registration.pushManager;
-    var removeSubscription = manager && manager.getSubscription
-      ? manager.getSubscription().then(function(subscription){ return subscription ? subscription.unsubscribe() : undefined; })
-      : Promise.resolve();
-    return removeSubscription.catch(function(){}).then(function(){ return self.registration.unregister(); });
-  })());
+WEBPUSH_SERVICE_WORKER_JS = r"""'use strict';
+self.addEventListener('push', function (event) {
+  var data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) {}
+  var title = String(data.title || '发送任务已完成').slice(0, 80);
+  var options = {
+    body: String(data.body || '打开续火花控制台查看发送结果').slice(0, 180),
+    icon: '/app-icon-512.png',
+    badge: '/apple-touch-icon.png',
+    tag: String(data.tag || 'sparkflow-send').slice(0, 80),
+    renotify: false,
+    data: { url: '/' }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
 });
-self.addEventListener('push', function(event){
-  event.waitUntil(self.registration.getNotifications().then(function(rows){ rows.forEach(function(row){ row.close(); }); }));
+self.addEventListener('notificationclick', function (event) {
+  event.notification.close();
+  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clients) {
+    for (var i = 0; i < clients.length; i++) {
+      var client = clients[i];
+      if (client.url.indexOf(self.location.origin + '/') === 0 && 'focus' in client) {
+        return client.focus();
+      }
+    }
+    return self.clients.openWindow('/');
+  }));
 });
 """
+
 DOWNLOAD_PAGE_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#087f8c"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="续火花"><meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -12701,12 +13168,12 @@ main{width:min(740px,100% - 32px);margin:42px auto;padding-bottom:40px}.brand{di
 .card{background:#fff;border:1px solid #dce9e9;border-radius:20px;padding:24px;margin:14px 0;box-shadow:0 8px 28px #1a484a0d}.card h1{font-size:24px;line-height:1.25;margin:0 0 8px}.card h2{font-size:17px;margin:0 0 8px}.muted{color:#6a8187;font-size:14px}.download{display:flex;justify-content:center;align-items:center;min-height:54px;border-radius:12px;background:#087f8c;color:white;text-decoration:none;font-weight:700;margin:18px 0 8px}.download:hover{background:#076b76}.download.disabled{background:#82989a;pointer-events:none}.hash{font:12px/1.6 ui-monospace,Consolas,monospace;overflow-wrap:anywhere;background:#f0f6f5;border-radius:10px;padding:10px;color:#405759}.steps{padding-left:22px}.steps li{padding:3px 0}.badge{display:inline-block;background:#e6f6f4;color:#076b76;border-radius:99px;padding:3px 9px;font-size:12px;font-weight:700}a{color:#087f8c}details{padding:13px 0;border-top:1px solid #dce9e9}summary{cursor:pointer;font-weight:700}.foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:14px}
 @media(max-width:600px){main{margin:20px auto;width:calc(100% - 22px)}.card{padding:18px;border-radius:17px}.card h1{font-size:22px}}
 </style></head><body><main><div class="brand"><div class="logo">✦</div><div><b>DouYinSparkFlow</b><span>手机应用与安装说明</span></div></div>
-<section class="card"><span class="badge">Android 安装包</span><h1>把续火花管理放进口袋</h1><p>登录或注册原有网站账号，查看今天的发送状态，管理自己的账号配置。发送结果通知通过你在网站「我的账号」填写的邮箱发送。</p>
+<section class="card"><span class="badge">Android 安装包</span><h1>把续火花管理放进口袋</h1><p>登录或注册原有网站账号，查看今天的发送状态，管理自己的账号配置。开启系统提醒后，发送成功、部分成功或失败都会显示通知；应用打开时检查更及时，后台通知可能受 Android 省电影响而延迟。</p>
 __APK_BUTTON__<div class="muted">安装包大小：__APK_SIZE__ · SHA-256</div><div class="hash">__APK_SHA__</div>
-<p class="muted">首次安装时 Android 可能要求允许浏览器或文件管理器安装此来源的应用。已安装旧版的设备需要先卸载旧版再安装本版，并重新登录；抖音账号配置和发送记录保存在服务器，不受卸载影响。</p></section>
-<section class="card"><h2>iPhone / iPad 主屏幕版</h2><p>这是可安装的网页应用，复用网站账号和普通用户功能，不需要 App Store 安装：</p><ol class="steps"><li>用 Safari 打开 <a href="/login">登录页</a>并登录。</li><li>点分享按钮，选择“添加到主屏幕”。</li><li>确认名称后添加，从主屏幕图标进入。</li></ol><p class="muted">发送结果通知通过你在网站「我的账号」填写的邮箱发送。</p></section>
+<p class="muted">首次安装时 Android 可能要求允许浏览器或文件管理器安装此来源的应用。已安装旧版的设备需要先卸载旧版再安装本版，并重新登录；抖音账号配置和发送记录保存在服务器，不受卸载影响。安装后请在应用内开启系统通知。</p></section>
+<section class="card"><h2>iPhone / iPad 主屏幕版</h2><p>这是可安装的网页应用，复用网站账号和普通用户功能，不需要 App Store 安装：</p><ol class="steps"><li>用 Safari 打开 <a href="/login">登录页</a>并登录。</li><li>点分享按钮，选择“添加到主屏幕”。</li><li>确认名称后添加，从主屏幕图标进入，开启“发送结果通知”。</li></ol><p class="muted">iOS 16.4 及以上版本支持网页推送。通知只在添加到主屏幕并从图标打开后开启；普通 Safari 标签页没有系统推送权限。授权后，发送成功或失败会由服务器推送，即使网页关闭也能收到。</p></section>
 __COOKIE_TOOL_SECTION__
-<section class="card"><h2>安全与校验</h2><p>应用只连接本网站的 HTTPS 地址；TLS 校验失败时会停止连接，不会绕过证书检查。应用不请求通讯录、短信、定位或发送结果通知权限。</p><p class="muted">直接下载适用于网站分发测试，不代表已通过 Google Play 商店审核。安装前可核对上方 SHA-256。</p></section>
+<section class="card"><h2>安全与校验</h2><p>应用只连接本网站的 HTTPS 地址；TLS 校验失败时会停止连接，不会绕过证书检查。应用不请求通讯录、短信或定位权限。Android 通知需单独授权；用于检查发送结果的会话 Cookie 在设备上用 Android Keystore 加密保存。</p><p class="muted">直接下载适用于网站分发测试，不代表已通过 Google Play 商店审核。安装前可核对上方 SHA-256。</p></section>
 <div class="foot"><a href="/login">返回登录</a><a href="/">打开控制台</a></div></main></body></html>"""
 
 
@@ -12982,6 +13449,39 @@ class Handler(BaseHTTPRequestHandler):
                 mine.append(run)
         return mine[:cap]
 
+    def visible_notification_runs(self) -> list:
+        """Small, account-scoped send events for mobile notification polling."""
+        runs = load_sends(SEND_STORE_MAX)
+        if not self._is_admin():
+            scopes = set(self._scopes() or [])
+            names = {str(t.get("username") or "") for t in self.my_accounts()}
+            names.discard("")
+            runs = [
+                run for run in runs
+                if isinstance(run, dict)
+                and (
+                    (str(run.get("unique_id") or "") and str(run.get("unique_id") or "") in scopes)
+                    or (not str(run.get("unique_id") or "") and str(run.get("account") or "") in names)
+                )
+            ]
+        events = []
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            status = str(run.get("status") or "")
+            if status in ("running", "queued"):
+                continue
+            stable = json.dumps(run, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            event_id = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
+            events.append({
+                "event_id": event_id,
+                "at": str(run.get("at") or "")[:40],
+                "account": str(run.get("account") or "")[:80],
+                "unique_id": str(run.get("unique_id") or "")[:80],
+                "status": status[:24],
+            })
+        return events
+
     def visible_logs(self) -> str:
         parts = []
         run_log = tail(RUN_LOG)
@@ -13187,7 +13687,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/service-worker.js":
-            body = LEGACY_PUSH_CLEANUP_SW_JS.encode("utf-8")
+            body = WEBPUSH_SERVICE_WORKER_JS.encode("utf-8")
             self.send_response(200)
             self._sec_headers()
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
@@ -13363,7 +13863,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(
                     {
                         "ok": False,
-                        "error": "「%s」还没保存过 Cookie：先点「开始授权」并用抖音 App 扫码" % unique_id,
+                        "error": "「%s」还没保存过 Cookie：先点「开始授权」用手机号登录" % unique_id,
                     },
                     404,
                 )
@@ -13381,6 +13881,12 @@ class Handler(BaseHTTPRequestHandler):
                     "cookie_text": json.dumps(cookies, ensure_ascii=False, separators=(",", ":")),
                 }
             )
+        elif path == "/api/friends":
+            query = parse_qs(urlparse(self.path).query)
+            uid = str((query.get("unique_id") or [""])[0]).strip()
+            if uid and self._deny_other(uid):
+                return
+            self._json(self.friend_payload(uid))
         elif path == "/api/users":
             if self._deny():
                 return
@@ -13392,10 +13898,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({"codes": redeem_code_overview()})
         elif path == "/api/mobile/notifications":
-            # Kept for older APKs; send-result notifications are retired.
-            self._json({"runs": []})
-        elif path.startswith("/api/webpush/"):
-            self._json({"ok": False, "error": "发送结果推送已停用，请使用邮件通知"}, 410)
+            self._json({"runs": self.visible_notification_runs()})
+        elif path == "/api/webpush/vapid-key":
+            try:
+                self._json({"ok": True, "public_key": webpush_vapid_keys()["public_key"]})
+            except RuntimeError as error:
+                self._json({"ok": False, "error": str(error)}, 503)
         elif path == "/api/sends":
             # limit 只是"这次想要几条"，真正的上限由角色决定：
             # 管理员最多 100 条，普通用户最多 2 条。不传 limit 就只回 2 条 ——
@@ -13479,9 +13987,6 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(image)
         elif path == "/api/logs":
-            if not self._is_admin():
-                self._json({"ok": False, "error": "仅管理员可以查看运行日志"}, 403)
-                return
             self._text(self.visible_logs())
         elif path == "/api/screenshot":
             query = parse_qs(urlparse(self.path).query)
@@ -13586,50 +14091,52 @@ class Handler(BaseHTTPRequestHandler):
         self._json(payload)
 
     def _dispatch(self, path: str) -> None:
-        if path == "/api/email/settings":
+        if path == "/api/webpush/status":
             if not self._same_origin_request():
                 self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
                 return
-            payload = self._body()
-            result = save_email_preferences(
-                self._user(), str(payload.get("address") or ""), payload.get("enabled")
-            )
-            self._json(result, 200 if result.get("ok") else 400)
-        elif path == "/api/email/test":
+            try:
+                payload = self._body()
+                endpoint = str(payload.get("endpoint") or "")
+                _webpush_endpoint_origin(endpoint)
+                subscriptions = _clean_push_subscriptions(WEBPUSH_SUBSCRIPTIONS_STORE.read())["users"]
+                active = any(
+                    item.get("endpoint") == endpoint
+                    for item in subscriptions.get(self._user(), [])
+                )
+            except ValueError as error:
+                self._json({"ok": False, "error": str(error)}, 400)
+                return
+            self._json({"ok": True, "active": active})
+        elif path == "/api/webpush/subscription":
             if not self._same_origin_request():
                 self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
                 return
-            if not smtp_is_configured():
-                self._json({
-                    "ok": False,
-                    "error": "站点邮件服务尚未配置或配置无效，请联系管理员",
-                }, 503)
+            try:
+                payload = self._body()
+                webpush_vapid_keys()
+                result = save_webpush_subscription(self._user(), payload)
+            except RuntimeError as error:
+                self._json({"ok": False, "error": str(error)}, 503)
                 return
-            address = email_preferences(self._user()).get("address") or ""
-            if not address:
-                self._json({"ok": False, "error": "请先填写并保存收件邮箱"}, 400)
+            except (ValueError, TypeError, KeyError) as error:
+                self._json({"ok": False, "error": str(error) or "设备订阅信息无效"}, 400)
                 return
-            remaining = reserve_email_test(self._user(), address)
-            if remaining:
-                self._json({
-                    "ok": False,
-                    "error": "测试邮件发送太频繁，请 %d 秒后重试" % remaining,
-                }, 429)
+            self._json(result, 200 if result.get("ok") else 409)
+        elif path == "/api/webpush/unsubscribe":
+            if not self._same_origin_request():
+                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
                 return
-            result = send_smtp_email(
-                address,
-                "DouYinSparkFlow 邮件通知测试",
-                "这是一封测试邮件。SMTP 已接受发送请求；请检查收件箱和垃圾邮件文件夹。",
-            )
-            if result.get("ok"):
-                self._json({
-                    "ok": True,
-                    "message": "测试邮件已交给 SMTP 服务器，请检查收件箱和垃圾邮件文件夹",
-                })
-            else:
-                self._json(result, 502)
-        elif path.startswith("/api/webpush/"):
-            self._json({"ok": False, "error": "发送结果推送已停用，请使用邮件通知"}, 410)
+            try:
+                payload = self._body()
+                endpoint = str(payload.get("endpoint") or "")
+                if not endpoint:
+                    raise ValueError("设备订阅地址为空")
+                remove_webpush_subscription(self._user(), endpoint)
+            except ValueError as error:
+                self._json({"ok": False, "error": str(error)}, 400)
+                return
+            self._json({"ok": True})
         elif path == "/api/schedule/check":
             payload = self._body()
             error = self._config_guard(payload)
@@ -13648,6 +14155,16 @@ class Handler(BaseHTTPRequestHandler):
                     for x in result.get("occupied", [])
                 ]
             self._json(result)
+        elif path == "/api/friends/refresh":
+            payload = self._body()
+            unique_id = str(payload.get("unique_id") or "").strip()
+            if not unique_id:
+                self._json({"ok": False, "error": "先填好抖音号再来拉好友"}, 400)
+                return
+            if self._deny_other(unique_id):
+                return
+            ok, message = friend_scanner.start(unique_id)
+            self._reply(ok, message)
         elif path == "/api/config":
             payload = self._body()
             error = self._config_guard(payload)
@@ -13898,7 +14415,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._browser_command(path, payload, sess)
         elif path == "/api/auth/phone":
-            self._json({"ok": False, "error": "手机号直登已替换为抖音 App 扫码授权，请启动扫码登录"}, 410)
+            payload = self._body()
+            if not self._browser_owner_ok(payload):
+                self._json({"ok": False, "error": "当前授权浏览器不属于你名下的抖音号"}, 403)
+                return
+            sess = self._my_session(payload)
+            if sess is None or not sess.running():
+                self._json({"ok": False, "error": "授权浏览器没在运行：先点「开始授权」"}, 409)
+                return
+            phone = re.sub(r"\D", "", str(payload.get("phone") or ""))
+            if not re.fullmatch(r"1\d{10}", phone):
+                self._json({"ok": False, "error": "请填 11 位手机号"}, 400)
+                return
+            browser.send("phone", unique_id=str(payload.get("unique_id") or ""), scopes=self._scopes(), phone=phone)
+            self._reply(True, "手机号已提交，正在填进抖音页面…")
         elif path == "/api/auth/sms":
             payload = self._body()
             if not self._browser_owner_ok(payload):
@@ -13998,6 +14528,37 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"ok": False, "error": "未知接口"}, 404)
 
+    def friend_payload(self, unique_id: str) -> dict:
+        """当前这个号的好友列表：正在拉就报进度，拉完了给最新结果。
+
+        内存里的结果优先（刚拉完还没落盘的也在），否则回落到上次存下来的那份。
+        """
+        uid = str(unique_id or "").strip()
+        snap = friend_scanner.snapshot()
+        if uid and snap.get("unique_id") == uid and (snap.get("running") or snap.get("finished_at")):
+            return {
+                "ok": True,
+                "unique_id": uid,
+                "running": bool(snap.get("running")),
+                "error": str(snap.get("error") or ""),
+                "progress": str(snap.get("progress") or ""),
+                "friends": list(snap.get("friends") or []),
+                "targets": list(snap.get("targets") or []),
+                "at": "",
+            }
+        account = load_accounts().get(uid) or {}
+        saved = account.get("friend_list")
+        return {
+            "ok": True,
+            "unique_id": uid,
+            "running": False,
+            "error": "",
+            "progress": "",
+            "friends": [str(x) for x in (saved if isinstance(saved, list) else [])],
+            "targets": [str(x) for x in (account.get("targets") or [])],
+            "at": str(account.get("friend_list_at") or ""),
+        }
+
     def status_payload(self) -> dict:
         # 自动准备二维码已经挪到 _auto_auth_loop 后台心跳里做了；
         # 这里不再顺手调 _scopes()，省得每次轮询都白读一次用户表
@@ -14010,30 +14571,24 @@ class Handler(BaseHTTPRequestHandler):
         is_admin = self._is_admin()
         me = self._user()
         access = subscription_info(me)
-        today = now_text()[:10]
-        visible_runs = load_sends(SEND_STORE_MAX)
+        # 普通用户首页直接展示今天自己的发送结果；管理员继续在完整记录页查看全站记录。
+        today_send = None
         if not is_admin:
-            visible_ids = set(str(x) for x in (self._scopes() or []))
-            visible_names = {str(task.get("username") or "") for task in self.my_accounts()}
-            visible_names.discard("")
-            visible_runs = [
-                run for run in visible_runs
-                if isinstance(run, dict) and (
-                    (str(run.get("unique_id") or "") and str(run.get("unique_id") or "") in visible_ids)
-                    or (not str(run.get("unique_id") or "") and str(run.get("account") or "") in visible_names)
-                )
+            today = now_text()[:10]
+            today_runs = [
+                run for run in self.visible_sends(SEND_MAX_USER)
+                if str(run.get("at") or "").startswith(today)
             ]
-        today_runs = [
-            run for run in visible_runs
-            if isinstance(run, dict) and str(run.get("at") or "").startswith(today)
-        ]
-        today_rows = [{
-            "at": str(run.get("at") or "")[:40],
-            "account": str(run.get("account") or "")[:80],
-            "status": str(run.get("status") or "")[:24],
-            "detail": str(run.get("detail") or "")[:300],
-        } for run in today_runs]
-        today_send = {"date": today, "runs": today_rows, "record": today_rows[0] if today_rows else None}
+            latest = today_runs[0] if today_runs else None
+            today_send = {
+                "date": today,
+                "record": ({
+                    "at": str(latest.get("at") or ""),
+                    "account": str(latest.get("account") or ""),
+                    "status": str(latest.get("status") or ""),
+                    "detail": str(latest.get("detail") or ""),
+                } if latest else None),
+            }
         scopes = self._scopes()  # None = 管理员（全部）
         login_of = {}
         for name, item in load_users().items():
@@ -14071,10 +14626,6 @@ class Handler(BaseHTTPRequestHandler):
                     "has_cookie": bool(item),
                     "cookie_count": len(item),
                     "saved_at": saved_at.get(uid, ""),
-                    "auth_check": (
-                        (state.get("auth_auto_check") or {}).get(uid)
-                        if isinstance(state.get("auth_auto_check"), dict) else None
-                    ),
                     "check": real_check(checks, uid),
                     "login_user": login_of.get(uid, ""),
                     "mine": True if scopes is None else (uid in scopes),
@@ -14143,8 +14694,6 @@ class Handler(BaseHTTPRequestHandler):
                     "started_at": None,
                     "stale": None,
                     "stuck": False,
-                    "timed_out": False,
-                    "timed_out_at": "",
                     "only": "",
                 }
 
@@ -14159,9 +14708,6 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "me": me,
             "is_admin": is_admin,
-            "email_notifications": dict(
-                email_preferences(me), smtp_configured=smtp_is_configured()
-            ),
             "subscription": access,
             "today_send": today_send,
             # 管理员自己的「最近从哪登录」；普通用户不需要，别白给
@@ -14660,12 +15206,12 @@ def main() -> int:
     threading.Thread(
         target=_schedule_loop, args=(heartbeat_stop,), name="daily-scheduler", daemon=True
     ).start()
-    if smtp_is_configured():
+    if _webpush_crypto():
         threading.Thread(
-            target=_email_notify_loop, args=(heartbeat_stop,), name="email-notify", daemon=True
+            target=_webpush_notify_loop, args=(heartbeat_stop,), name="webpush-notify", daemon=True
         ).start()
     else:
-        print("[panel] 邮件通知未启用：请在 panel.env 配置 SMTP", flush=True)
+        print("[panel] Web Push 暂不可用：未安装 cryptography 依赖", flush=True)
     SERVER = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), Handler)
     print("[panel] listening on %s:%d" % (PANEL_HOST, PANEL_PORT), flush=True)
     try:
@@ -14679,21 +15225,38 @@ def main() -> int:
 
 
 def _tighten_log_perms() -> None:
-    """把日志目录里已经存在的文件统一改成 0600（只有自己可读）。"""
-    targets = []
-    try:
-        targets = [p for p in LOG_DIR.iterdir() if p.is_file() and not p.is_symlink()]
-    except Exception:
-        targets = []
-    try:
-        targets += [p for p in SHOT_DIR.iterdir() if p.is_file() and not p.is_symlink()]
-    except Exception:
-        pass
-    for path in targets:
+    """把日志目录里已经存在的文件统一改成 0600（只有自己可读）。
+
+    【为什么不能无脑 chmod】
+    LOG_DIR / SHOT_DIR 实际挂在网络文件系统（COS）上。实测这个挂载：
+      - stat / readdir 很便宜：遍历 729 个文件只要 0.22 秒（约 0.3ms/个）；
+      - chmod 是一次远程元数据调用，约 60ms/个。
+    send-shots 已经攒了 700 多张截图，一次全量 chmod 要 44 秒以上。
+    而看门狗判定"连续 3 次 /login 不通就 force-recreate"，窗口只有约 16 秒，
+    于是容器每次都在启动途中被杀，陷入"重建 -> 又来不及启动 -> 再重建"的死循环，
+    面板再也起不来（只能人工停掉看门狗）。
+    所以这里改成：只对权限确实不是 0600 的文件发 chmod。
+    进程 umask 是 0o77，新写的文件天生就是 0600，正常启动下这里一个远程写都不会发；
+    第一遍只在真的存在历史遗留（比如别人手动拷进来的 0644 文件）时做少量修正。
+    """
+    for base in (LOG_DIR, SHOT_DIR):
         try:
-            os.chmod(path, 0o600)
+            entries = os.scandir(base)
         except Exception:
-            pass
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    # 用 lstat，跳过符号链接（原逻辑就是 not p.is_symlink()）
+                    info = entry.stat(follow_symlinks=False)
+                    # 位运算显式加括号：Python 里 & 的优先级低于 ==，不括会算错
+                    if (info.st_mode & 0o170000) != 0o100000:
+                        continue
+                    if (info.st_mode & 0o777) == 0o600:
+                        continue
+                    os.chmod(entry.path, 0o600)
+                except Exception:
+                    continue
 
 
 def _cleanup_plaintext_leftovers() -> None:

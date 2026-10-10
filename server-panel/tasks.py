@@ -147,7 +147,7 @@ def clear_abort_flag():
 
 
 def mark_need_relogin(account, detail):
-    """登录失效时留个标记，控制台看到就会提示重新扫码。"""
+    """登录失效时留个标记，供面板显示状态并发送邮件提醒。"""
     try:
         os.makedirs(os.path.dirname(REL_LOGIN_FLAG), exist_ok=True)
         with open(REL_LOGIN_FLAG, "w", encoding="utf-8") as handle:
@@ -1475,7 +1475,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
         if list_state == "abort":
             entry["status"] = "no_login"
             entry["reason"] = "no_login"
-            entry["detail"] = "登录已失效（页面弹出了登录框），控制台会自动准备好二维码，扫码即可恢复"
+            entry["detail"] = "登录已失效（页面弹出了登录框），系统不会自动打开授权流程，请登录面板手动重新授权"
+            entry["login_expired"] = True
+            entry["login_failure_detail"] = entry["detail"]
             logger.error(f"账号 {account} 登录已失效，本次不发送")
             mark_need_relogin(account, entry["detail"])
             return
@@ -1660,6 +1662,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
                 item["reason"] = reason
                 item["detail"] = detail
                 if relogin_detail:
+                    item["login_failure_detail"] = relogin_detail
+                    entry["login_expired"] = True
+                    entry["login_failure_detail"] = relogin_detail
                     mark_need_relogin(account, relogin_detail)
 
                 logger.info(
