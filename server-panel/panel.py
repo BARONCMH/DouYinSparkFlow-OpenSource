@@ -13472,7 +13472,7 @@ main{width:min(740px,100% - 32px);margin:42px auto;padding-bottom:40px}.brand{di
 <section class="card"><span class="badge">Android 安装包</span><h1>把续火花管理放进口袋</h1><p>登录或注册原有网站账号，查看今天的发送状态，管理自己的账号配置。开启系统提醒后，发送成功、部分成功或失败都会显示通知；应用打开时检查更及时，后台通知可能受 Android 省电影响而延迟。</p>
 __APK_BUTTON__<div class="muted">安装包大小：__APK_SIZE__ · SHA-256</div><div class="hash">__APK_SHA__</div>
 <p class="muted">首次安装时 Android 可能要求允许浏览器或文件管理器安装此来源的应用。已安装旧版的设备需要先卸载旧版再安装本版，并重新登录；抖音账号配置和发送记录保存在服务器，不受卸载影响。安装后请在应用内开启系统通知。</p></section>
-<section class="card"><h2>iPhone / iPad 主屏幕版</h2><p>这是可安装的网页应用，复用网站账号和普通用户功能，不需要 App Store 安装：</p><ol class="steps"><li>用 Safari 打开 <a href="/login">登录页</a>并登录。</li><li>点分享按钮，选择“添加到主屏幕”。</li><li>确认名称后添加，从主屏幕图标进入，开启“发送结果通知”。</li></ol><p class="muted">iOS 16.4 及以上版本支持网页推送。通知只在添加到主屏幕并从图标打开后开启；普通 Safari 标签页没有系统推送权限。授权后，发送成功或失败会由服务器推送，即使网页关闭也能收到。</p></section>
+<section class="card"><h2>手机浏览器访问</h2><p>用 Safari 或 Chrome 打开网站即可登录和管理。发送成功、失败、超时和登录失效通过你在“我的账号”填写的邮箱通知；需要接收邮件，不依赖手机系统推送权限。</p><ol class="steps"><li>用手机浏览器打开 <a href="/login">登录页</a>并登录。</li><li>进入“我的账号”，填写收件邮箱。</li><li>保存并开启邮件通知，发送一封测试邮件确认设置。</li></ol></section>
 __COOKIE_TOOL_SECTION__
 <section class="card"><h2>安全与校验</h2><p>应用只连接本网站的 HTTPS 地址；TLS 校验失败时会停止连接，不会绕过证书检查。应用不请求通讯录、短信或定位权限。Android 通知需单独授权；用于检查发送结果的会话 Cookie 在设备上用 Android Keystore 加密保存。</p><p class="muted">直接下载适用于网站分发测试，不代表已通过 Google Play 商店审核。安装前可核对上方 SHA-256。</p></section>
 <div class="foot"><a href="/login">返回登录</a><a href="/">打开控制台</a></div></main></body></html>"""
@@ -15630,12 +15630,15 @@ def main() -> int:
     threading.Thread(
         target=_health_check_loop, args=(heartbeat_stop,), name="health-check", daemon=True
     ).start()
-    if WEBPUSH_ENABLED and _webpush_crypto():
-        threading.Thread(
-            target=_webpush_notify_loop, args=(heartbeat_stop,), name="webpush-notify", daemon=True
-        ).start()
+    if WEBPUSH_ENABLED:
+        if _webpush_crypto():
+            threading.Thread(
+                target=_webpush_notify_loop, args=(heartbeat_stop,), name="webpush-notify", daemon=True
+            ).start()
+        else:
+            print("[panel] Web Push 已启用但加密组件不可用", flush=True)
     else:
-        print("[panel] Web Push 暂不可用：未安装 cryptography 依赖", flush=True)
+        print("[panel] Web Push 已关闭，发送结果通知使用 SMTP 邮件", flush=True)
     threading.Thread(
         target=_email_notify_loop, args=(heartbeat_stop,), name="email-notify", daemon=True
     ).start()
