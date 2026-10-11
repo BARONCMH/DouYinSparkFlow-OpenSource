@@ -6,8 +6,7 @@
 ![Docker](https://img.shields.io/badge/Docker-%E2%9C%94-blue?logo=docker)
 ![Android](https://img.shields.io/badge/Android-%E2%9C%94-3DDC84?logo=android)
 
-> 本仓库是 [`2061360308/DouYinSparkFlow`](https://github.com/2061360308/DouYinSparkFlow) 的**分发与集成仓库**：保留上游（MIT）全部源码，并补上多用户 Web 控制台、Android 客户端、Windows Cookie 导出工具，以及可直接校验的成品下载。
->
+
 > 自动化操作可能导致验证码、限流、功能限制、账号封禁或登录态失效。请只操作你本人拥有或已获得明确授权的账号。
 
 ## 🎁 公益服
@@ -16,7 +15,7 @@
 
 这是由自建提供的公益服，与源码仓库**分开运营**，请自行评估风险后使用，并先阅读其服务条款与隐私做法。
 
-**在线入口：[https://124.220.96.161/](https://124.220.96.161/)**
+**在线入口：[https://baronduckwa.icu](https://baronduckwa.icu/)**
 
 > 进入前请先确认域名与证书。请勿向他人提供账号密码、短信验证码或抖音登录凭证，并合理控制任务数量与发送频率。
 >
