@@ -1255,7 +1255,10 @@ def scroll_and_select_user(page, username, targets, skip=None):
                             retries=1,
                             delay=3,
                             url="https://www.douyin.com/chat",
-                            wait_until="domcontentloaded",
+                            # 抖音聊天页有长连接和延迟资源，等待 load/domcontentloaded
+                            # 都可能把一次导航卡满 120 秒；提交后由下面的会话列表
+                            # 检测判断页面是否真正可用。
+                            wait_until="commit",
                         )
                         time.sleep(3)
                         if wait_for_conversation_list(page, timeout=120) == "ready":
@@ -1448,7 +1451,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
             retries=config["taskRetryTimes"],
             delay=5,
             url="https://www.douyin.com/chat",
-            wait_until="domcontentloaded",
+            # 不等待抖音页面的完整 load 事件；聊天页的长连接可能永远不结束。
+            # wait_for_conversation_list 会继续等待真实的会话列表或登录弹窗。
+            wait_until="commit",
         )
 
         time.sleep(5)  # 等待5秒让过可能存在的弹窗
