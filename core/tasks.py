@@ -4,6 +4,8 @@ from utils.config import get_config, get_userData
 from core.msg_builder import build_message
 from core.browser import get_browser
 from core.douyin_im import DouyinIM, STATUS_READY, norm
+from core.douyin_im import JS_LOGIN_DOM
+from core.session_store import SessionStore, capture_state
 
 
 config = get_config()
@@ -11,7 +13,7 @@ userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
 
 
-def do_user_task(browser, username, cookies, targets):
+def do_user_task(browser, username, cookies, targets, unique_id="", fingerprint=""):
     """一个账号的完整流程：门禁 → 滚动找人 → 发送 → 回执确认。
 
     实现委托给 `core.douyin_im.DouyinIM`：
@@ -20,7 +22,9 @@ def do_user_task(browser, username, cookies, targets):
       任务三（发送）    im.type_and_send —— 真实键盘事件 + HTTP/DOM 回执双确认
     拟人化节奏由 cloakbrowser 的 humanize 负责，这里不再叠加延迟。
     """
-    context = browser.new_context()  # 每个任务使用独立的上下文
+    sessions = SessionStore(unique_id, cookies, fingerprint)
+    state = sessions.load()
+    context = browser.new_context(**({"storage_state": state} if state else {}))
     context.set_default_navigation_timeout(
         config["browserActionTimeout"]
     )  # 导航超时（毫秒，config 已换算好）
@@ -30,8 +34,9 @@ def do_user_task(browser, username, cookies, targets):
 
     page = context.new_page()
 
-    # 注入 Cookie
-    context.add_cookies(cookies)
+    # 有快照时已经包含 Cookie、localStorage 和 IndexedDB；只有首次运行才注入配置 Cookie。
+    if state is None:
+        context.add_cookies(cookies)
 
     im = None
     try:
@@ -64,35 +69,39 @@ def do_user_task(browser, username, cookies, targets):
         )
 
         sent_ok = sent_fail = 0
+        uncertain = []
 
         # 生成器：yield 出来的那一刻，对应好友的会话已经被选中
         for friend in im.iter_find_and_select(targets):
             logger.debug(f"账号 {username} 已选中好友 {friend['display']}，准备发送")
             message = build_message()
             r = im.type_and_send(friend, message)
+            if not r["ok"] and r.get("safe_to_retry") is True:
+                logger.warning(
+                    f"账号 {username} → {friend['display']} 发送前失败，重试一次"
+                )
+                try:
+                    if friend.get("reselect") and friend["reselect"]():
+                        r = im.type_and_send(friend, message)
+                except Exception:
+                    logger.warning(traceback.format_exc())
             if r["ok"]:
                 sent_ok += 1
                 logger.info(
                     f"账号 {username} → {friend['display']} 发送成功"
                     f"（{r.get('via')} message_id={r.get('message_id') or '-'}）"
                 )
+            elif r.get("delivery_state") == "uncertain":
+                uncertain.append(friend["display"])
+                logger.warning(
+                    f"账号 {username} → {friend['display']} 发送结果待确认，"
+                    f"为避免重复未自动重试：{r.get('reason') or ''}"
+                )
             else:
                 sent_fail += 1
-                # 重试一次：用 conv_id 重新选中（列表可能已滚动，原来的下标失效）
                 logger.warning(
-                    f"账号 {username} → {friend['display']} 未拿到回执，重试一次"
+                    f"账号 {username} → {friend['display']} 发送失败：{r.get('reason') or ''}"
                 )
-                try:
-                    if friend.get("reselect") and friend["reselect"]():
-                        r2 = im.type_and_send(friend, message)
-                        if r2["ok"]:
-                            sent_ok += 1
-                            sent_fail -= 1
-                            logger.info(
-                                f"账号 {username} → {friend['display']} 重试成功"
-                            )
-                except Exception:
-                    logger.warning(traceback.format_exc())
             # 发送完让列表状态落定，再继续滚动（发送会把该会话移到顶部）
             page.wait_for_timeout(800)
 
@@ -100,7 +109,7 @@ def do_user_task(browser, username, cookies, targets):
         logger.info(
             f"账号 {username} 扫描结束：停止原因={scan.get('stopped')} "
             f"步数={scan.get('steps')} 访问会话={scan.get('visited')} "
-            f"发送成功={sent_ok} 发送失败={sent_fail}"
+            f"发送成功={sent_ok} 发送失败={sent_fail} 待确认={len(uncertain)}"
         )
         if scan.get("missing"):
             # 这两句必须区分开：scanned_all=False 时"没找到"不代表"不存在"
@@ -120,6 +129,13 @@ def do_user_task(browser, username, cookies, targets):
                 f"主列表扫不到，目标可能被折叠"
             )
     finally:
+        if im is not None and im.ready:
+            try:
+                dom = page.evaluate(JS_LOGIN_DOM)
+                if dom.get("hasChatRoot") and not dom.get("loginVisible"):
+                    sessions.save(capture_state(context))
+            except Exception:
+                logger.warning("登录状态快照保存失败，请检查数据目录权限")
         if im is not None:
             try:
                 im.detach()
@@ -150,11 +166,20 @@ def runTasks():
         fingerprint = user.get("fingerprint", None)
         logger.info(f"开始处理账号 {username}")
         # 创建任务
+        browser = None
         try:
             browser = get_browser(fingerprint)
-            do_user_task(browser, username, cookies, targets)
+            do_user_task(
+                browser,
+                username,
+                cookies,
+                targets,
+                user.get("unique_id", ""),
+                fingerprint or "",
+            )
             logger.info(f"账号 {username} 任务完成")
         finally:
             # 关闭浏览器实例
-            browser.close()
-    
+            if browser is not None:
+                browser.close()
+

@@ -19,10 +19,7 @@ os.environ.setdefault("CLOAKBROWSER_AUTO_UPDATE", "false")
 
 
 def get_browser(fingerprint=None):
-    """
-    启动浏览器实例
-    :return: 浏览器实例
-    """
+    """启动浏览器实例。"""
     proxyAddress = get_config()["proxyAddress"]
     headless = not DEBUG
     
@@ -36,19 +33,30 @@ def get_browser(fingerprint=None):
         "--metrics-recording-only",
         "--ignore-gpu-blocklist",
         "--disable-gpu",
-        "--enable-unsafe-swiftshader",
+        # 关闭指纹噪声并固定存储配额，避免每次启动产生不一致的浏览器特征。
+        # SwiftShader 会把软件渲染器特征暴露给页面，不能作为默认参数。
+        "--fingerprint-noise=false",
+        "--fingerprint-storage-quota=2048",
     ]
-    
+
+    # 只有账号明确配置了种子时才固定指纹；否则交给 CloakBrowser 生成默认种子。
     if fingerprint:
         BASE_CHROME_ARGS.append(f"--fingerprint={str(fingerprint)}")
 
+    launch_kwargs = {"headless": headless, "humanize": True, "args": BASE_CHROME_ARGS}
+
     try:
         # 启动浏览器（cloakbrowser 自带 humanize 拟人化，调用方不要再叠加延迟）
-        if proxyAddress:
-            browser = launch(proxy=proxyAddress, headless=headless, humanize=True, args=BASE_CHROME_ARGS)
-        else:
-            browser = launch(headless=headless, humanize=True, args=BASE_CHROME_ARGS)
-        return browser
+        if not proxyAddress:
+            return launch(**launch_kwargs)
+
+        # 使用代理时按出口 IP 匹配时区/语言；GeoIP 服务不可用时安全降级，
+        # 不因代理环境的外部服务故障阻断任务启动。
+        try:
+            return launch(proxy=proxyAddress, geoip=True, **launch_kwargs)
+        except RuntimeError as exc:
+            print(f"GeoIP 自动时区/语言失败，改用本机默认时区继续：{exc}")
+            return launch(proxy=proxyAddress, **launch_kwargs)
     except Exception as e:
         # 捕获浏览器启动错误
         if "Executable doesn't exist" in str(e):
