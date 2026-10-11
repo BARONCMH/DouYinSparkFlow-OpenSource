@@ -21,5 +21,5 @@
 
 ## 链接
 
-- [GitHub 仓库](https://github.com/2061360308/DouYinSparkFlow)
-- [讨论区](https://github.com/2061360308/DouYinSparkFlow/discussions)
+- [GitHub 仓库](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource)
+- [讨论区](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/discussions)

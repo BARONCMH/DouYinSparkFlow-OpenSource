@@ -79,6 +79,7 @@ PANEL_SECRET=
 PANEL_TRUST_PROXY=1
 PANEL_RUN_STORE_SQLITE=0
 PANEL_HEALTH_CHECK_INTERVAL=0
+PANEL_AUTO_AUTH=0
 PANEL_WEBPUSH_ENABLED=0
 ```
 
@@ -87,6 +88,7 @@ PANEL_WEBPUSH_ENABLED=0
 - 只有按下文配置了可信的本机反向代理，并让它覆盖转发头时，才把 `PANEL_TRUST_PROXY` 设为 `1`。不要让公网客户端直接控制这些转发头。
 - `PANEL_RUN_STORE_SQLITE=1` 会把已有的 `logs/send-status.json` 和 `logs/run-events.jsonl` 导入 `logs/run-store.sqlite3`，并继续镜像写回 JSON，便于回滚。先保持 `0` 也完全兼容。
 - `PANEL_HEALTH_CHECK_INTERVAL` 以秒为单位，`0` 表示关闭；例如 `21600` 表示每 6 小时自动检测全部抖音号。发送、授权或手动检测正在运行时，本轮会跳过。
+- `PANEL_AUTO_AUTH=0` 保持登录失效后的自动授权关闭；失效只会发邮件，用户从账号页手动点“授权”。
 - `PANEL_WEBPUSH_ENABLED` 默认 `0`。第三阶段的发送结果通知走邮件；只有确实需要保留旧版浏览器推送时才改成 `1`。
 
 ### 可选：配置发送结果邮件
@@ -138,7 +140,7 @@ sudo docker compose --env-file panel.env -f compose.yml ps
 sudo docker compose --env-file panel.env -f compose.yml logs --tail=100
 ```
 
-正常启动时，`ps` 应显示容器处于 `Up` 状态，日志会显示面板监听 `8080`。容器端口只映射到服务器本机的 `127.0.0.1:18080`。在服务器本机可检查登录页：
+正常启动时，`ps` 应显示容器处于 `Up (healthy)` 状态，日志会显示面板监听 `8080`。容器端口只映射到服务器本机的 `127.0.0.1:18080`。在服务器本机可检查登录页：
 
 ```bash
 curl -I http://127.0.0.1:18080/login

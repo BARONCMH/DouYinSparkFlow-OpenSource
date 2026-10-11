@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -62,23 +63,28 @@ class RunStore:
             "1", "true", "yes", "on"
         }
         if sqlite_enabled:
-            sqlite_path = self.path.with_name("run-store.sqlite3")
-            self._sqlite = SQLiteRunStore(sqlite_path)
-            # Import old files only when the database is empty.  Keep both
-            # formats so rollback to an older image remains possible.
-            if self._sqlite.count() == 0:
-                legacy_runs = self._read_unlocked()
-                legacy_events = []
-                try:
-                    for line in self.event_path.read_text(encoding="utf-8").splitlines():
-                        item = json.loads(line)
-                        if isinstance(item, dict):
-                            legacy_events.append(item)
-                except (FileNotFoundError, OSError, ValueError, TypeError):
-                    pass
-                self._sqlite.replace_runs(legacy_runs)
-                for event in reversed(legacy_events):
-                    self._sqlite.add_event(event)
+            try:
+                sqlite_path = self.path.with_name("run-store.sqlite3")
+                self._sqlite = SQLiteRunStore(sqlite_path)
+                # Import old files only when the database is empty.  Keep both
+                # formats so rollback to an older image remains possible.
+                if self._sqlite.count() == 0:
+                    legacy_runs = self._read_unlocked()
+                    legacy_events = []
+                    try:
+                        for line in self.event_path.read_text(encoding="utf-8").splitlines():
+                            item = json.loads(line)
+                            if isinstance(item, dict):
+                                legacy_events.append(item)
+                    except (FileNotFoundError, OSError, ValueError, TypeError):
+                        pass
+                    self._sqlite.replace_runs(legacy_runs)
+                    # JSONL is append ordered; importing in that same order
+                    # preserves newest-first reads from SQLite.
+                    for event in legacy_events:
+                        self._sqlite.add_event(event)
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -165,7 +171,10 @@ class RunStore:
     def read(self, limit: int = 0, unique_id: str = "") -> list[dict]:
         """Return newest-first records without exposing a mutable internal list."""
         if self._sqlite is not None:
-            return self._sqlite.read(limit=limit, unique_id=unique_id)
+            try:
+                return self._sqlite.read(limit=limit, unique_id=unique_id)
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
         with self._locked():
             runs = self._read_unlocked()
         if unique_id:
@@ -177,6 +186,11 @@ class RunStore:
         wanted = str(run_id or "")
         if not wanted:
             return None
+        if self._sqlite is not None:
+            try:
+                return self._sqlite.get(wanted)
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
         for run in self.read():
             if self._run_key(run) == wanted:
                 return run
@@ -192,33 +206,36 @@ class RunStore:
         record["updated_at"] = _now_text()
         run_id = self._run_key(record)
         if self._sqlite is not None:
-            with self._locked():
-                previous = self._sqlite.get(run_id)
-                runs = self._sqlite.read()
-                index = next((i for i, item in enumerate(runs) if self._run_key(item) == run_id), None)
-                if index is None:
-                    runs.insert(0, record)
-                else:
-                    runs[index] = record
-                runs = self._trim(runs)
-                self._sqlite.replace_runs(runs)
-                self._write_unlocked(runs)
-                old_status = str((previous or {}).get("status") or "")
-                new_status = str(record.get("status") or "")
-                if old_status != new_status and new_status:
-                    event = {
-                        "event_id": uuid4().hex,
-                        "at": record.get("updated_at") or _now_text(),
-                        "type": "run.status",
-                        "run_id": run_id,
-                        "account": str(record.get("account") or ""),
-                        "unique_id": str(record.get("unique_id") or ""),
-                        "from": old_status,
-                        "to": new_status,
-                    }
-                    self._sqlite.add_event(event)
-                    self._write_event_unlocked(event)
-            return record
+            try:
+                with self._locked():
+                    previous = self._sqlite.get(run_id)
+                    runs = self._sqlite.read()
+                    index = next((i for i, item in enumerate(runs) if self._run_key(item) == run_id), None)
+                    if index is None:
+                        runs.insert(0, record)
+                    else:
+                        runs[index] = record
+                    runs = self._trim(runs)
+                    self._sqlite.replace_runs(runs)
+                    self._write_unlocked(runs)
+                    old_status = str((previous or {}).get("status") or "")
+                    new_status = str(record.get("status") or "")
+                    if old_status != new_status and new_status:
+                        event = {
+                            "event_id": uuid4().hex,
+                            "at": record.get("updated_at") or _now_text(),
+                            "type": "run.status",
+                            "run_id": run_id,
+                            "account": str(record.get("account") or ""),
+                            "unique_id": str(record.get("unique_id") or ""),
+                            "from": old_status,
+                            "to": new_status,
+                        }
+                        self._sqlite.add_event(event)
+                        self._write_event_unlocked(event)
+                return record
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
         with self._locked():
             runs = self._read_unlocked()
             index = next(
@@ -252,7 +269,10 @@ class RunStore:
     def events(self, limit: int = 100) -> list[dict]:
         """Read recent lifecycle events, newest first."""
         if self._sqlite is not None:
-            return self._sqlite.events(limit)
+            try:
+                return self._sqlite.events(limit)
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
         try:
             lines = self.event_path.read_text(encoding="utf-8").splitlines()
         except (FileNotFoundError, OSError):
@@ -271,7 +291,10 @@ class RunStore:
 
     def health(self) -> dict:
         if self._sqlite is not None:
-            return self._sqlite.health()
+            try:
+                return self._sqlite.health()
+            except (OSError, sqlite3.Error, RuntimeError):
+                self._sqlite = None
         runs = self.read()
         active = sum(str(item.get("status") or "") in {"running", "queued"} for item in runs)
         latest = max(

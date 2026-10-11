@@ -65,7 +65,7 @@ class EmailOutbox:
             except FileNotFoundError:
                 pass
 
-    def enqueue(self, recipient: str, subject: str, body: str, *, kind: str = "run") -> dict:
+    def enqueue(self, recipient: str, subject: str, body: str, *, kind: str = "run", dedupe_key: str = "") -> dict:
         recipient = str(recipient or "").strip()
         if not valid_email(recipient):
             raise ValueError("收件邮箱格式不正确")
@@ -78,6 +78,7 @@ class EmailOutbox:
             "subject": subject or "DouYinSparkFlow 通知",
             "body": body,
             "kind": str(kind or "run")[:40],
+            "dedupe_key": str(dedupe_key or "")[:160],
             "status": "pending",
             "attempts": 0,
             "created_at": now,
@@ -88,6 +89,12 @@ class EmailOutbox:
         with self._lock:
             data = self._read()
             items = [x for x in data.get("items", []) if isinstance(x, dict)]
+            if dedupe_key:
+                for existing in items:
+                    if (str(existing.get("dedupe_key") or "") == str(dedupe_key)
+                            and str(existing.get("to") or "").lower() == recipient.lower()
+                            and str(existing.get("status") or "") in {"pending", "retry", "sending", "sent"}):
+                        return {"id": str(existing.get("id") or ""), "status": str(existing.get("status") or "queued"), "deduplicated": True}
             items.insert(0, item)
             # Keep pending work and a bounded history.  Old failed entries are
             # retained long enough for an administrator to diagnose SMTP setup.
@@ -158,6 +165,16 @@ class EmailOutbox:
             data = self._read()
             items = [x for x in data.get("items", []) if isinstance(x, dict)]
             changed = False
+            # A process can die after claiming an item.  Do not leave it in
+            # ``sending`` forever; a short lease makes the queue recover on
+            # the next worker tick without sending old work concurrently.
+            for item in items:
+                if (item.get("status") == "sending"
+                        and int(item.get("lease_at") or 0) < now - 600):
+                    item["status"] = "retry"
+                    item["next_attempt_at"] = now
+                    item["last_error"] = "发送进程中断，已自动重试"
+                    changed = True
             for item in items:
                 if len(selected) >= max(1, int(max_items)):
                     break
@@ -167,6 +184,7 @@ class EmailOutbox:
                     continue
                 item["status"] = "sending"
                 item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["lease_at"] = now
                 changed = True
                 selected.append(dict(item))
             if changed:
@@ -183,11 +201,12 @@ class EmailOutbox:
                 self._update(item["id"], lambda row, d=delay, e=safe_error: row.update({
                     "status": "failed" if attempts >= 6 else "retry",
                     "next_attempt_at": int(time.time()) + d,
+                    "lease_at": 0,
                     "last_error": e,
                 }))
             else:
                 sent += 1
                 self._update(item["id"], lambda row: row.update({
-                    "status": "sent", "sent_at": int(time.time()), "last_error": ""
+                    "status": "sent", "sent_at": int(time.time()), "lease_at": 0, "last_error": ""
                 }))
         return {"picked": len(selected), "sent": sent, "failed": failed}

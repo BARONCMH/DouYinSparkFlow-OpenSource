@@ -5,11 +5,11 @@
 ## 1. 准备
 
 1. 安装 Docker 和 Docker Compose
-2. 用 configTool 生成 `.env`（见 [配置生成器](guide/03-配置生成器.md)）。不熟悉配置项的话可先参考仓库里的 [`.env.example`](https://github.com/2061360308/DouYinSparkFlow/blob/main/.env.example)
+2. 用 configTool 生成 `.env`（见 [配置生成器](guide/03-配置生成器.md)）。不熟悉配置项的话可先参考仓库里的 [`.env.example`](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/blob/main/.env.example)
 
 ## 2. 两个容器
 
-项目用 [`docker-compose.yml`](https://github.com/2061360308/DouYinSparkFlow/blob/main/docker-compose.yml) 一次启动两个容器：
+项目用 [`docker-compose.yml`](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/blob/main/docker-compose.yml) 一次启动两个容器：
 
 | 容器 | 作用 |
 | --- | --- |

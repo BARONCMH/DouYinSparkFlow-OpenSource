@@ -8,6 +8,7 @@
 - 部署方式
   - [服务器 Docker（推荐）](deploy/docker.md)
   - [多用户 Web 面板部署](deploy/panel.md)
+  - [面板 Docker 小白教程](deploy/docker-小白教程.md)
   - [云函数](deploy/fc.md)
   - [GitHub Action（过时）](deploy/action.md)
   - [源码部署](deploy/source.md)
@@ -17,8 +18,8 @@
   - [本地代理调试](dev/local-proxy-debug.md)
 - [问答](faq/faq.md)
 - 相关资源
-  - [GitHub 仓库](https://github.com/2061360308/DouYinSparkFlow)
-  - [Release 下载](https://github.com/2061360308/DouYinSparkFlow/releases)
-  - [docker-compose.yml](https://github.com/2061360308/DouYinSparkFlow/blob/main/docker-compose.yml)
-  - [FC ROS 模板](https://github.com/2061360308/DouYinSparkFlow/blob/main/aliyun-fc-ros-template.yaml)
-  - [讨论区](https://github.com/2061360308/DouYinSparkFlow/discussions)
+  - [本项目 GitHub 仓库](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource)
+  - [本项目 Releases](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/releases)
+  - [面板部署目录](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/tree/main/server-panel)
+  - [Android / Cookie 工具](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/tree/main/downloads)
+  - [上游仓库（兼容参考）](https://github.com/2061360308/DouYinSparkFlow)

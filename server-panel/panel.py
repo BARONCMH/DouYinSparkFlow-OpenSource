@@ -94,6 +94,8 @@ TASK_RESERVE_MB = 380  # 有发送任务 / 检测在跑时，额外留这么多�
 MAX_AUTH_SESSIONS = max(1, min(4, int(os.getenv("PANEL_MAX_AUTH_SESSIONS", "3") or 3)))
 MIN_FREE_MB = 300  # 兜底阈值：可用内存低于这个数，任何新浏览器都不再开
 AUTO_AUTH_INTERVAL = 30  # 秒：后台心跳每隔多久看一眼有没有账号需要重新扫码
+# 登录失效只发邮件，不自动占用浏览器准备二维码。管理员或用户仍可手动点授权。
+PANEL_AUTO_AUTH = str(os.getenv("PANEL_AUTO_AUTH", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
 # [本地增强] 秒：后台回收 send.lock 的间隔。
 # 以前这把锁只在网页轮询 /api/status 时顺带释放（snapshot -> _reap），
 # 页面一关就没人轮询，面板会把锁一直攥在手里，后续手动运行会被误判为已有任务。
@@ -882,9 +884,13 @@ def _email_recipients(run: dict, users: dict, accounts_by_name: dict) -> list[st
     admin = data.get("admin") or {}
     if admin.get("enabled") and valid_email(admin.get("email")):
         recipients.append(str(admin["email"]))
+    # Events without an account identity are intentionally administrator-only.
+    # Never fan out a global/system event to every user's mailbox.
+    if not uid:
+        return list(dict.fromkeys(recipients))
     for name, item in (users or {}).items():
         scopes = {str(x) for x in (item.get("accounts") or [])} if isinstance(item, dict) else set()
-        if uid and uid not in scopes:
+        if uid not in scopes:
             continue
         pref = data["users"].get(str(name)) or {}
         if pref.get("enabled") and valid_email(pref.get("email")):
@@ -930,13 +936,48 @@ def _email_notify_loop(stop_event: threading.Event) -> None:
                     # Keep it pending until SMTP is configured; do not mark it
                     # seen and silently lose a notification.
                     continue
+                queued_all = True
                 for recipient in recipients:
                     try:
-                        EMAIL_OUTBOX.enqueue(recipient, subject, body, kind="run")
+                        EMAIL_OUTBOX.enqueue(recipient, subject, body, kind="run:%s" % event_id,
+                                             dedupe_key="run:%s:%s" % (event_id, recipient.lower()))
                     except (ValueError, OSError):
-                        pass
-                seen.add(event_id)
-                seen_order.append(event_id)
+                        queued_all = False
+                if queued_all:
+                    seen.add(event_id)
+                    seen_order.append(event_id)
+            # A task can discover an expired login before it has a terminal
+            # run record.  Turn the marker into one administrator/account mail
+            # and keep a stable marker so it is not sent every poll.
+            relogin = load_relogin() or {}
+            if relogin:
+                marker = json.dumps(relogin, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                event_id = hashlib.sha256(("relogin:" + marker).encode("utf-8")).hexdigest()[:32]
+                if event_id not in seen and smtp_ready():
+                    relogin_account = str(relogin.get("account") or "")
+                    relogin_uid = next(
+                        (uid for uid, name in accounts_by_name.items() if name == relogin_account), ""
+                    )
+                    synthetic = {
+                        "run_id": event_id,
+                        "unique_id": str(relogin.get("unique_id") or relogin_uid),
+                        "account": relogin_account or "抖音账号",
+                        "status": "no_login",
+                        "detail": str(relogin.get("detail") or "登录状态失效，请重新授权"),
+                        "at": str(relogin.get("at") or now_text()),
+                    }
+                    subject, body = _email_message(synthetic)
+                    recipients = _email_recipients(synthetic, users, accounts_by_name)
+                    queued_all = True
+                    for recipient in recipients:
+                        try:
+                            EMAIL_OUTBOX.enqueue(recipient, subject, body, kind="relogin:%s" % event_id,
+                                                 dedupe_key="relogin:%s:%s" % (event_id, recipient.lower()))
+                        except (ValueError, OSError):
+                            queued_all = False
+                    if queued_all:
+                        seen.add(event_id)
+                        seen_order.append(event_id)
             EMAIL_STATE_STORE.write({"initialized": True, "seen": seen_order[-500:], "retry_after": {}})
         except Exception as error:
             log_force("邮件通知后台检查失败", type(error).__name__)
@@ -11418,6 +11459,12 @@ html[data-theme] :focus-visible{outline:3px solid #666!important;outline-offset:
         <div class="row" style="margin-top:10px"><button class="sm ghost" type="button" id="healthRefresh">刷新健康状态</button><span class="muted small" id="healthState"></span></div>
       </div>
       <div class="card">
+        <h2>邮件队列</h2>
+        <p class="sub">查看最近的测试邮件和发送结果；正文不会在这里显示。</p>
+        <div id="emailQueue" class="small muted">读取中…</div>
+        <div class="row" style="margin-top:10px"><button class="sm ghost" type="button" id="emailQueueRefresh">刷新队列</button></div>
+      </div>
+      <div class="card">
         <h2>应急操作</h2>
         <p class="sub">浏览器卡住时用；不会影响已保存的登录状态和配置。</p>
         <div class="row tight">
@@ -11558,6 +11605,22 @@ function loadHealth(){
       + '</div><p class="muted small" style="margin-top:10px">' + esc(diskText) + ' · 自动巡检：' + (n.health_check_interval ? ('每 ' + Math.round(n.health_check_interval / 3600 * 10) / 10 + ' 小时') : '关闭') + '</p>';
   });
 }
+function loadEmailQueue(){
+  var box = $('emailQueue');
+  if(!box){ return; }
+  getJson('api/email/outbox').then(function(data){
+    if(!data || !data.ok){ box.textContent = (data && data.error) || '邮件队列暂时无法读取'; return; }
+    var items = data.items || [];
+    if(!items.length){ box.textContent = data.smtp_configured ? '队列为空' : 'SMTP 尚未配置'; return; }
+    var labels = {pending:'待发送', retry:'等待重试', sending:'发送中', sent:'已发送', failed:'失败'};
+    box.innerHTML = items.slice(0, 12).map(function(item){
+      var tone = item.status === 'sent' ? 'g' : (item.status === 'failed' ? 'r' : 'y');
+      return '<div class="row tight" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:5px 0">'
+        + '<span><span class="badge ' + tone + '"><span class="dot"></span>' + esc(labels[item.status] || item.status || '—') + '</span> '
+        + esc(item.to || '') + '</span><span class="muted small">' + esc(item.kind || '') + '</span></div>';
+    }).join('');
+  });
+}
 function fmtLeft(sec){
   if(sec === null || sec === undefined){ return ''; }
   return sec >= 60 ? (Math.ceil(sec / 60) + ' 分钟') : (sec + ' 秒');
@@ -11607,7 +11670,7 @@ function showPanel(name){
   if(name === 'subscription'){ loadUsers(true); loadSubscriptionAdmin(); }
   if(name === 'records'){ loadSends(); }
   if(name === 'logs'){ loadLogs(true); }
-  if(name === 'system'){ loadHealth(); }
+  if(name === 'system'){ loadHealth(); loadEmailQueue(); }
   if(name === 'accounts'){ loadStatus(); }
 }
 Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b){
@@ -11617,6 +11680,7 @@ Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b)
   };
 });
 if($('healthRefresh')){ $('healthRefresh').onclick = loadHealth; }
+if($('emailQueueRefresh')){ $('emailQueueRefresh').onclick = loadEmailQueue; }
 window.addEventListener('hashchange', function(){ showPanel((location.hash || '').replace('#',''));
  });
 
@@ -15615,11 +15679,12 @@ def main() -> int:
             update_env(old)
     except Exception as error:
         log_force("清理旧自动发送配置失败", type(error).__name__)
-    # 后台心跳：登录失效时自动把二维码准备好（不再占用 /api/status 请求线程）
+    # 登录失效只发邮件；默认不自动启动授权浏览器，避免后台占用设备和内存。
     heartbeat_stop = threading.Event()
-    threading.Thread(
-        target=_auto_auth_loop, args=(heartbeat_stop,), name="auto-auth", daemon=True
-    ).start()
+    if PANEL_AUTO_AUTH:
+        threading.Thread(
+            target=_auto_auth_loop, args=(heartbeat_stop,), name="auto-auth", daemon=True
+        ).start()
     # 后台回收发送锁：不依赖网页轮询，避免锁长期占用导致后续手动运行被拦截
     threading.Thread(
         target=_lock_reaper_loop, args=(heartbeat_stop,), name="lock-reaper", daemon=True

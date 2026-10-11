@@ -56,7 +56,7 @@
 
 **问：有讨论群吗？**
 
-答：有问题优先到 [GitHub Discussions](https://github.com/2061360308/DouYinSparkFlow/discussions) 提问，方便检索和沉淀。
+答：有问题优先到 [GitHub Discussions](https://github.com/BARONCMH/DouYinSparkFlow-OpenSource/discussions) 提问，方便检索和沉淀。
 
 **问：想贡献代码怎么做？**
 
