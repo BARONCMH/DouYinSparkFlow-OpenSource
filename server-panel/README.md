@@ -33,6 +33,10 @@ account counts, run-store health, and log-directory disk usage. It never returns
 cookies, message content, or private filesystem paths. Existing
 `send-status.json` consumers remain compatible.
 
+Administrators can read the lifecycle journal with `GET /api/runs/events?limit=100`.
+The endpoint is admin-only and returns status transitions without cookies or
+message bodies.
+
 For deployment checks, set `PANEL_DRY_RUN=1` in the private `panel.env` and
 start a manual run. The worker will record a `dry_run` result for each eligible
 account without opening a browser or sending anything. Set it back to `0` before

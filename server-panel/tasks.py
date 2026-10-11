@@ -15,6 +15,7 @@ from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 from core.owned.run_store import RunStore
 from core.owned.task_policy import account_timeout_seconds
+from core.owned.account_queue import AccountJob, AccountProcessQueue
 from playwright.sync_api import Response
 import time
 
@@ -1907,57 +1908,61 @@ def _run_panel_accounts_separately():
 
     clear_abort_flag()
     logger.info("开始执行任务；每个抖音号独立计时，上限 %d 秒", timeout_seconds)
-    any_failure = False
-    for user in userData:
-        uid = str(user.get("unique_id") or "").strip()
-        account = str(user.get("username") or uid or "抖音账号")
-        if not uid:
-            logger.warning("账号 %s 缺少 unique_id，本次跳过", account)
-            any_failure = True
-            continue
-        logger.info("开始处理账号 %s（独立上限 %d 秒）", account, timeout_seconds)
+
+    def spawn(job: AccountJob):
         child_environment = os.environ.copy()
-        child_environment["RUN_ONLY_ACCOUNTS"] = uid
+        child_environment["RUN_ONLY_ACCOUNTS"] = job.unique_id
         child_environment["PANEL_ACCOUNT_CHILD"] = "1"
         options = {}
         if os.name == "nt":
             options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             options["start_new_session"] = True
-        started_at = time.time()
-        try:
-            process = subprocess.Popen(
-                [sys.executable, "main.py"],
-                cwd=os.getcwd(),
-                env=child_environment,
-                **options,
+        return subprocess.Popen(
+            [sys.executable, "main.py"],
+            cwd=os.getcwd(),
+            env=child_environment,
+            **options,
+        )
+
+    def on_start(job: AccountJob, _started_at: float):
+        logger.info("开始处理账号 %s（独立上限 %d 秒）", job.account, timeout_seconds)
+
+    def on_complete(job: AccountJob, _started_at: float, returncode):
+        logger.info("账号 %s 任务完成（退出码 %s）", job.account, returncode)
+
+    def on_spawn_failure(job: AccountJob, started_at: float, error: BaseException):
+        logger.error("账号 %s 的发送进程启动失败：%s", job.account, error)
+        _record_account_process_failure(
+            job.user, started_at, detail="发送进程启动失败，请查看运行日志。"
+        )
+
+    def on_process_failure(job: AccountJob, started_at: float, returncode):
+        _record_account_process_failure(job.user, started_at, returncode)
+
+    def on_timeout(job: AccountJob, started_at: float):
+        logger.error("账号 %s 发送超过 %d 秒，停止该账号并继续后续账号", job.account, timeout_seconds)
+        _record_account_timeout(job.user, started_at, timeout_seconds)
+
+    for user in userData:
+        if not str(user.get("unique_id") or "").strip():
+            logger.warning(
+                "账号 %s 缺少 unique_id，本次跳过",
+                str(user.get("username") or "抖音账号"),
             )
-        except Exception as error:
-            logger.error("账号 %s 的发送进程启动失败：%s", account, error)
-            any_failure = True
-            _record_account_process_failure(
-                user, started_at, detail="发送进程启动失败，请查看运行日志。"
-            )
-            continue
-        try:
-            process.wait(timeout=timeout_seconds)
-            logger.info("账号 %s 任务完成（退出码 %s）", account, process.returncode)
-            if process.returncode != 0:
-                any_failure = True
-                _record_account_process_failure(user, started_at, process.returncode)
-        except subprocess.TimeoutExpired:
-            # If the worker exited right at the deadline, don't convert a completed
-            # account run into a timeout.
-            if process.poll() is not None:
-                logger.info("账号 %s 在超时检查前已完成（退出码 %s）", account, process.returncode)
-                if process.returncode != 0:
-                    any_failure = True
-                    _record_account_process_failure(user, started_at, process.returncode)
-                continue
-            logger.error("账号 %s 发送超过 %d 秒，停止该账号并继续后续账号", account, timeout_seconds)
-            _terminate_account_process(process)
-            _record_account_timeout(user, started_at, timeout_seconds)
-            any_failure = True
-    if any_failure:
+
+    queue = AccountProcessQueue(
+        timeout_seconds=timeout_seconds,
+        spawn=spawn,
+        terminate=_terminate_account_process,
+        timeout_error=subprocess.TimeoutExpired,
+        on_start=on_start,
+        on_complete=on_complete,
+        on_spawn_failure=on_spawn_failure,
+        on_process_failure=on_process_failure,
+        on_timeout=on_timeout,
+    )
+    result = queue.run(userData)
+    if not result.ok:
         logger.error("本轮至少有一个抖音账号未正常完成；请检查发送记录和运行日志")
         raise SystemExit(1)

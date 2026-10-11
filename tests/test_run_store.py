@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.owned.run_store import RunStore
 from core.owned.task_policy import account_timeout_seconds
+from core.owned.account_queue import AccountProcessQueue
 
 
 class RunStoreTests(unittest.TestCase):
@@ -49,3 +50,82 @@ class TaskPolicyTests(unittest.TestCase):
                 os.environ.pop("PANEL_ACCOUNT_TIMEOUT_SECONDS", None)
             else:
                 os.environ["PANEL_ACCOUNT_TIMEOUT_SECONDS"] = original
+
+
+class AccountQueueTests(unittest.TestCase):
+    def test_queue_continues_after_spawn_failure(self):
+        class QueueTimeout(Exception):
+            pass
+
+        class Process:
+            def __init__(self, returncode=0):
+                self.returncode = returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        seen = []
+
+        def spawn(job):
+            seen.append(job.unique_id)
+            if job.unique_id == "bad":
+                raise RuntimeError("cannot start")
+            return Process()
+
+        result = AccountProcessQueue(
+            timeout_seconds=5,
+            spawn=spawn,
+            terminate=lambda process: None,
+            timeout_error=QueueTimeout,
+        ).run(
+            [
+                {"unique_id": "bad", "username": "bad"},
+                {"unique_id": "good", "username": "good"},
+            ]
+        )
+
+        self.assertEqual(seen, ["bad", "good"])
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(result.failed, 1)
+
+    def test_queue_marks_timeout_and_continues(self):
+        class QueueTimeout(Exception):
+            pass
+
+        class Process:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+
+            def wait(self, timeout=None):
+                raise QueueTimeout()
+
+            def poll(self):
+                return self.returncode
+
+        processes = []
+        timed_out = []
+
+        def spawn(job):
+            process = Process()
+            processes.append(process)
+            return process
+
+        def terminate(process):
+            process.terminated = True
+            process.returncode = -9
+
+        result = AccountProcessQueue(
+            timeout_seconds=1,
+            spawn=spawn,
+            terminate=terminate,
+            timeout_error=QueueTimeout,
+            on_timeout=lambda job, started_at: timed_out.append(job.unique_id),
+        ).run([{"unique_id": "u1", "username": "one"}])
+
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(timed_out, ["u1"])
+        self.assertTrue(processes[0].terminated)

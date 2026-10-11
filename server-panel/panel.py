@@ -13848,6 +13848,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.status_payload())
         elif path == "/api/health":
             self._json(self.health_payload())
+        elif path == "/api/runs/events":
+            if not self._is_admin():
+                self._json({"ok": False, "error": "只有管理员可以查看任务事件"}, 403)
+                return
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                limit = max(1, min(500, int((query.get("limit") or ["100"])[0])))
+            except ValueError:
+                limit = 100
+            self._json({"ok": True, "events": RUN_STORE.events(limit)})
         elif path == "/api/cookie":
             # 「一键复制 Cookie」按钮点下去才按需读一次：
             # 不塞进 /api/config 那种每秒轮询的接口里，少一分凭证被反复搬运的风险。
