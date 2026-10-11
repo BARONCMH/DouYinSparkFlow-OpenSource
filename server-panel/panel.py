@@ -41,6 +41,11 @@ from urllib.parse import parse_qs, quote, urlparse, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from dotenv import dotenv_values
+# The container starts this file by absolute path (`/app/panel/panel.py`),
+# which makes Python put `/app/panel` on sys.path but not the application root.
+# Keep the project-owned modules importable in both the image and local runs.
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
 from core.owned.run_store import RunStore
 
 BASE_DIR = Path("/app")
