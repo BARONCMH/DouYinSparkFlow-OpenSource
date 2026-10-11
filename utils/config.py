@@ -60,10 +60,41 @@ def get_config():
 
 
 def sanitize_cookies(cookies):
-    for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
+    # Older imports are a list of cookie objects. Newer authorizations store a
+    # Playwright storage_state dict; leave that wrapper intact and only clean
+    # the nested cookie list when it is present.
+    if isinstance(cookies, list):
+        for cookie in cookies:
+            if isinstance(cookie, dict) and "sameSite" in cookie:
+                cookie.pop("sameSite")  # Playwright 可能不支持该字段
+    elif isinstance(cookies, dict):
+        nested = cookies.get("cookies")
+        if isinstance(nested, list):
+            for cookie in nested:
+                if isinstance(cookie, dict) and "sameSite" in cookie:
+                    cookie.pop("sameSite")
     return cookies
+
+
+def parse_cookie_value(raw):
+    """Parse a Cookie/storage_state JSON value without corrupting escapes.
+
+    Storage states contain values such as ``\"maybe\"``. Applying
+    ``unicode_escape`` before JSON parsing turns those escaped quotes into
+    literal quotes and breaks otherwise valid JSON. Parse the value as-is
+    first; only fall back to the old .env compatibility transform when the
+    original text is not valid JSON.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        try:
+            legacy = raw.encode("utf-8").decode("unicode_escape")
+            return json.loads(legacy)
+        except (UnicodeError, json.JSONDecodeError):
+            return None
 
 
 def get_userData():
@@ -91,15 +122,12 @@ def get_userData():
             logger.warning(f"{username} 的任务  缺少 unique_id 字段，已跳过")
             continue
         cookies_key = f"cookies_{unique_id}".upper()
-        cookies_str = (
-            os.getenv(cookies_key, "").encode("utf-8").decode("unicode_escape")
-        )
+        cookies_str = os.getenv(cookies_key, "")
         if not cookies_str:
             logger.warning(f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过")
             continue
-        try:
-            cookies = json.loads(cookies_str)
-        except json.JSONDecodeError:
+        cookies = parse_cookie_value(cookies_str)
+        if cookies is None:
             logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
             continue
 

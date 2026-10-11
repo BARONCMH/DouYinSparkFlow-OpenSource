@@ -19,6 +19,57 @@ from core.owned.account_queue import AccountJob, AccountProcessQueue
 from playwright.sync_api import Response
 import time
 
+
+def _load_task_environment() -> None:
+    """Load the large per-run account payload passed by the panel.
+
+    The panel keeps ``TASKS`` and ``COOKIES_*`` out of ``execve``'s
+    environment because a single Cookie JSON can exceed Linux's per-variable
+    limit.  It passes the values through an inherited memfd (or a 0600
+    temporary file) instead.  ``utils.config.get_userData`` still reads from
+    ``os.environ``, so the worker must merge that payload before calling it.
+    Keep this at module import time, before ``get_userData()`` is evaluated.
+    """
+    source = ""
+    try:
+        fd_text = (os.environ.get("TASK_ENV_FD") or "").strip()
+        file_path = (os.environ.get("TASK_ENV_FILE") or "").strip()
+        if fd_text:
+            try:
+                fd = int(fd_text)
+            except ValueError:
+                fd = -1
+            if fd >= 0:
+                with os.fdopen(os.dup(fd), "r", encoding="utf-8") as handle:
+                    source = handle.read()
+        elif file_path:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                source = handle.read()
+        if not source:
+            return
+        payload = json.loads(source)
+        if not isinstance(payload, dict):
+            return
+        loaded = 0
+        cookie_keys = 0
+        for key, value in payload.items():
+            if not isinstance(key, str) or value is None:
+                continue
+            os.environ[key] = str(value)
+            loaded += 1
+            if key.upper().startswith("COOKIES_"):
+                cookie_keys += 1
+        # Do not print any Cookie values.  This line is deliberately compact so
+        # a failed run still shows whether the hand-off reached the worker.
+        print("[douyin] 已加载发送配置：%d 项，Cookie 账号 %d 个" % (loaded, cookie_keys))
+    except Exception as error:
+        # Let the normal config reader produce its usual per-account warnings;
+        # this diagnostic explains why all accounts may otherwise look empty.
+        print("[douyin] 加载发送配置失败：%s" % type(error).__name__)
+
+
+_load_task_environment()
+
 config = get_config()
 userData = get_userData()
 
