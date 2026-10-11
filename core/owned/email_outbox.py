@@ -65,6 +65,16 @@ class EmailOutbox:
             except FileNotFoundError:
                 pass
 
+    def _trim_items(self, items: list[dict]) -> list[dict]:
+        if len(items) <= self.max_items:
+            return items
+        # Never evict work that has not been delivered merely because a long
+        # SMTP outage created a large history.  Completed rows are the first
+        # candidates for retention cleanup.
+        live = [item for item in items if item.get("status") in {"pending", "retry", "sending"}]
+        done = [item for item in items if item.get("status") not in {"pending", "retry", "sending"}]
+        return (live + done)[: self.max_items]
+
     def enqueue(self, recipient: str, subject: str, body: str, *, kind: str = "run", dedupe_key: str = "") -> dict:
         recipient = str(recipient or "").strip()
         if not valid_email(recipient):
@@ -98,7 +108,7 @@ class EmailOutbox:
             items.insert(0, item)
             # Keep pending work and a bounded history.  Old failed entries are
             # retained long enough for an administrator to diagnose SMTP setup.
-            items = items[: self.max_items]
+            items = self._trim_items(items)
             self._write({"items": items})
         return {"id": item["id"], "status": "queued"}
 
@@ -117,7 +127,7 @@ class EmailOutbox:
                     fn(item)
                     found = dict(item)
                     break
-            self._write({"items": items[: self.max_items]})
+            self._write({"items": self._trim_items(items)})
             return found
 
     @staticmethod
@@ -188,7 +198,7 @@ class EmailOutbox:
                 changed = True
                 selected.append(dict(item))
             if changed:
-                self._write({"items": items[: self.max_items]})
+                self._write({"items": self._trim_items(items)})
         sent = failed = 0
         for item in selected:
             try:
