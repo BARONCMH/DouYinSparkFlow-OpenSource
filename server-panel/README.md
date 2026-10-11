@@ -37,6 +37,12 @@ Administrators can read the lifecycle journal with `GET /api/runs/events?limit=1
 The endpoint is admin-only and returns status transitions without cookies or
 message bodies.
 
+第三阶段还提供持久化邮件 outbox：每个用户可以在“我的账号”填写收件地址并
+开启结果邮件，管理员在私有 `panel.env` 中配置 SMTP。发送成功、失败、超时和
+登录失效会进入重试队列；SMTP 暂时不可用时不会静默丢失。`PANEL_HEALTH_CHECK_INTERVAL`
+设为正数后，后台会在空闲时定期逐个检查全部账号。`PANEL_RUN_STORE_SQLITE=1`
+可启用 `logs/run-store.sqlite3`，并继续保留 JSON 镜像以便回滚。
+
 For deployment checks, set `PANEL_DRY_RUN=1` in the private `panel.env` and
 start a manual run. The worker will record a `dry_run` result for each eligible
 account without opening a browser or sending anything. Set it back to `0` before

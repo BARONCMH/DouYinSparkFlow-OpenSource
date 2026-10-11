@@ -47,6 +47,7 @@ from dotenv import dotenv_values
 if "/app" not in sys.path:
     sys.path.insert(0, "/app")
 from core.owned.run_store import RunStore
+from core.owned.email_outbox import EmailOutbox, valid_email, smtp_ready
 
 BASE_DIR = Path("/app")
 # 配置目录是整目录挂载，/app/.env 是指向它的软链。
@@ -121,6 +122,10 @@ WEBPUSH_SUBSCRIPTIONS_PATH = Path("/app/config/panel-webpush-subscriptions.json"
 WEBPUSH_VAPID_PATH = Path("/app/config/panel-webpush-vapid.json")
 WEBPUSH_STATE_PATH = LOG_DIR / "webpush-state.json"
 WEBPUSH_LIB_DIR = Path("/app/config/webpush-lib")
+EMAIL_OUTBOX_PATH = LOG_DIR / "email-outbox.json"
+EMAIL_STATE_PATH = LOG_DIR / "email-state.json"
+EMAIL_TEST_STATE_PATH = LOG_DIR / "email-test-state.json"
+EMAIL_SETTINGS_PATH = Path("/app/config/panel-email-settings.json")
 MAX_BODY_BYTES = 1000000  # 单次请求体上限，超过直接回 413
 BODY_READ_TIMEOUT = 15  # 秒：读请求体的总时限，客户端只报长度不发内容时不能一直等
 
@@ -353,12 +358,27 @@ WEBPUSH_SUBSCRIPTIONS_STORE = JsonStore(
 WEBPUSH_STATE_STORE = JsonStore(
     WEBPUSH_STATE_PATH, default=lambda: {"initialized": False, "seen": []}
 )
+EMAIL_OUTBOX = EmailOutbox(EMAIL_OUTBOX_PATH)
+EMAIL_STATE_STORE = JsonStore(
+    EMAIL_STATE_PATH, default=lambda: {"initialized": False, "seen": [], "retry_after": {}}
+)
+EMAIL_TEST_STATE_STORE = JsonStore(
+    EMAIL_TEST_STATE_PATH, default=lambda: {"users": {}, "addresses": {}}
+)
+EMAIL_SETTINGS_STORE = JsonStore(
+    EMAIL_SETTINGS_PATH, default=lambda: {"users": {}, "admin": {}}
+)
 
 _WEBPUSH_KEY_LOCK = threading.Lock()
 _WEBPUSH_CRYPTO_CACHE = None
 _WEBPUSH_SUBJECT = (os.getenv("WEBPUSH_SUBJECT") or "https://124.220.96.161/").strip()
 _WEBPUSH_MAX_SUBSCRIPTIONS_PER_USER = 5
 _WEBPUSH_POLL_SECONDS = 5
+WEBPUSH_ENABLED = str(os.getenv("PANEL_WEBPUSH_ENABLED", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    HEALTH_CHECK_INTERVAL = max(0, min(7 * 24 * 3600, int(os.getenv("PANEL_HEALTH_CHECK_INTERVAL", "0") or 0)))
+except ValueError:
+    HEALTH_CHECK_INTERVAL = 0
 
 
 def _webpush_crypto():
@@ -739,6 +759,206 @@ def _webpush_notify_loop(stop_event: threading.Event) -> None:
             })
         except Exception as error:
             log_force("Web Push 后台检查失败", type(error).__name__)
+
+
+# --------------------------------------------------------------------------
+# SMTP 邮件通知：浏览器推送只在用户主动开启时使用；邮件是跨设备的持久通知。
+# --------------------------------------------------------------------------
+def _clean_email_settings(data) -> dict:
+    data = data if isinstance(data, dict) else {}
+    users = data.get("users") if isinstance(data.get("users"), dict) else {}
+    admin = data.get("admin") if isinstance(data.get("admin"), dict) else {}
+    output = {"users": {}, "admin": {}}
+    for name, item in users.items():
+        if not isinstance(item, dict):
+            continue
+        address = str(item.get("email") or "").strip()
+        output["users"][str(name)] = {
+            "email": address if valid_email(address) else "",
+            "enabled": bool(item.get("enabled")) and bool(address and valid_email(address)),
+            "updated_at": str(item.get("updated_at") or ""),
+        }
+    address = str(admin.get("email") or "").strip()
+    output["admin"] = {
+        "email": address if valid_email(address) else "",
+        "enabled": bool(admin.get("enabled")) and bool(address and valid_email(address)),
+        "updated_at": str(admin.get("updated_at") or ""),
+    }
+    return output
+
+
+def email_settings_for(username: str) -> dict:
+    data = _clean_email_settings(EMAIL_SETTINGS_STORE.read())
+    key = "admin" if str(username or "") == str(PANEL_USERNAME) else str(username or "")
+    item = data.get(key) if key == "admin" else data["users"].get(key)
+    item = item if isinstance(item, dict) else {}
+    return {
+        "email": str(item.get("email") or ""),
+        "enabled": bool(item.get("enabled")),
+        "smtp_configured": smtp_ready(),
+        "updated_at": str(item.get("updated_at") or ""),
+    }
+
+
+def save_email_settings(username: str, address: str, enabled: bool) -> dict:
+    username = str(username or "").strip()
+    address = str(address or "").strip()
+    if address and not valid_email(address):
+        return {"ok": False, "error": "邮箱格式不正确"}
+    enabled = bool(enabled)
+    if enabled and not address:
+        return {"ok": False, "error": "开启邮件通知前请先填写邮箱"}
+    now = now_text()
+
+    def apply(data):
+        clean = _clean_email_settings(data)
+        item = {"email": address, "enabled": bool(enabled and address), "updated_at": now}
+        if username == str(PANEL_USERNAME):
+            clean["admin"] = item
+        else:
+            clean["users"][username] = item
+        return clean
+
+    EMAIL_SETTINGS_STORE.update(apply)
+    return {"ok": True, "message": "邮件通知设置已保存", "settings": email_settings_for(username)}
+
+
+def email_test_cooldown(username: str, address: str) -> int:
+    now = int(time.time())
+    data = EMAIL_TEST_STATE_STORE.read()
+    users = data.get("users") if isinstance(data, dict) and isinstance(data.get("users"), dict) else {}
+    addresses = data.get("addresses") if isinstance(data, dict) and isinstance(data.get("addresses"), dict) else {}
+    left_user = max(0, 60 - (now - int(users.get(str(username)) or 0)))
+    left_address = max(0, 300 - (now - int(addresses.get(str(address).lower()) or 0)))
+    return max(left_user, left_address)
+
+
+def mark_email_test(username: str, address: str) -> None:
+    now = int(time.time())
+
+    def apply(data):
+        data = data if isinstance(data, dict) else {}
+        users = data.get("users") if isinstance(data.get("users"), dict) else {}
+        addresses = data.get("addresses") if isinstance(data.get("addresses"), dict) else {}
+        users[str(username)] = now
+        addresses[str(address).lower()] = now
+        # Keep this tiny state file bounded if an installation has many users.
+        return {"users": dict(list(users.items())[-1000:]), "addresses": dict(list(addresses.items())[-1000:])}
+
+    EMAIL_TEST_STATE_STORE.update(apply)
+
+
+def _email_run_event_id(run: dict) -> str:
+    return _push_event_id(run)
+
+
+def _email_message(run: dict) -> tuple[str, str]:
+    labels = {
+        "ok": "发送成功", "partial": "部分发送成功", "failed": "发送失败",
+        "error": "发送出错", "no_login": "账号登录失效", "no_friend": "未找到目标好友",
+        "timeout": "账号发送超时", "queue_timeout": "账号发送超时",
+    }
+    status = str(run.get("status") or "")
+    label = labels.get(status, "发送任务已结束")
+    account = str(run.get("account") or run.get("unique_id") or "抖音账号")[:80]
+    subject = "DouYinSparkFlow · %s · %s" % (account, label)
+    lines = ["发送任务通知", "账号：%s" % account, "结果：%s" % label,
+             "时间：%s" % str(run.get("at") or run.get("finished_at") or now_text())]
+    detail = str(run.get("detail") or "").strip()
+    if detail:
+        lines.append("说明：%s" % detail[:1000])
+    friends = run.get("friends") if isinstance(run.get("friends"), list) else []
+    if friends:
+        ok = sum(1 for item in friends if isinstance(item, dict) and item.get("ok"))
+        lines.append("好友结果：成功 %d，未成功 %d" % (ok, max(0, len(friends) - ok)))
+    lines.append("请登录控制台查看详细记录。")
+    return subject, "\n".join(lines)
+
+
+def _email_recipients(run: dict, users: dict, accounts_by_name: dict) -> list[str]:
+    uid = str(run.get("unique_id") or "")
+    recipients = []
+    data = _clean_email_settings(EMAIL_SETTINGS_STORE.read())
+    admin = data.get("admin") or {}
+    if admin.get("enabled") and valid_email(admin.get("email")):
+        recipients.append(str(admin["email"]))
+    for name, item in (users or {}).items():
+        scopes = {str(x) for x in (item.get("accounts") or [])} if isinstance(item, dict) else set()
+        if uid and uid not in scopes:
+            continue
+        pref = data["users"].get(str(name)) or {}
+        if pref.get("enabled") and valid_email(pref.get("email")):
+            recipients.append(str(pref["email"]))
+    # A run with no unique_id can only be safely sent to the administrator.
+    # De-duplicate addresses so an admin who also owns an account gets one mail.
+    return list(dict.fromkeys(recipients))
+
+
+def _email_notify_loop(stop_event: threading.Event) -> None:
+    """Queue one mail per terminal run and retry SMTP delivery in the outbox."""
+    try:
+        state = EMAIL_STATE_STORE.read()
+        if not isinstance(state, dict) or not state.get("initialized"):
+            baseline = [_email_run_event_id(run) for run in load_sends(SEND_STORE_MAX) if isinstance(run, dict)]
+            EMAIL_STATE_STORE.write({"initialized": True, "seen": baseline[-500:], "retry_after": {}})
+    except Exception as error:
+        log_force("邮件通知初始化失败", type(error).__name__)
+    while not stop_event.wait(5):
+        try:
+            state = EMAIL_STATE_STORE.read()
+            seen_order = [str(x) for x in (state.get("seen") or [])]
+            seen = set(seen_order)
+            if smtp_ready():
+                EMAIL_OUTBOX.process_once(max_items=5)
+            runs = [item for item in load_sends(SEND_STORE_MAX) if isinstance(item, dict)]
+            users = load_users()
+            accounts_by_name = {str(task.get("unique_id") or ""): str(task.get("username") or "") for task in load_tasks()}
+            for run in reversed(runs):
+                status = str(run.get("status") or "")
+                if status in {"running", "queued"}:
+                    continue
+                event_id = _email_run_event_id(run)
+                if event_id in seen:
+                    continue
+                subject, body = _email_message(run)
+                recipients = _email_recipients(run, users, accounts_by_name)
+                if not recipients:
+                    seen.add(event_id)
+                    seen_order.append(event_id)
+                    continue
+                if not smtp_ready():
+                    # Keep it pending until SMTP is configured; do not mark it
+                    # seen and silently lose a notification.
+                    continue
+                for recipient in recipients:
+                    try:
+                        EMAIL_OUTBOX.enqueue(recipient, subject, body, kind="run")
+                    except (ValueError, OSError):
+                        pass
+                seen.add(event_id)
+                seen_order.append(event_id)
+            EMAIL_STATE_STORE.write({"initialized": True, "seen": seen_order[-500:], "retry_after": {}})
+        except Exception as error:
+            log_force("邮件通知后台检查失败", type(error).__name__)
+
+
+def _health_check_loop(stop_event: threading.Event) -> None:
+    """Run an opt-in, serialized login check for every configured account."""
+    if HEALTH_CHECK_INTERVAL <= 0:
+        return
+    while not stop_event.wait(HEALTH_CHECK_INTERVAL):
+        try:
+            if browser.running() or checker.running() or runner.running():
+                continue
+            uids = [str(item.get("unique_id") or "") for item in load_tasks() if str(item.get("unique_id") or "")]
+            if not uids:
+                continue
+            ok, message = checker.start_all(uids)
+            save_state({"health_check": {"at": now_text(), "ok": bool(ok), "message": str(message)}})
+            if not ok:
+                log_force("定时健康巡检未启动", str(message))
+        except Exception as error:
+            log_force("定时健康巡检异常", type(error).__name__)
 
 
 # 退出登录「黑名单」：令牌一旦进来，签名再对也不认。
@@ -7795,6 +8015,17 @@ html[data-theme] h1,html[data-theme] h2,html[data-theme] h3{scroll-margin-top:76
 <p class="muted" id="sub_result" role="status" aria-live="polite"></p>
 </section>
 
+<section id="emailbox">
+<h2>邮件通知</h2>
+<p class="muted">发送成功、失败、超时或登录失效后，结果会发到这里填写的邮箱。邮件由管理员配置的 SMTP 服务发送。</p>
+<div class="grid3" style="margin-top:12px">
+<div><label for="email_address">收件邮箱</label><input id="email_address" type="email" maxlength="254" autocomplete="email" placeholder="name@example.com"></div>
+<div class="checkline" style="align-self:end"><input type="checkbox" id="email_enable"><label for="email_enable">开启邮件通知</label></div>
+<div style="align-self:end"><button id="email_save" type="button">保存邮件设置</button></div>
+</div>
+<div class="row" style="margin-top:10px"><button id="email_test" class="ghost" type="button">发送测试邮件</button><span class="muted" id="email_state" role="status"></span></div>
+</section>
+
 
 <section id="mebox" hidden>
 <h2>修改登录密码</h2>
@@ -10239,6 +10470,43 @@ function initWebPush(){
   };
 }
 
+function loadEmailSettings(){
+  var address = $('email_address'), enabled = $('email_enable'), state = $('email_state');
+  if(!address || !enabled || !state){ return; }
+  getJson('api/email/settings').then(function(data){
+    var s = data && data.settings;
+    if(!s){ state.textContent = '邮件设置暂时无法读取'; return; }
+    address.value = s.email || '';
+    enabled.checked = !!s.enabled;
+    state.textContent = s.smtp_configured ? (s.enabled ? '邮件通知已开启' : '尚未开启邮件通知') : '管理员还没有配置 SMTP';
+    $('email_test').disabled = !s.smtp_configured || !s.email;
+  });
+}
+function bindEmailSettings(){
+  var save = $('email_save'), test = $('email_test'), state = $('email_state');
+  if(!save || !test || !state){ return; }
+  save.onclick = function(){
+    save.disabled = true;
+    post('api/email/settings', {email: $('email_address').value || '', enabled: !!$('email_enable').checked})
+      .then(function(data){
+        save.disabled = false;
+        state.textContent = (data && (data.message || data.error)) || '';
+        toast(state.textContent, !!(data && data.ok));
+        if(data && data.ok){
+          test.disabled = !(data.settings && data.settings.smtp_configured && data.settings.email);
+        }
+      });
+  };
+  test.onclick = function(){
+    test.disabled = true;
+    post('api/email/test', {}).then(function(data){
+      state.textContent = (data && (data.message || data.error)) || '';
+      toast(state.textContent, !!(data && data.ok));
+      test.disabled = false;
+    });
+  };
+}
+
 // 顶部提示条要贴在顶栏下面：手机上顶栏会折成两行、高度变高，这里跟着量一次
 function syncHeadHeight(){
   // 顶栏换成了侧边栏布局里的 .main .top：量它的高度，顶部提示条才会正好落在标题栏下面
@@ -10257,6 +10525,8 @@ function bootChrome(){
   bindAuthWizard();
   bindAnyBox();
   initWebPush();
+  bindEmailSettings();
+  loadEmailSettings();
   initNav();
 }
 if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', bootChrome); }
@@ -11142,6 +11412,12 @@ html[data-theme] :focus-visible{outline:3px solid #666!important;outline-offset:
   <section class="panel" id="p-system">
     <div class="grid2">
       <div class="card">
+        <h2>服务健康</h2>
+        <p class="sub">面板、发送引擎、登录检测、磁盘和邮件队列的安全摘要。</p>
+        <div id="healthSummary" class="small muted">读取中…</div>
+        <div class="row" style="margin-top:10px"><button class="sm ghost" type="button" id="healthRefresh">刷新健康状态</button><span class="muted small" id="healthState"></span></div>
+      </div>
+      <div class="card">
         <h2>应急操作</h2>
         <p class="sub">浏览器卡住时用；不会影响已保存的登录状态和配置。</p>
         <div class="row tight">
@@ -11265,6 +11541,23 @@ function getText(url){
 function getJson(url){
   return fetch(url).then(function(r){ return r.json(); }).catch(function(){ return null; });
 }
+function loadHealth(){
+  var box = $('healthSummary');
+  if(!box){ return; }
+  getJson('api/health').then(function(data){
+    if(!data || !data.ok){ box.textContent = (data && data.error) || '健康状态暂时无法读取'; return; }
+    var svc = data.service || {}, runs = data.runs || {}, disk = data.disk || {}, n = data.notifications || {};
+    var diskText = disk.free_bytes ? ('磁盘剩余 ' + Math.round(disk.free_bytes / 1024 / 1024) + ' MB') : '磁盘信息不可用';
+    box.innerHTML = '<div class="facts">'
+      + '<div><div class="muted">面板</div><div class="kv">' + esc(svc.panel || '—') + '</div></div>'
+      + '<div><div class="muted">发送引擎</div><div class="kv">' + (svc.sender_running ? '运行中' : '空闲') + '</div></div>'
+      + '<div><div class="muted">登录检测</div><div class="kv">' + (svc.checker_running ? '运行中' : '空闲') + '</div></div>'
+      + '<div><div class="muted">邮件队列</div><div class="kv">' + (n.smtp_configured ? (n.queued + ' 条待发') : 'SMTP 未配置') + '</div></div>'
+      + '<div><div class="muted">活动任务</div><div class="kv">' + (runs.active_runs || 0) + '</div></div>'
+      + '<div><div class="muted">存储记录</div><div class="kv">' + (runs.stored_runs || 0) + ' 条 · ' + esc(runs.backend || 'json') + '</div></div>'
+      + '</div><p class="muted small" style="margin-top:10px">' + esc(diskText) + ' · 自动巡检：' + (n.health_check_interval ? ('每 ' + Math.round(n.health_check_interval / 3600 * 10) / 10 + ' 小时') : '关闭') + '</p>';
+  });
+}
 function fmtLeft(sec){
   if(sec === null || sec === undefined){ return ''; }
   return sec >= 60 ? (Math.ceil(sec / 60) + ' 分钟') : (sec + ' 秒');
@@ -11314,6 +11607,7 @@ function showPanel(name){
   if(name === 'subscription'){ loadUsers(true); loadSubscriptionAdmin(); }
   if(name === 'records'){ loadSends(); }
   if(name === 'logs'){ loadLogs(true); }
+  if(name === 'system'){ loadHealth(); }
   if(name === 'accounts'){ loadStatus(); }
 }
 Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b){
@@ -11322,6 +11616,7 @@ Array.prototype.forEach.call(document.querySelectorAll('#nav .nav'), function(b)
     if(location.hash !== '#' + name){ location.hash = name; } else { showPanel(name); }
   };
 });
+if($('healthRefresh')){ $('healthRefresh').onclick = loadHealth; }
 window.addEventListener('hashchange', function(){ showPanel((location.hash || '').replace('#',''));
  });
 
@@ -13922,6 +14217,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "public_key": webpush_vapid_keys()["public_key"]})
             except RuntimeError as error:
                 self._json({"ok": False, "error": str(error)}, 503)
+        elif path == "/api/email/settings":
+            self._json({"ok": True, "settings": email_settings_for(self._user())})
+        elif path == "/api/email/outbox":
+            if not self._is_admin():
+                self._json({"ok": False, "error": "只有管理员可以查看邮件队列"}, 403)
+                return
+            self._json({"ok": True, "items": EMAIL_OUTBOX.snapshot(200), "smtp_configured": smtp_ready()})
         elif path == "/api/sends":
             # limit 只是"这次想要几条"，真正的上限由角色决定：
             # 管理员最多 100 条，普通用户最多 2 条。不传 limit 就只回 2 条 ——
@@ -14109,7 +14411,41 @@ class Handler(BaseHTTPRequestHandler):
         self._json(payload)
 
     def _dispatch(self, path: str) -> None:
-        if path == "/api/webpush/status":
+        if path == "/api/email/settings":
+            if not self._same_origin_request():
+                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
+                return
+            payload = self._body()
+            result = save_email_settings(
+                self._user(), str(payload.get("email") or ""), bool(payload.get("enabled"))
+            )
+            self._json(result, 200 if result.get("ok") else 400)
+        elif path == "/api/email/test":
+            if not self._same_origin_request():
+                self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
+                return
+            settings = email_settings_for(self._user())
+            if not settings.get("email"):
+                self._json({"ok": False, "error": "请先保存收件邮箱"}, 400)
+                return
+            if not smtp_ready():
+                self._json({"ok": False, "error": "服务器还没有配置 SMTP"}, 503)
+                return
+            wait = email_test_cooldown(self._user(), settings["email"])
+            if wait:
+                self._json({"ok": False, "error": "测试邮件发送太频繁，请 %d 秒后再试" % wait}, 429)
+                return
+            try:
+                queued = EMAIL_OUTBOX.enqueue(
+                    settings["email"], "DouYinSparkFlow · 测试邮件",
+                    "这是一封测试邮件。邮件通知队列已经正常登记。", kind="test"
+                )
+            except ValueError as error:
+                self._json({"ok": False, "error": str(error)}, 400)
+                return
+            mark_email_test(self._user(), settings["email"])
+            self._json({"ok": True, "message": "测试邮件已加入发送队列，稍后查收", "item": queued})
+        elif path == "/api/webpush/status":
             if not self._same_origin_request():
                 self._json({"ok": False, "error": "请求来源无效，请刷新后再试"}, 403)
                 return
@@ -14623,6 +14959,12 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "ok": True,
             "generated_at": now_text(),
+            "notifications": {
+                "email_worker": True,
+                "smtp_configured": smtp_ready(),
+                "queued": sum(1 for item in EMAIL_OUTBOX.snapshot(500) if item.get("status") in {"pending", "retry", "sending"}),
+                "health_check_interval": HEALTH_CHECK_INTERVAL,
+            },
             "service": {
                 "panel": "up",
                 "sender_running": bool(runner.running()),
@@ -15285,12 +15627,18 @@ def main() -> int:
     threading.Thread(
         target=_schedule_loop, args=(heartbeat_stop,), name="daily-scheduler", daemon=True
     ).start()
-    if _webpush_crypto():
+    threading.Thread(
+        target=_health_check_loop, args=(heartbeat_stop,), name="health-check", daemon=True
+    ).start()
+    if WEBPUSH_ENABLED and _webpush_crypto():
         threading.Thread(
             target=_webpush_notify_loop, args=(heartbeat_stop,), name="webpush-notify", daemon=True
         ).start()
     else:
         print("[panel] Web Push 暂不可用：未安装 cryptography 依赖", flush=True)
+    threading.Thread(
+        target=_email_notify_loop, args=(heartbeat_stop,), name="email-notify", daemon=True
+    ).start()
     SERVER = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), Handler)
     print("[panel] listening on %s:%d" % (PANEL_HOST, PANEL_PORT), flush=True)
     try:

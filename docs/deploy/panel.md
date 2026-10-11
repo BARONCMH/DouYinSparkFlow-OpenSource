@@ -77,11 +77,17 @@ PANEL_USERNAME=admin
 PANEL_PASSWORD=这里替换为刚生成的随机密码
 PANEL_SECRET=
 PANEL_TRUST_PROXY=1
+PANEL_RUN_STORE_SQLITE=0
+PANEL_HEALTH_CHECK_INTERVAL=0
+PANEL_WEBPUSH_ENABLED=0
 ```
 
 - `PANEL_PASSWORD` 必须设置，否则面板会拒绝启动。请使用唯一的强密码；登录后也可以在面板中修改管理员密码。
 - `PANEL_SECRET` 留空时，程序会生成密钥并保存到 `config/panel-secret`。备份时要保留该文件。若自行填写 `PANEL_SECRET`，之后必须一直保留同一个值；更换密钥会使已保存的抖音登录凭据无法解密，并让现有登录会话失效。
 - 只有按下文配置了可信的本机反向代理，并让它覆盖转发头时，才把 `PANEL_TRUST_PROXY` 设为 `1`。不要让公网客户端直接控制这些转发头。
+- `PANEL_RUN_STORE_SQLITE=1` 会把已有的 `logs/send-status.json` 和 `logs/run-events.jsonl` 导入 `logs/run-store.sqlite3`，并继续镜像写回 JSON，便于回滚。先保持 `0` 也完全兼容。
+- `PANEL_HEALTH_CHECK_INTERVAL` 以秒为单位，`0` 表示关闭；例如 `21600` 表示每 6 小时自动检测全部抖音号。发送、授权或手动检测正在运行时，本轮会跳过。
+- `PANEL_WEBPUSH_ENABLED` 默认 `0`。第三阶段的发送结果通知走邮件；只有确实需要保留旧版浏览器推送时才改成 `1`。
 
 ### 可选：配置发送结果邮件
 
