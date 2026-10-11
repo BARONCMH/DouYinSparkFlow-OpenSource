@@ -8405,6 +8405,27 @@ function post(url, data){
       return {ok: false, httpStatus: 0, error: '网络断了或后端没响应，稍后再试'};
     });
 }
+// 统一的 JSON GET：页面启动时也会读取邮件设置，不能依赖管理员页脚本里
+// 后定义的同名辅助函数。此前这里漏了定义，bootChrome() 在初始化阶段抛出
+// ReferenceError，导致后面的导航和所有按钮都没有绑定点击事件。
+function getJson(url){
+  return fetch(url, {credentials:'same-origin'})
+    .then(function(r){
+      return r.text().then(function(t){
+        var body = null;
+        try { body = JSON.parse(t); } catch(e){ body = null; }
+        if(!body || typeof body !== 'object'){
+          body = {ok:false, error:'HTTP ' + r.status + '（后端返回了无效内容）'};
+        }
+        if(body.httpStatus === undefined){ body.httpStatus = r.status; }
+        return body;
+      });
+    })
+    .catch(function(){ return {ok:false, error:'网络断了或后端没响应'}; });
+}
+// 邮件设置沿用同一套浮层提示；旧版只在管理员页定义了 toast，普通控制台
+// 点击保存邮件设置时会再次遇到未定义函数。
+function toast(text, ok){ flash(text, ok); }
 // ---- 按钮防抖：点一下先锁住，等服务端状态回来再校正 ----
 function lockButton(btn){
   if(!btn){ return true; }
