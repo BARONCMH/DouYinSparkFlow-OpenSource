@@ -128,6 +128,8 @@ EMAIL_OUTBOX_PATH = LOG_DIR / "email-outbox.json"
 EMAIL_STATE_PATH = LOG_DIR / "email-state.json"
 EMAIL_TEST_STATE_PATH = LOG_DIR / "email-test-state.json"
 EMAIL_SETTINGS_PATH = Path("/app/config/panel-email-settings.json")
+# 注册邮箱验证码只保存挑战元数据和 HMAC，绝不落盘验证码明文。
+EMAIL_VERIFY_PATH = Path("/app/config/panel-email-verifications.json")
 MAX_BODY_BYTES = 1000000  # 单次请求体上限，超过直接回 413
 BODY_READ_TIMEOUT = 15  # 秒：读请求体的总时限，客户端只报长度不发内容时不能一直等
 
@@ -369,6 +371,9 @@ EMAIL_TEST_STATE_STORE = JsonStore(
 )
 EMAIL_SETTINGS_STORE = JsonStore(
     EMAIL_SETTINGS_PATH, default=lambda: {"users": {}, "admin": {}}
+)
+EMAIL_VERIFY_STORE = JsonStore(
+    EMAIL_VERIFY_PATH, default=lambda: {"challenges": {}}
 )
 
 _WEBPUSH_KEY_LOCK = threading.Lock()
@@ -2778,6 +2783,12 @@ USERNAME_RE = r"[A-Za-z0-9_.@-]{2,32}"
 # 注册要填的手机号：只要中国大陆 11 位手机号。不要验证码、不校验唯一，仅作联系方式。
 PHONE_RE = r"1[3-9][0-9]{9}"
 
+# 自助注册邮箱是可选的：留空就沿用原来的注册流程；填了邮箱则先完成邮件验证码验证。
+EMAIL_VERIFY_TTL = 10 * 60
+EMAIL_VERIFY_COOLDOWN = 60
+EMAIL_VERIFY_MAX_ATTEMPTS = 5
+EMAIL_VERIFY_MAX_CHALLENGES = 2000
+
 # 账号时长：老用户没有 access 字段，按历史约定永久有效；新注册用户从创建时起试用 3 天。
 TRIAL_DAYS = 3
 REDEEM_DURATIONS = {
@@ -2940,8 +2951,178 @@ def _phone_error(phone: str, required: bool = True) -> str:
     return ""
 
 
+def _email_error(address: str, required: bool = False) -> str:
+    """注册邮箱校验；空值只在 required=True 时视为错误。"""
+    address = str(address or "").strip()
+    if not address:
+        return "请填邮箱" if required else ""
+    if not valid_email(address):
+        return "邮箱格式不正确"
+    return ""
+
+
+def _register_email_digest(challenge: str, address: str, code: str) -> str:
+    """绑定挑战、邮箱和验证码的 HMAC；文件里只留这个摘要。"""
+    payload = "register-email-v1|%s|%s|%s" % (
+        str(challenge or ""), str(address or "").strip().lower(), str(code or "")
+    )
+    return hmac.new(SESSION_SECRET, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _clean_register_email_challenges(data) -> dict:
+    """清理过期/损坏的注册邮箱挑战，限制持久化文件大小。"""
+    raw = data.get("challenges") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    now = int(time.time())
+    kept = {}
+    for challenge, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            expires = int(item.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if expires <= now:
+            continue
+        address = str(item.get("email") or "").strip().lower()
+        digest = str(item.get("digest") or "")
+        if not challenge or not valid_email(address) or len(digest) != 64:
+            continue
+        try:
+            attempts = max(0, int(item.get("attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        try:
+            created_at = int(item.get("created_at") or now)
+        except (TypeError, ValueError):
+            created_at = now
+        kept[str(challenge)] = {
+            "email": address,
+            "digest": digest,
+            "created_at": created_at,
+            "expires_at": expires,
+            "attempts": attempts,
+            "ip": str(item.get("ip") or "")[:80],
+        }
+    # Keep the newest challenges if a broken client creates many of them.
+    if len(kept) > EMAIL_VERIFY_MAX_CHALLENGES:
+        ordered = sorted(kept.items(), key=lambda pair: int(pair[1].get("created_at") or 0), reverse=True)
+        kept = dict(ordered[:EMAIL_VERIFY_MAX_CHALLENGES])
+    return {"challenges": kept}
+
+
+def request_register_email_code(address: str, ip: str = "") -> dict:
+    """生成并排队一封注册验证码邮件；不返回验证码明文。"""
+    address = str(address or "").strip().lower()
+    error = _email_error(address, required=True)
+    if error:
+        return {"ok": False, "error": error}
+    if not smtp_ready():
+        return {"ok": False, "error": "服务器还没有配置邮件服务；可以不填写邮箱直接注册", "code": "smtp_unavailable"}
+    now = int(time.time())
+    ip = str(ip or "").strip()[:80]
+    existing = _clean_register_email_challenges(EMAIL_VERIFY_STORE.read()).get("challenges", {})
+    # Same address and source are both throttled.  This keeps accidental double clicks
+    # and bulk requests from filling the SMTP outbox.
+    for item in existing.values():
+        try:
+            created = int(item.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if now - created < EMAIL_VERIFY_COOLDOWN and (
+            str(item.get("email") or "") == address or (ip and str(item.get("ip") or "") == ip)
+        ):
+            return {"ok": False, "error": "验证码发送太频繁，请稍后再试", "retry_after": max(1, EMAIL_VERIFY_COOLDOWN - (now - created))}
+    challenge = secrets.token_urlsafe(24)
+    code = "%06d" % secrets.randbelow(1000000)
+    try:
+        EMAIL_OUTBOX.enqueue(
+            address,
+            "DouYinSparkFlow · 注册验证码",
+            "你的注册验证码是：%s\n\n验证码 10 分钟内有效。若不是你本人操作，请忽略这封邮件。" % code,
+            kind="register-email",
+            dedupe_key="register-email:" + challenge,
+        )
+    except (ValueError, RuntimeError) as error:
+        return {"ok": False, "error": str(error) or "验证码邮件暂时无法发送"}
+
+    digest = _register_email_digest(challenge, address, code)
+
+    def _apply(data):
+        clean = _clean_register_email_challenges(data)
+        clean["challenges"][challenge] = {
+            "email": address,
+            "digest": digest,
+            "created_at": now,
+            "expires_at": now + EMAIL_VERIFY_TTL,
+            "attempts": 0,
+            "ip": ip,
+        }
+        return clean
+
+    EMAIL_VERIFY_STORE.update(_apply)
+    return {
+        "ok": True,
+        "challenge": challenge,
+        "expires_in": EMAIL_VERIFY_TTL,
+        "message": "验证码已加入发送队列，请查收邮箱",
+    }
+
+
+def check_register_email_code(address: str, challenge: str, code: str) -> dict:
+    """校验注册验证码但暂不消费，只有用户创建成功后才标记已使用。"""
+    address = str(address or "").strip().lower()
+    challenge = str(challenge or "").strip()
+    code = str(code or "").strip()
+    if _email_error(address, required=True) or not challenge or not re.fullmatch(r"[0-9]{6}", code):
+        return {"ok": False, "error": "邮箱验证码不正确或已过期"}
+    result = {"ok": False, "error": "邮箱验证码不正确或已过期"}
+    now = int(time.time())
+
+    def _apply(data):
+        clean = _clean_register_email_challenges(data)
+        item = clean["challenges"].get(challenge)
+        if not isinstance(item, dict) or str(item.get("email") or "") != address:
+            return clean
+        try:
+            attempts = int(item.get("attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        if attempts >= EMAIL_VERIFY_MAX_ATTEMPTS or int(item.get("expires_at") or 0) <= now:
+            clean["challenges"].pop(challenge, None)
+            return clean
+        expected = str(item.get("digest") or "")
+        if not hmac.compare_digest(expected, _register_email_digest(challenge, address, code)):
+            item["attempts"] = attempts + 1
+            if item["attempts"] >= EMAIL_VERIFY_MAX_ATTEMPTS:
+                clean["challenges"].pop(challenge, None)
+            result["error"] = "邮箱验证码不正确或已过期"
+            return clean
+        result.update({"ok": True, "email": address, "challenge": challenge})
+        return clean
+
+    EMAIL_VERIFY_STORE.update(_apply)
+    return result
+
+
+def consume_register_email_code(challenge: str) -> None:
+    """用户创建成功后删除挑战，防止同一个验证码再次注册。"""
+    challenge = str(challenge or "").strip()
+    if not challenge:
+        return
+
+    def _apply(data):
+        clean = _clean_register_email_challenges(data)
+        clean["challenges"].pop(challenge, None)
+        return clean
+
+    EMAIL_VERIFY_STORE.update(_apply)
+
+
 def create_user(name: str, password: str, again=None, phone: str = "",
-                require_phone: bool = False) -> dict:
+                require_phone: bool = False, email: str = "",
+                email_verified_at: str = "") -> dict:
     """注册新用户。
 
     phone 是手机号：自注册必须填（require_phone=True）；
@@ -2950,12 +3131,16 @@ def create_user(name: str, password: str, again=None, phone: str = "",
     name = str(name or "").strip()
     password = str(password or "")
     phone = str(phone or "").strip()
+    email = str(email or "").strip().lower()
     error = _name_error(name)
     if error:
         return {"ok": False, "error": error}
     phone_error = _phone_error(phone, required=require_phone)
     if phone_error:
         return {"ok": False, "error": phone_error}
+    email_error = _email_error(email, required=False)
+    if email_error:
+        return {"ok": False, "error": email_error}
     if again not in (None, "") and str(again) != password:
         return {"ok": False, "error": "两次输入的密码不一样"}
     if len(password) < 6:
@@ -2975,6 +3160,8 @@ def create_user(name: str, password: str, again=None, phone: str = "",
             "at": now_text(),
             "last_login": now_text(),
             "phone": phone,
+            "email": email,
+            "email_verified_at": str(email_verified_at or "") if email else "",
             "accounts": [],
             "key": secrets.token_hex(8),  # 令牌里带上它：用户被删掉后，旧登录立刻失效
             "access": _new_trial_access(created_at),
@@ -13384,6 +13571,15 @@ REGISTER_HTML = """<!doctype html>
 <input id="rg-phone" name="phone" type="tel" inputmode="numeric" maxlength="11"
   pattern="1[3-9][0-9]{9}" autocomplete="tel" enterkeyhint="next" required
   placeholder="13812345678">
+<label for="rg-email">邮箱（可选；填写后需要验证码）</label>
+<div style="display:flex;gap:8px;align-items:center"><input id="rg-email" name="email" type="email" maxlength="254"
+  autocomplete="email" enterkeyhint="next" placeholder="name@example.com" style="flex:1;min-width:0">
+<button id="rg-email-code" type="button" class="ghost" style="width:auto;white-space:nowrap;padding:11px 12px">获取验证码</button></div>
+<input id="rg-email-challenge" name="email_challenge" type="hidden">
+<label for="rg-email-code-input">邮箱验证码 <span style="font-weight:400;color:#888">（填写邮箱后必填）</span></label>
+<input id="rg-email-code-input" name="email_code" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+  pattern="[0-9]{6}" placeholder="6 位数字；不填邮箱可留空">
+<p class="hint" id="rg-email-hint" role="status" aria-live="polite"></p>
 <label for="rg-pass">密码（至少 6 位）</label>
 <span class="pw"><input id="rg-pass" name="password" type="password" autocomplete="new-password" minlength="6" enterkeyhint="next" required>
 <button type="button" class="eye" id="rg-eye" aria-label="显示密码" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.8"/></svg></button></span>
@@ -13397,12 +13593,27 @@ __ERROR__
 <script>
 (function(){
   var form=document.querySelector("form[action='/register']");
-  var u=document.getElementById("rg-user"), ph=document.getElementById("rg-phone"), p1=document.getElementById("rg-pass"), p2=document.getElementById("rg-pass2");
+  var u=document.getElementById("rg-user"), ph=document.getElementById("rg-phone"), em=document.getElementById("rg-email"), ec=document.getElementById("rg-email-code-input"), ech=document.getElementById("rg-email-challenge"), eb=document.getElementById("rg-email-code"), eh=document.getElementById("rg-email-hint"), p1=document.getElementById("rg-pass"), p2=document.getElementById("rg-pass2");
   var go=document.getElementById("rg-go"), eye=document.getElementById("rg-eye"), hint=document.getElementById("rg-hint");
   if(u) u.focus();
   if(eye&&p1&&p2){ eye.onclick=function(){ var show=p1.type==="password"; p1.type=p2.type=show?"text":"password";
     eye.setAttribute("aria-pressed", show?"true":"false"); eye.setAttribute("aria-label", show?"隐藏密码":"显示密码"); }; }
   var PHONE_RE_JS=/^1[3-9][0-9]{9}$/, bad=null;
+  var EMAIL_RE_JS=/^[^\\s@<>]+@[^\\s@<>]+\\.[^\\s@<>]+$/;
+  if(eb){ eb.addEventListener("click", function(){
+    var address=(em&&em.value||"").trim().toLowerCase();
+    if(!address){ if(eh){ eh.textContent="先填写邮箱；不需要邮箱验证可以直接注册"; eh.className="hint bad"; } if(em){ em.focus(); } return; }
+    if(!EMAIL_RE_JS.test(address)){ if(eh){ eh.textContent="邮箱格式不正确"; eh.className="hint bad"; } if(em){ em.focus(); } return; }
+    eb.disabled=true; eb.textContent="发送中…";
+    fetch("/api/register/email-code", {method:"POST", headers:{"Content-Type":"application/json"}, credentials:"same-origin", body:JSON.stringify({email:address})})
+      .then(function(r){ return r.json().catch(function(){ return {ok:false,error:"服务器返回无效"}; }); })
+      .then(function(data){
+        if(data.ok){ if(ech){ ech.value=data.challenge||""; } if(em){ em.dataset.challengeEmail=address; } if(eh){ eh.textContent=data.message||"验证码已发送，请查收邮箱"; eh.className="hint"; } if(ec){ ec.focus(); } }
+        else { if(eh){ eh.textContent=data.error||"验证码发送失败"; eh.className="hint bad"; } }
+      }).catch(function(){ if(eh){ eh.textContent="验证码发送失败：网络断了或后端没响应"; eh.className="hint bad"; } })
+      .finally(function(){ eb.disabled=false; eb.textContent="获取验证码"; });
+  }); }
+  if(em){ em.addEventListener("input", function(){ if(ech && em.value.trim().toLowerCase()!==em.dataset.challengeEmail){ ech.value=""; } }); }
   function check(){
     if(!hint||!p1||!p2) return true;
     bad=null;
@@ -13411,11 +13622,17 @@ __ERROR__
       if(!pv){ bad=ph; hint.textContent="请填手机号"; hint.hidden=false; return false; }
       if(!PHONE_RE_JS.test(pv)){ bad=ph; hint.textContent="手机号要填 11 位数字（比如 13812345678）"; hint.hidden=false; return false; }
     }
+    if(em){
+      var ev=em.value.trim();
+      if(ev && (!EMAIL_RE_JS.test(ev) || !ech || !ech.value || !ec || !/^[0-9]{6}$/.test(ec.value.trim()))){ bad=(!EMAIL_RE_JS.test(ev)?em:ec); hint.textContent="填写邮箱后，请先获取并填入 6 位邮箱验证码"; hint.hidden=false; return false; }
+    }
     if(p2.value && p1.value!==p2.value){ bad=p2; hint.textContent="两次输入的密码不一样"; hint.hidden=false; return false; }
     hint.hidden=true; return true;
   }
   if(ph) ph.addEventListener("blur", function(){ if(ph.value.trim()) check(); });
   if(ph) ph.addEventListener("input", function(){ if(hint&&!hint.hidden) check(); });
+  if(em) em.addEventListener("blur", function(){ if(em.value.trim()) check(); });
+  if(ec) ec.addEventListener("input", function(){ if(hint&&!hint.hidden) check(); });
   if(p2) p2.addEventListener("input", check);
   if(p1) p1.addEventListener("input", function(){ if(hint&&!hint.hidden) check(); });
   if(form){ form.addEventListener("submit", function(e){
@@ -14397,6 +14614,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/register/email-code":
+            # 这是注册页唯一的未登录 JSON 接口。校验浏览器来源（若有）并
+            # 由独立的邮箱/IP 冷却限制防止跨站或脚本批量请求验证码。
+            source = str(self.headers.get("Origin") or self.headers.get("Referer") or "").strip()
+            host = str(self.headers.get("Host") or "").strip().lower()
+            if source:
+                try:
+                    parsed = urlsplit(source)
+                    if not parsed.netloc or parsed.netloc.lower() != host or parsed.username or parsed.password:
+                        self._json({"ok": False, "error": "请求来源无效，请刷新注册页后再试"}, 403)
+                        return
+                except Exception:
+                    self._json({"ok": False, "error": "请求来源无效，请刷新注册页后再试"}, 403)
+                    return
+            if not register_allowed():
+                self._json({"ok": False, "error": "注册已经关闭了"}, 403)
+                return
+            payload = self._body()
+            result = request_register_email_code(
+                str(payload.get("email") or ""), self._client_ip()
+            )
+            self._json(result, 200 if result.get("ok") else (503 if result.get("code") == "smtp_unavailable" else 400))
+            return
         if path == "/login":
             form = self._form()
             user = str(form.get("username", "")).strip()
@@ -14446,13 +14686,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             note_register_attempt(reg_ip)
             form = self._form()
+            email = str(form.get("email") or "").strip().lower()
+            email_challenge = str(form.get("email_challenge") or "").strip()
+            email_code = str(form.get("email_code") or "").strip()
+            email_verified_at = ""
+            if email:
+                checked = check_register_email_code(email, email_challenge, email_code)
+                if not checked.get("ok"):
+                    self._html(render_register(checked.get("error", "邮箱验证码不正确或已过期")))
+                    return
+                email_verified_at = now_text()
             result = create_user(
                 form.get("username", ""), form.get("password", ""), form.get("password2"),
-                form.get("phone", ""), require_phone=True,
+                form.get("phone", ""), require_phone=True, email=email,
+                email_verified_at=email_verified_at,
             )
             if not result.get("ok"):
                 self._html(render_register(result.get("error", "注册失败")))
                 return
+            if email:
+                consume_register_email_code(email_challenge)
             token = make_token(result["user"], "", False, result.get("key", ""))
             self._redirect("/", self._sid_cookie(token))
             return
