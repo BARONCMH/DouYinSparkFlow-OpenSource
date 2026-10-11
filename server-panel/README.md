@@ -16,6 +16,28 @@ The panel's users and Douyin accounts are configured in its web interface. `conf
 
 Optional email notifications use SMTP settings in the private `panel.env`. Each panel user can set their own recipient address and enable or disable send-result emails from “My Account”; the account owner can send a throttled test email before enabling notifications. See the deployment guide for provider examples and TLS settings.
 
+## Project-owned backend boundary
+
+The panel now keeps task lifecycle persistence in `core/owned/run_store.py`. The
+worker and web panel share the same atomic run store and lifecycle event journal,
+while the Douyin browser code stays behind the existing integration modules.
+This prevents a late account timeout from overwriting another account's result
+and gives future clients a stable operational endpoint:
+
+```text
+GET /api/health
+```
+
+The endpoint requires a signed-in panel session and returns service state,
+account counts, run-store health, and log-directory disk usage. It never returns
+cookies, message content, or private filesystem paths. Existing
+`send-status.json` consumers remain compatible.
+
+For deployment checks, set `PANEL_DRY_RUN=1` in the private `panel.env` and
+start a manual run. The worker will record a `dry_run` result for each eligible
+account without opening a browser or sending anything. Set it back to `0` before
+normal use.
+
 Keep `panel.env`, `config/`, and `logs/` private. They contain credentials, encrypted account state, and logs. `PANEL_SECRET` must remain stable after account credentials are saved; if it is left empty, the panel persists a generated value in `config/panel-secret`.
 
 To let the panel serve the public downloads, copy the files into `logs/app-downloads/` from this directory:

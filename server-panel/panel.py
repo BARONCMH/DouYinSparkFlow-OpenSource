@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import shutil
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 try:
@@ -40,6 +41,7 @@ from urllib.parse import parse_qs, quote, urlparse, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from dotenv import dotenv_values
+from core.owned.run_store import RunStore
 
 BASE_DIR = Path("/app")
 # 配置目录是整目录挂载，/app/.env 是指向它的软链。
@@ -70,6 +72,7 @@ AUTH_IDLE_STOP = 3 * 60  # 秒：授权浏览器超过 3 分钟没人扫码/没�
 SEND_STORE_MAX = 100
 SEND_MAX_USER = 2  # 普通用户最多看自己名下最近 2 次
 SEND_MAX_ADMIN = 100  # 管理员最多看最近 100 次
+RUN_STORE = RunStore(SEND_LOG, keep_per_account=25, max_runs=SEND_STORE_MAX)
 # 同时允许多少个"授权浏览器"（每个号一个独立会话，各扫各的）。
 #
 # 数字来自 2026-09-18 在容器里的真实测量（加载抖音页、量 PSS 真实占用）：
@@ -1584,11 +1587,9 @@ def now_text() -> str:
 def load_sends(limit: int = 2) -> list:
     """读取程序写下的发送结果记录。"""
     try:
-        data = json.loads(SEND_LOG.read_text(encoding="utf-8"))
+        return RUN_STORE.read(limit=max(0, int(limit)))
     except Exception:
         return []
-    runs = data.get("runs") if isinstance(data, dict) else None
-    return runs[:limit] if isinstance(runs, list) else []
 
 
 def schedule_spec_canon(text) -> str:
@@ -13845,6 +13846,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"browser": browser.snapshot_for(self._scopes(), uid), "run": runner.snapshot()})
         elif path == "/api/status":
             self._json(self.status_payload())
+        elif path == "/api/health":
+            self._json(self.health_payload())
         elif path == "/api/cookie":
             # 「一键复制 Cookie」按钮点下去才按需读一次：
             # 不塞进 /api/config 那种每秒轮询的接口里，少一分凭证被反复搬运的风险。
@@ -14557,6 +14560,67 @@ class Handler(BaseHTTPRequestHandler):
             "friends": [str(x) for x in (saved if isinstance(saved, list) else [])],
             "targets": [str(x) for x in (account.get("targets") or [])],
             "at": str(account.get("friend_list_at") or ""),
+        }
+
+    def health_payload(self) -> dict:
+        """Return a safe operational summary for the signed-in user.
+
+        This endpoint is intentionally separate from ``/api/status``: the
+        normal dashboard can poll it less often, while operators and future
+        clients get one stable health contract that does not include cookies,
+        message text, or filesystem paths.
+        """
+        runs = RUN_STORE.health()
+        accounts = self.my_accounts()
+        failures = task_login_failures()
+        if not self._is_admin():
+            visible_ids = {str(item.get("unique_id") or "") for item in accounts}
+            failures = {
+                uid: item for uid, item in failures.items()
+                if uid in visible_ids
+            }
+            visible_runs = self.visible_sends(SEND_MAX_USER)
+            runs = dict(runs)
+            runs["stored_runs"] = len(visible_runs)
+            runs["active_runs"] = sum(
+                str(item.get("status") or "") in {"running", "queued"}
+                for item in visible_runs
+            )
+            runs["latest_at"] = max(
+                (
+                    str(item.get("updated_at") or item.get("finished_at") or item.get("at") or "")
+                    for item in visible_runs
+                ),
+                default="",
+            )
+            runs["events"] = 0
+        try:
+            usage = shutil.disk_usage(LOG_DIR)
+            disk = {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+                "used_percent": round((usage.used / usage.total) * 100, 2) if usage.total else 0,
+            }
+        except OSError:
+            disk = {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "used_percent": 0}
+        with_cookie = sum(1 for item in accounts if load_cookies(str(item.get("unique_id") or "")))
+        return {
+            "ok": True,
+            "generated_at": now_text(),
+            "service": {
+                "panel": "up",
+                "sender_running": bool(runner.running()),
+                "checker_running": bool(checker.running()),
+                "authorization_running": bool(browser.running()),
+            },
+            "accounts": {
+                "visible": len(accounts),
+                "with_credentials": with_cookie,
+                "login_failures": sum(1 for item in failures.values() if isinstance(item, dict)),
+            },
+            "runs": runs,
+            "disk": disk,
         }
 
     def status_payload(self) -> dict:

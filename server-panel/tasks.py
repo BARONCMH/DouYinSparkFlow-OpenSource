@@ -13,6 +13,8 @@ from utils.config import get_config, get_userData
 from core.douyin_im import match_contact_name, norm
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
+from core.owned.run_store import RunStore
+from core.owned.task_policy import account_timeout_seconds
 from playwright.sync_api import Response
 import time
 
@@ -102,6 +104,11 @@ SHOT_DIR = "/app/logs/send-shots"
 # 结果就是别人账号把位置占满，自己的发送结果永远看不到。
 KEEP_RUNS_PER_ACCOUNT = 25
 KEEP_RUNS_MAX = 100  # 兜底上限，账号再多也不会无限涨
+RUN_STORE = RunStore(
+    SEND_LOG,
+    keep_per_account=KEEP_RUNS_PER_ACCOUNT,
+    max_runs=KEEP_RUNS_MAX,
+)
 
 
 def _safe_name(text):
@@ -215,45 +222,13 @@ def wait_with_abort(seconds):
 
 
 def record_run(entry, cleanup_shots=True):
-    """把一次发送的结果写进 send-status.json，控制台据此显示发送记录。"""
+    """把一次发送结果交给项目自己的运行存储层。"""
     try:
-        os.makedirs(os.path.dirname(SEND_LOG), exist_ok=True)
-        data = {"runs": []}
-        if os.path.exists(SEND_LOG):
-            try:
-                with open(SEND_LOG, encoding="utf-8") as handle:
-                    loaded = json.load(handle)
-                if isinstance(loaded, dict) and isinstance(loaded.get("runs"), list):
-                    data = loaded
-            except Exception:
-                pass
-        run_id = str(entry.get("run_id") or "")
-        existing_index = next(
-            (
-                index for index, run in enumerate(data["runs"])
-                if run_id and isinstance(run, dict) and str(run.get("run_id") or "") == run_id
-            ),
-            None,
-        )
-        if existing_index is None:
-            data["runs"].insert(0, entry)
-        else:
-            data["runs"][existing_index] = entry
-        kept, seen = [], {}
-        for run in data["runs"]:
-            key = str(run.get("unique_id") or run.get("account") or "")
-            seen[key] = seen.get(key, 0) + 1
-            if seen[key] <= KEEP_RUNS_PER_ACCOUNT and len(kept) < KEEP_RUNS_MAX:
-                kept.append(run)
-        data["runs"] = kept
-        tmp = SEND_LOG + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=1)
-        os.replace(tmp, SEND_LOG)
+        RUN_STORE.upsert(entry)
         if cleanup_shots:
             keep = {
                 item.get("shot")
-                for run in data["runs"]
+                for run in RUN_STORE.read()
                 for item in run.get("friends", [])
                 if item.get("shot")
             }
@@ -1749,9 +1724,39 @@ def runTasks():
     _run_tasks_in_current_process()
 
 
+def _dry_run_enabled() -> bool:
+    return str(os.getenv("PANEL_DRY_RUN") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_dry_run(user):
+    """Record a deterministic rehearsal result without opening a browser."""
+    uid = str(user.get("unique_id") or "")
+    runner_id = str(os.getenv("PANEL_RUN_ID") or uuid4().hex)
+    entry = {
+        "run_id": "%s:%s" % (runner_id, uid),
+        "runner_id": runner_id,
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "account": str(user.get("username") or uid or "抖音账号"),
+        "unique_id": uid,
+        "targets": list(user.get("targets") or []),
+        "friends": [],
+        "status": "dry_run",
+        "reason": "dry_run",
+        "detail": "演练模式：已验证任务编排，未打开浏览器，也未向抖音发送消息",
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    record_run(entry)
+
+
 def _run_tasks_in_current_process():
     if not userData:
         logger.warning("没有可执行的账号，本次跳过（可能是账号缺少 Cookie）")
+        return
+    if _dry_run_enabled():
+        logger.warning("PANEL_DRY_RUN 已开启：本轮只验证任务编排，不打开浏览器、不发送消息")
+        clear_abort_flag()
+        for user in userData:
+            _record_dry_run(user)
         return
     # core.browser.get_browser returns the CloakBrowser Browser instance
     # directly; it does not return a (Playwright, Browser) tuple.
@@ -1816,77 +1821,65 @@ def _terminate_account_process(process):
             pass
 
 
-def _record_account_timeout(user, started_at, timeout_seconds):
-    """Mark only the account that exceeded its own time limit."""
+def _worker_run_entry(user, started_at):
+    """Load or create the current account record through the owned store."""
     uid = str(user.get("unique_id") or "")
     runner_id = str(os.getenv("PANEL_RUN_ID") or "")
-    run_id = "%s:%s" % (runner_id or "", uid)
-    account = str(user.get("username") or uid or "抖音账号")
-    started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at))
-    finished_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    run_id = "%s:%s" % (runner_id, uid)
+    entry = RUN_STORE.get(run_id)
+    if entry is not None:
+        return entry
+    return {
+        "run_id": run_id,
+        "runner_id": runner_id,
+        "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)),
+        "account": str(user.get("username") or uid or "抖音账号"),
+        "unique_id": uid,
+        "targets": list(user.get("targets") or []),
+        "friends": [],
+        "status": "running",
+    }
+
+
+def _record_worker_terminal(user, started_at, *, status, reason, detail, **extra):
+    """Update one account without overwriting a newer terminal result."""
+    account = str(user.get("username") or user.get("unique_id") or "抖音账号")
+    try:
+        entry = _worker_run_entry(user, started_at)
+        if str(entry.get("status") or "") != "running":
+            return
+        entry.update(
+            {
+                "status": status,
+                "reason": reason,
+                "detail": detail,
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **extra,
+            }
+        )
+        RUN_STORE.upsert(entry)
+    except Exception as error:
+        logger.error("记录账号 %s 的终态失败：%s", account, type(error).__name__)
+
+
+def _record_account_timeout(user, started_at, timeout_seconds):
+    """Mark only the account that exceeded its own time limit."""
     detail = (
         "此抖音号发送超过 %d 分钟，系统已停止该账号及其浏览器；"
         "本账号未完成，后续账号会继续执行。" % max(1, timeout_seconds // 60)
     )
-    try:
-        data = {"runs": []}
-        if os.path.exists(SEND_LOG):
-            try:
-                with open(SEND_LOG, encoding="utf-8") as handle:
-                    loaded = json.load(handle)
-                if isinstance(loaded, dict) and isinstance(loaded.get("runs"), list):
-                    data = loaded
-            except Exception:
-                pass
-        runs = data["runs"]
-        entry = next(
-            (
-                item for item in runs
-                if isinstance(item, dict)
-                and (
-                    str(item.get("run_id") or "") == run_id
-                    or (runner_id and str(item.get("runner_id") or "") == runner_id
-                        and str(item.get("unique_id") or "") == uid)
-                )
-            ),
-            None,
-        )
-        if entry is not None and str(entry.get("status") or "") != "running":
-            return
-        if entry is None:
-            entry = {
-                "run_id": run_id,
-                "runner_id": runner_id,
-                "at": started_text,
-                "account": account,
-                "unique_id": uid,
-                "targets": list(user.get("targets") or []),
-                "friends": [],
-            }
-            runs.insert(0, entry)
-        entry.update({
-            "status": "timed_out",
-            "reason": "timeout",
-            "detail": detail,
-            "finished_at": finished_text,
-            "timed_out": True,
-        })
-        runs[:] = runs[:KEEP_RUNS_MAX]
-        tmp = SEND_LOG + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=1)
-        os.replace(tmp, SEND_LOG)
-    except Exception as error:
-        logger.error("记录账号 %s 的超时结果失败：%s", account, type(error).__name__)
+    _record_worker_terminal(
+        user,
+        started_at,
+        status="timed_out",
+        reason="timeout",
+        detail=detail,
+        timed_out=True,
+    )
 
 
 def _record_account_process_failure(user, started_at, returncode=None, detail=""):
     """Record worker crashes that happen before do_user_task can create a result."""
-    uid = str(user.get("unique_id") or "")
-    runner_id = str(os.getenv("PANEL_RUN_ID") or "")
-    run_id = "%s:%s" % (runner_id, uid)
-    account = str(user.get("username") or uid or "抖音账号")
-    finished_text = time.strftime("%Y-%m-%d %H:%M:%S")
     if not detail:
         if returncode is not None and returncode < 0 and os.name != "nt":
             try:
@@ -1896,51 +1889,13 @@ def _record_account_process_failure(user, started_at, returncode=None, detail=""
             detail = "发送进程被 %s 中断（退出码 %s）" % (signal_name, returncode)
         else:
             detail = "发送进程异常退出（退出码 %s）" % returncode
-    try:
-        data = {"runs": []}
-        if os.path.exists(SEND_LOG):
-            try:
-                with open(SEND_LOG, encoding="utf-8") as handle:
-                    loaded = json.load(handle)
-                if isinstance(loaded, dict) and isinstance(loaded.get("runs"), list):
-                    data = loaded
-            except Exception:
-                pass
-        runs = data["runs"]
-        entry = next(
-            (
-                item for item in runs
-                if isinstance(item, dict)
-                and str(item.get("run_id") or "") == run_id
-            ),
-            None,
-        )
-        if entry is not None and str(entry.get("status") or "") != "running":
-            return
-        if entry is None:
-            entry = {
-                "run_id": run_id,
-                "runner_id": runner_id,
-                "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)),
-                "account": account,
-                "unique_id": uid,
-                "targets": list(user.get("targets") or []),
-                "friends": [],
-            }
-            runs.insert(0, entry)
-        entry.update({
-            "status": "error",
-            "reason": "process_error",
-            "detail": detail,
-            "finished_at": finished_text,
-        })
-        runs[:] = runs[:KEEP_RUNS_MAX]
-        tmp = SEND_LOG + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=1)
-        os.replace(tmp, SEND_LOG)
-    except Exception as error:
-        logger.error("记录账号 %s 的进程错误失败：%s", account, type(error).__name__)
+    _record_worker_terminal(
+        user,
+        started_at,
+        status="error",
+        reason="process_error",
+        detail=detail,
+    )
 
 
 def _run_panel_accounts_separately():
@@ -1948,10 +1903,7 @@ def _run_panel_accounts_separately():
     if not userData:
         logger.warning("没有可执行的账号，本次跳过（可能是账号缺少 Cookie）")
         return
-    try:
-        timeout_seconds = max(1, int(os.getenv("PANEL_ACCOUNT_TIMEOUT_SECONDS", "600")))
-    except (TypeError, ValueError):
-        timeout_seconds = 600
+    timeout_seconds = account_timeout_seconds()
 
     clear_abort_flag()
     logger.info("开始执行任务；每个抖音号独立计时，上限 %d 秒", timeout_seconds)
